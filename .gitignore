@@ -1,0 +1,5 @@
+# Artefatos de build do Rust
+/target
+
+# Cofres criptografados (dados do usuario)
+*.sagu

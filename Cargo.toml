@@ -1,0 +1,53 @@
+[package]
+name = "sagu-term"
+version = "0.1.0"
+edition = "2021"
+description = "Cliente SSH desktop em Rust puro com cofre criptografado e terminal com auto-copia"
+license = "MIT"
+
+[dependencies]
+# GUI
+eframe = { version = "0.31", features = ["persistence"] }
+egui = "0.31"
+# Carregamento de imagens/SVG na UI (icones vetoriais)
+egui_extras = { version = "0.31", features = ["svg"] }
+
+# SSH (Rust puro) — backend "ring" evita dependencia do aws-lc (cmake/nasm)
+russh = { version = "0.61", default-features = false, features = ["ring", "flate2", "rsa"] }
+
+# Terminal parsing (ANSI/VT100)
+vt100 = "0.16"
+
+# Async runtime
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+
+# Cofre criptografado
+aes-gcm = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+
+# Serialização
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilidades
+uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = "1"
+zeroize = "1"
+
+# Dialogos nativos de arquivo (Rust puro via windows-rs)
+rfd = "0.15"
+
+# Decodificacao de PNG para icone/logo
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Leitura da area de transferencia (colar com botao direito)
+arboard = "3"
+
+# Terminal local (cmd.exe) via PTY — ConPTY no Windows
+portable-pty = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
