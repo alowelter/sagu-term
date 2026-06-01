@@ -1,5 +1,18 @@
 # Artefatos de build do Rust
 /target
 
+# Backup gerado pelo rustfmt
+**/*.rs.bk
+
 # Cofres criptografados (dados do usuario)
 *.sagu
+
+# Arquivos de IDE/editor
+/.vscode
+/.idea
+*.iml
+
+# Sistema operacional
+Thumbs.db
+Desktop.ini
+.DS_Store
