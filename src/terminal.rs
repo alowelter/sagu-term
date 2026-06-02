@@ -16,6 +16,8 @@ pub struct TerminalOutput {
     pub input: Vec<u8>,
     /// Novo tamanho (cols, rows) caso a area tenha mudado.
     pub resize: Option<(u16, u16)>,
+    /// Verdadeiro quando este terminal detem o foco do teclado neste quadro.
+    pub focused: bool,
 }
 
 pub struct Terminal {
@@ -89,6 +91,7 @@ impl Terminal {
         if response.clicked() {
             response.request_focus();
         }
+        out.focused = response.has_focus();
         if response.has_focus() {
             ui.memory_mut(|m| {
                 m.set_focus_lock_filter(
