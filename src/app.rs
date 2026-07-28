@@ -2856,7 +2856,7 @@ impl App {
             };
 
             secao(ui, "Paineis da sessao");
-            atalho(ui, "Alt+\u{2190}\u{2191}\u{2193}\u{2192}", "trocar de painel (na direcao)");
+            atalho(ui, "Alt+(setas)", "trocar de painel (na direcao)");
 
             secao(ui, "Paineis da sessao (prefixo Ctrl+B)");
             atalho(ui, "Ctrl+B, H", "dividir lado a lado");
@@ -4058,8 +4058,7 @@ impl eframe::App for App {
                                 ui.label(
                                     egui::RichText::new(
                                         "Alt+\u{2190}\u{2191}\u{2193}\u{2192} troca de painel  \
-                                         \u{00b7}  Ctrl+B + tecla: comandos de painel \
-                                         (A = ajuda)  \u{00b7}  F5 atualiza SFTP",
+                                         \u{00b7}  Ctrl+B + A: Ajuda  \u{00b7}  F5 atualiza SFTP",
                                     )
                                     .small()
                                     .color(TEXT_WEAK),
