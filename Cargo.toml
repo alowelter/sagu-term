@@ -19,7 +19,7 @@ russh = { version = "0.61", default-features = false, features = ["ring", "flate
 vt100 = "0.16"
 
 # Async runtime
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
 
 # Cofre criptografado
 aes-gcm = "0.10"
@@ -46,6 +46,13 @@ arboard = "3"
 
 # Terminal local (cmd.exe) via PTY — ConPTY no Windows
 portable-pty = "0.8"
+russh-sftp = "2.3.0"
+
+[build-dependencies]
+# Embute o icone (e metadados de versao) como recurso do executavel Windows
+winresource = "0.1"
+# Gera o .ico a partir de assets/logo_mini.png durante o build
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
 
 [profile.release]
 opt-level = 3

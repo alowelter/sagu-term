@@ -1,4 +1,5 @@
-//! Terminal local (cmd.exe) via PTY usando `portable-pty` (ConPTY no Windows).
+//! Terminal local (cmd.exe ou WSL) via PTY usando `portable-pty` (ConPTY no
+//! Windows).
 //!
 //! Reutiliza o mesmo protocolo da sessao SSH (`UiToSsh`/`SshToUi`) para que a UI
 //! trate um terminal local exatamente como uma conexao remota.
@@ -10,9 +11,63 @@ use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
 use crate::ssh::{SshHandle, SshToUi, UiToSsh};
 
-/// Abre um terminal local rodando `cmd.exe`. `repaint` acorda o loop do egui
-/// sempre que ha novos bytes para exibir.
-pub fn connect_cmd<F>(cols: u16, rows: u16, repaint: F) -> SshHandle
+/// Qual shell local executar no PTY.
+#[derive(Clone, Copy, PartialEq)]
+pub enum LocalShell {
+    /// Prompt de comando do Windows (cmd.exe).
+    Cmd,
+    /// Linux via WSL (wsl.exe, distribuicao padrao), iniciando no home.
+    Wsl,
+}
+
+impl LocalShell {
+    /// Nome exibido na barra de titulo do painel.
+    pub fn label(self) -> &'static str {
+        match self {
+            LocalShell::Cmd => "Local",
+            LocalShell::Wsl => "WSL",
+        }
+    }
+
+    /// Monta o comando a executar no PTY.
+    fn command(self) -> CommandBuilder {
+        match self {
+            LocalShell::Cmd => {
+                let mut c = CommandBuilder::new("cmd.exe");
+                if let Ok(home) = std::env::var("USERPROFILE") {
+                    c.cwd(home);
+                }
+                c
+            }
+            LocalShell::Wsl => {
+                let mut c = CommandBuilder::new("wsl.exe");
+                // "~" inicia o shell no home do usuario Linux (atalho do wsl.exe).
+                c.arg("~");
+                c
+            }
+        }
+    }
+}
+
+/// Verdadeiro se o WSL esta instalado nesta maquina (wsl.exe presente).
+/// Detectado uma unica vez por execucao.
+pub fn wsl_available() -> bool {
+    static WSL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WSL.get_or_init(|| {
+        std::env::var("WINDIR")
+            .map(|w| {
+                std::path::Path::new(&w)
+                    .join("System32")
+                    .join("wsl.exe")
+                    .exists()
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Abre um terminal local rodando o shell indicado. `repaint` acorda o loop do
+/// egui sempre que ha novos bytes para exibir.
+pub fn connect_local<F>(shell: LocalShell, cols: u16, rows: u16, repaint: F) -> SshHandle
 where
     F: Fn() + Send + Sync + 'static,
 {
@@ -40,14 +95,11 @@ where
             Err(e) => return fail(format!("pty: {e}")),
         };
 
-        let mut cmd = CommandBuilder::new("cmd.exe");
-        if let Ok(home) = std::env::var("USERPROFILE") {
-            cmd.cwd(home);
-        }
+        let cmd = shell.command();
 
         let mut child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
-            Err(e) => return fail(format!("cmd.exe: {e}")),
+            Err(e) => return fail(format!("{}: {e}", shell.label())),
         };
         // O lado escravo nao e mais necessario depois do spawn.
         drop(pair.slave);

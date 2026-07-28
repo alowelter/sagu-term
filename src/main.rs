@@ -3,17 +3,17 @@
 
 mod app;
 mod pty;
+mod sftp;
 mod ssh;
 mod terminal;
 mod vault;
 
 use app::App;
 
-/// Carrega o mini-logo como icone da janela (assets/logo_mini.png).
+/// Carrega o mini-logo como icone da janela (embutido no binario).
 fn load_icon() -> Option<egui::IconData> {
-    let path = app::asset_path("logo_mini.png").or_else(|| app::asset_path("logo.png"))?;
-    let bytes = std::fs::read(path).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?.into_rgba8();
+    let bytes = include_bytes!("../assets/logo_mini.png");
+    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
     let (width, height) = img.dimensions();
     Some(egui::IconData {
         rgba: img.into_raw(),

@@ -31,8 +31,8 @@ pub enum UiToSsh {
 }
 
 /// Handler do cliente russh. Aceita a chave do servidor automaticamente
-/// (TOFU desabilitado para simplicidade).
-struct Client;
+/// (TOFU desabilitado para simplicidade). Compartilhado com a sessao SFTP.
+pub(crate) struct Client;
 
 impl client::Handler for Client {
     type Error = russh::Error;
@@ -43,6 +43,48 @@ impl client::Handler for Client {
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
+}
+
+/// Conecta e autentica uma sessao russh com os dados do host. Unico ponto de
+/// configuracao (timeouts, politica de chave do servidor, metodos de
+/// autenticacao), compartilhado entre as sessoes de terminal SSH e SFTP.
+pub(crate) async fn connect_and_auth(host: &Host) -> anyhow::Result<client::Handle<Client>> {
+    let config = Arc::new(client::Config {
+        inactivity_timeout: Some(Duration::from_secs(3600)),
+        keepalive_interval: Some(Duration::from_secs(30)),
+        ..Default::default()
+    });
+
+    let mut session = client::connect(config, (host.host.as_str(), host.port), Client)
+        .await
+        .map_err(|e| anyhow::anyhow!("nao foi possivel conectar: {e}"))?;
+
+    let authenticated = match &host.auth {
+        AuthMethod::Password { password } => session
+            .authenticate_password(host.username.clone(), password.clone())
+            .await?
+            .success(),
+        AuthMethod::Key {
+            private_key,
+            passphrase,
+        } => {
+            let key = decode_secret_key(private_key, passphrase.as_deref())
+                .map_err(|e| anyhow::anyhow!("chave privada invalida: {e}"))?;
+            let hash = session.best_supported_rsa_hash().await?.flatten();
+            session
+                .authenticate_publickey(
+                    host.username.clone(),
+                    PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+                )
+                .await?
+                .success()
+        }
+    };
+
+    if !authenticated {
+        anyhow::bail!("falha na autenticacao (credenciais rejeitadas)");
+    }
+    Ok(session)
 }
 
 /// Lado da UI: enviar comandos e receber eventos da sessao.
@@ -124,41 +166,7 @@ async fn run_session<F>(
 where
     F: Fn() + Send + 'static,
 {
-    let config = Arc::new(client::Config {
-        inactivity_timeout: Some(Duration::from_secs(3600)),
-        keepalive_interval: Some(Duration::from_secs(30)),
-        ..Default::default()
-    });
-
-    let mut session = client::connect(config, (host.host.as_str(), host.port), Client)
-        .await
-        .map_err(|e| anyhow::anyhow!("nao foi possivel conectar: {e}"))?;
-
-    let authenticated = match &host.auth {
-        AuthMethod::Password { password } => session
-            .authenticate_password(host.username.clone(), password.clone())
-            .await?
-            .success(),
-        AuthMethod::Key {
-            private_key,
-            passphrase,
-        } => {
-            let key = decode_secret_key(private_key, passphrase.as_deref())
-                .map_err(|e| anyhow::anyhow!("chave privada invalida: {e}"))?;
-            let hash = session.best_supported_rsa_hash().await?.flatten();
-            session
-                .authenticate_publickey(
-                    host.username.clone(),
-                    PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-                )
-                .await?
-                .success()
-        }
-    };
-
-    if !authenticated {
-        anyhow::bail!("falha na autenticacao (credenciais rejeitadas)");
-    }
+    let session = connect_and_auth(&host).await?;
 
     let mut channel = session.channel_open_session().await?;
     channel
@@ -168,6 +176,12 @@ where
 
     let _ = from_ssh.send(SshToUi::Connected);
     repaint();
+
+    // Distingue o encerramento esperado (usuario desconectou ou o shell saiu
+    // com `exit`, que envia ExitStatus) da queda de conexao: nesse ultimo caso
+    // devolve erro para a UI preservar o painel com a mensagem em vez de
+    // fecha-lo silenciosamente.
+    let mut clean_exit = false;
 
     loop {
         tokio::select! {
@@ -180,6 +194,7 @@ where
                         channel.window_change(cols as u32, rows as u32, 0, 0).await?;
                     }
                     Some(UiToSsh::Disconnect) | None => {
+                        clean_exit = true;
                         let _ = channel.eof().await;
                         break;
                     }
@@ -195,6 +210,9 @@ where
                         let _ = from_ssh.send(SshToUi::Data(data.to_vec()));
                         repaint();
                     }
+                    Some(ChannelMsg::ExitStatus { .. }) => {
+                        clean_exit = true;
+                    }
                     Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
                         break;
                     }
@@ -204,5 +222,8 @@ where
         }
     }
 
+    if !clean_exit {
+        anyhow::bail!("conexao perdida (a sessao caiu sem encerramento normal)");
+    }
     Ok(())
 }

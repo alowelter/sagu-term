@@ -9,6 +9,11 @@
 
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Vec2};
 
+/// Cor de fundo padrao do terminal (compartilhada por render e resolucao de
+/// cores; celulas com este fundo nao precisam pintar retangulo). Grafite bem
+/// escuro, alinhado com a paleta da aplicacao.
+const TERM_BG: Color32 = Color32::from_rgb(0x13, 0x13, 0x16);
+
 /// Resultado de um quadro do terminal: o que precisa ser enviado ao servidor.
 #[derive(Default)]
 pub struct TerminalOutput {
@@ -47,6 +52,12 @@ impl Terminal {
         self.parser.process(bytes);
     }
 
+    /// Pede o foco do teclado para este terminal no proximo quadro (usado
+    /// pelos atalhos de troca de painel).
+    pub fn take_focus(&mut self) {
+        self.want_focus = true;
+    }
+
     fn resize(&mut self, cols: u16, rows: u16) {
         if cols == 0 || rows == 0 || (cols == self.cols && rows == self.rows) {
             return;
@@ -61,10 +72,21 @@ impl Terminal {
         let mut out = TerminalOutput::default();
 
         let font_id = FontId::monospace(self.font_size);
+        // A celula e arredondada para um numero inteiro de pixels fisicos.
+        //
+        // Isso nao e cosmetico: ao compor um texto, o egui arredonda a posicao
+        // de cada glifo para o pixel (epaint text_layout.rs), ou seja, avanca
+        // sempre `round(advance)`. Com uma celula fracionaria (ex.: 8.275) o
+        // texto anda 8 px por caractere enquanto a grade anda 8.275, e a
+        // diferenca acumula: em 16 colunas o texto ja fica meio caractere a
+        // esquerda do cursor, que e desenhado sobre a grade. Casando a celula
+        // com o passo real do egui, glifos, fundos e cursor ficam alinhados.
+        let ppp = ui.ctx().pixels_per_point();
+        let snap = |v: f32| ((v * ppp).round() / ppp).max(1.0);
         let (cell_w, cell_h) = ui.fonts(|f| {
             (
-                f.glyph_width(&font_id, 'M').max(1.0),
-                f.row_height(&font_id).max(1.0),
+                snap(f.glyph_width(&font_id, 'M')),
+                snap(f.row_height(&font_id)),
             )
         });
 
@@ -81,7 +103,7 @@ impl Terminal {
         let painter = ui.painter_at(rect);
 
         // Fundo geral do terminal.
-        painter.rect_filled(rect, CornerRadius::ZERO, Color32::from_rgb(0x0c, 0x0c, 0x0c));
+        painter.rect_filled(rect, CornerRadius::ZERO, TERM_BG);
 
         // Foco do teclado.
         if self.want_focus {
@@ -152,32 +174,36 @@ impl Terminal {
         self.paint_grid(&painter, rect, &font_id, cell_w, cell_h);
 
         // --- Entrada de teclado (somente com foco) ---
+        // Processa dentro do proprio closure de input: evita clonar o Vec de
+        // eventos (que pode conter Strings grandes de colagem) a cada quadro.
         if response.has_focus() {
-            let events = ui.input(|i| i.events.clone());
-            for ev in events {
-                match ev {
-                    egui::Event::Text(t) => {
-                        for ch in t.chars().filter(|c| !c.is_control()) {
-                            let mut buf = [0u8; 4];
-                            out.input.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            ui.input(|i| {
+                for ev in &i.events {
+                    match ev {
+                        egui::Event::Text(t) => {
+                            for ch in t.chars().filter(|c| !c.is_control()) {
+                                let mut buf = [0u8; 4];
+                                out.input
+                                    .extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                            }
                         }
-                    }
-                    egui::Event::Paste(t) => out.input.extend_from_slice(t.as_bytes()),
-                    egui::Event::Copy => out.input.push(0x03), // Ctrl+C = interrupcao
-                    egui::Event::Cut => out.input.push(0x18), // Ctrl+X
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        if let Some(bytes) = map_key(key, &modifiers) {
-                            out.input.extend_from_slice(&bytes);
+                        egui::Event::Paste(t) => out.input.extend_from_slice(t.as_bytes()),
+                        egui::Event::Copy => out.input.push(0x03), // Ctrl+C = interrupcao
+                        egui::Event::Cut => out.input.push(0x18),  // Ctrl+X
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } => {
+                            if let Some(bytes) = map_key(*key, modifiers) {
+                                out.input.extend_from_slice(&bytes);
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
+            });
         }
 
         out
@@ -241,12 +267,54 @@ impl Terminal {
         for row in 0..self.rows {
             let y = rect.min.y + row as f32 * cell_h;
 
-            // Agrupa celulas contiguas com mesmo estilo para reduzir draw calls.
+            // Agrupa celulas ASCII contiguas com o mesmo estilo em "trechos":
+            // um unico texto (galley) e um unico retangulo de fundo por trecho,
+            // em vez de um por celula — reduz muito o custo por quadro em
+            // grades grandes. Glifos largos (CJK) ou fora do ASCII sao pintados
+            // individualmente, pois a fonte pode nao lhes dar a largura exata
+            // da celula monoespacada.
+            let mut run = String::new();
+            let mut run_start = 0u16;
+            let mut run_fg = Color32::WHITE;
+            let mut run_bg = TERM_BG;
+            let mut run_only_spaces = true;
+
+            macro_rules! flush_run {
+                () => {
+                    if !run.is_empty() {
+                        let x = rect.min.x + run_start as f32 * cell_w;
+                        if run_bg != TERM_BG {
+                            painter.rect_filled(
+                                Rect::from_min_size(
+                                    Pos2::new(x, y),
+                                    // Trechos sao 100% ASCII: len == n. de colunas.
+                                    Vec2::new(run.len() as f32 * cell_w, cell_h),
+                                ),
+                                CornerRadius::ZERO,
+                                run_bg,
+                            );
+                        }
+                        // Trechos so de espacos nao precisam desenhar texto.
+                        if !run_only_spaces {
+                            painter.text(
+                                Pos2::new(x, y),
+                                Align2::LEFT_TOP,
+                                run.clone(),
+                                font_id.clone(),
+                                run_fg,
+                            );
+                        }
+                        run.clear();
+                    }
+                };
+            }
+
             let mut col = 0u16;
             while col < self.cols {
                 let cell = match screen.cell(row, col) {
                     Some(c) => c,
                     None => {
+                        flush_run!();
                         col += 1;
                         continue;
                     }
@@ -257,36 +325,64 @@ impl Terminal {
                 }
 
                 let (fg, bg) = resolve_colors(cell);
-                let span = if cell.is_wide() { 2 } else { 1 };
-
-                // Fundo da celula.
-                if bg != Color32::from_rgb(0x0c, 0x0c, 0x0c) {
-                    let bg_rect = Rect::from_min_size(
-                        Pos2::new(rect.min.x + col as f32 * cell_w, y),
-                        Vec2::new(cell_w * span as f32, cell_h),
-                    );
-                    painter.rect_filled(bg_rect, CornerRadius::ZERO, bg);
-                }
-
-                // Glifo.
                 let s = cell.contents();
-                if !s.is_empty() {
-                    painter.text(
-                        Pos2::new(rect.min.x + col as f32 * cell_w, y),
-                        Align2::LEFT_TOP,
-                        s,
-                        font_id.clone(),
-                        fg,
-                    );
-                }
+                let ascii = !cell.is_wide()
+                    && (s.is_empty()
+                        || (s.len() == 1 && (0x20..0x7f).contains(&s.as_bytes()[0])));
 
-                col += span;
+                if ascii {
+                    let ch = if s.is_empty() { ' ' } else { s.as_bytes()[0] as char };
+                    let is_space = ch == ' ';
+                    // O trecho continua se o estilo casa (espacos so exigem o
+                    // mesmo fundo; a cor do texto deles nao aparece).
+                    let compat = !run.is_empty()
+                        && bg == run_bg
+                        && (is_space || run_only_spaces || fg == run_fg);
+                    if !compat {
+                        flush_run!();
+                        run_start = col;
+                        run_fg = fg;
+                        run_bg = bg;
+                        run_only_spaces = true;
+                    }
+                    if !is_space && run_only_spaces {
+                        // O primeiro glifo visivel define a cor do trecho.
+                        run_fg = fg;
+                        run_only_spaces = false;
+                    }
+                    run.push(ch);
+                    col += 1;
+                } else {
+                    flush_run!();
+                    let span = if cell.is_wide() { 2 } else { 1 };
+                    if bg != TERM_BG {
+                        painter.rect_filled(
+                            Rect::from_min_size(
+                                Pos2::new(rect.min.x + col as f32 * cell_w, y),
+                                Vec2::new(cell_w * span as f32, cell_h),
+                            ),
+                            CornerRadius::ZERO,
+                            bg,
+                        );
+                    }
+                    if !s.is_empty() {
+                        painter.text(
+                            Pos2::new(rect.min.x + col as f32 * cell_w, y),
+                            Align2::LEFT_TOP,
+                            s,
+                            font_id.clone(),
+                            fg,
+                        );
+                    }
+                    col += span;
+                }
             }
+            flush_run!();
         }
 
-        // Selecao: overlay translucido.
+        // Selecao: overlay translucido no aco claro do tema.
         if let Some(((r0, c0), (r1, c1))) = sel {
-            let overlay = Color32::from_rgba_unmultiplied(0x33, 0x99, 0xff, 0x55);
+            let overlay = Color32::from_rgba_unmultiplied(0x9b, 0xa3, 0xb4, 0x55);
             for r in r0..=r1 {
                 let (start, end) = if r0 == r1 {
                     (c0, c1)
@@ -328,7 +424,7 @@ impl Terminal {
 
 fn resolve_colors(cell: &vt100::Cell) -> (Color32, Color32) {
     let default_fg = Color32::from_rgb(0xcc, 0xcc, 0xcc);
-    let default_bg = Color32::from_rgb(0x0c, 0x0c, 0x0c);
+    let default_bg = TERM_BG;
 
     let mut fg_color = cell.fgcolor();
     let mut bg_color = cell.bgcolor();

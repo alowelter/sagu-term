@@ -1,0 +1,4 @@
+# Linka o CRT do MSVC estaticamente: o .exe nao depende de
+# VCRUNTIME140.dll nem do Visual C++ Redistributable na maquina destino.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
