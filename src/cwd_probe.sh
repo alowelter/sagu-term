@@ -157,11 +157,22 @@ SHD=; cwd_of "$SH" && SHD=$D
 # 2b. Sem controle de jobs (ex.: programa aberto pelo .bashrc, como um tmux
 #     automatico sem "exec"), o filho em primeiro plano fica no grupo do
 #     proprio shell e o tty aponta o shell, como se ele estivesse no prompt.
-#     Nesse caso o filho mais novo no grupo do shell e quem esta de fato em
-#     primeiro plano.
+#     Nesse caso o filho mais novo no grupo do shell cuja entrada e o
+#     proprio terminal e quem esta de fato em primeiro plano. Processos de
+#     fundo do .bashrc (entrada /dev/null) e substituicoes de processo como
+#     `exec > >(tee log)` (entrada em pipe) ficam de fora.
 if [ "$TP" = "$SH" ]; then
-  K=$(scan kids "$SH" | sort -n | tail -n 1)
-  [ -n "$K" ] && TP=${K#* }
+  T0=$(readlink "/proc/$SH/fd/0" 2>/dev/null)
+  K=
+  if [ -n "$T0" ]; then
+    while read -r st k; do
+      [ -n "$k" ] || continue
+      [ "$(readlink "/proc/$k/fd/0" 2>/dev/null)" = "$T0" ] && K=$k
+    done <<EOF
+$(scan kids "$SH" | sort -n)
+EOF
+  fi
+  [ -n "$K" ] && TP=$K
 fi
 
 # 3. Foreground job of that tty (if not the shell itself).

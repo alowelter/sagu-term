@@ -1068,6 +1068,41 @@ fn painted_btn(
     response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
+/// Botao com largura ajustada ao texto (minimo 100 px, nunca maior que a
+/// area disponivel), para rotulos variaveis como caminhos. `hover`: dica
+/// opcional (ex.: o caminho completo).
+fn fit_btn(ui: &mut egui::Ui, text: &str, s: &BtnStyle, hover: &str) -> bool {
+    let text_w = ui.fonts(|f| {
+        f.layout_no_wrap(
+            text.to_string(),
+            egui::FontId::proportional(14.0),
+            egui::Color32::WHITE,
+        )
+        .size()
+        .x
+    });
+    let width = (text_w + 24.0).max(100.0).min(ui.available_width().max(100.0));
+    let before = ui.cursor().min;
+    let clicked = painted_btn(ui, egui::vec2(width, 28.0), text, 14.0, s);
+    if !hover.is_empty() {
+        let rect = egui::Rect::from_min_size(before, egui::vec2(width, 28.0));
+        ui.interact(rect, ui.id().with(("fit_btn_hover", text)), egui::Sense::hover())
+            .on_hover_text(hover);
+    }
+    clicked
+}
+
+/// Corta um caminho longo pelo inicio ("...pasta/final"), mantendo o final.
+fn elide_path(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        s.to_string()
+    } else {
+        let tail: String = s.chars().skip(n - (max - 1)).collect();
+        format!("\u{2026}{tail}")
+    }
+}
+
 /// Botao primario (acento) compacto para os dialogos.
 fn accent_btn(ui: &mut egui::Ui, text: &str) -> bool {
     painted_btn(ui, egui::vec2(100.0, 28.0), text, 14.0, &BTN_ACCENT)
@@ -2455,6 +2490,9 @@ impl App {
     /// direcao, caso contrario transforma a folha numa nova divisao. Retorna o
     /// caminho do painel recem-criado (para receber o foco do teclado).
     fn split_pane(&mut self, path: &[usize], dir: SplitDir) -> Option<Vec<usize>> {
+        // Os caminhos mudam: retangulos do quadro anterior deixam de valer
+        // (um arquivo solto neste intervalo e ignorado, nunca desviado).
+        self.pane_rects.clear();
         let Some(root) = &mut self.root else {
             return None;
         };
@@ -2496,6 +2534,8 @@ impl App {
     /// Fecha o painel no caminho; colapsa a divisao se sobrar um filho, ou
     /// retorna a lista de hosts se nao restar nenhum painel.
     fn close_pane(&mut self, path: &[usize]) {
+        // Os caminhos mudam: retangulos do quadro anterior deixam de valer.
+        self.pane_rects.clear();
         if let Some(root) = &mut self.root {
             if let Some(node) = node_at_mut(root, path) {
                 disconnect_tree(node);
@@ -2565,18 +2605,25 @@ impl App {
                         SshToUi::Closed => {
                             // Envio em andamento morre com a sessao: mantem o
                             // painel aberto com o aviso em vez de fecha-lo.
-                            if pane.upload.as_ref().is_some_and(|u| {
-                                matches!(
-                                    u.stage,
-                                    UploadStage::Locating { .. } | UploadStage::Sending { .. }
-                                )
-                            }) {
-                                pane.upload = Some(UploadUi::notice(
-                                    "Envio interrompido: a sessão foi encerrada.",
-                                ));
-                                pane.state = SessionState::Error(
-                                    "sessao encerrada durante o envio de arquivos".into(),
-                                );
+                            match pane.upload.as_ref().map(|u| &u.stage) {
+                                Some(UploadStage::Locating { .. } | UploadStage::Sending { .. }) => {
+                                    pane.upload = Some(UploadUi::notice(
+                                        "Envio interrompido: a sessão foi encerrada.",
+                                    ));
+                                    // Preserva o erro real (ex.: conexao perdida).
+                                    if !matches!(pane.state, SessionState::Error(_)) {
+                                        pane.state = SessionState::Error(
+                                            "sessao encerrada durante o envio de arquivos".into(),
+                                        );
+                                    }
+                                }
+                                // A pergunta de destino nao vale mais.
+                                Some(UploadStage::Asking(_)) => {
+                                    pane.upload = Some(UploadUi::notice(
+                                        "Envio cancelado: a sessão foi encerrada.",
+                                    ));
+                                }
+                                _ => {}
                             }
                             // Encerramento normal (ex.: `exit`): fecha o painel.
                             if matches!(pane.state, SessionState::Error(_)) {
@@ -3135,7 +3182,10 @@ impl App {
         }
         let id = self.next_upload_id;
         self.next_upload_id += 1;
-        ssh.drop_files(id, files);
+        if !ssh.drop_files(id, files) {
+            pane.upload = Some(UploadUi::notice("Sessão encerrada; nada foi enviado."));
+            return;
+        }
         pane.upload = Some(UploadUi {
             id,
             skipped_dirs: dirs.len(),
@@ -3588,9 +3638,9 @@ fn upload_status(ui: &mut egui::Ui, upload: &Option<UploadUi>) -> bool {
     let (text, color, full) = match &u.stage {
         UploadStage::Locating { since } => {
             // Evita piscar quando a descoberta e rapida.
-            let wait = std::time::Duration::from_millis(300);
-            if since.elapsed() < wait {
-                ui.ctx().request_repaint_after(wait - since.elapsed());
+            let left = std::time::Duration::from_millis(300).saturating_sub(since.elapsed());
+            if !left.is_zero() {
+                ui.ctx().request_repaint_after(left);
                 return false;
             }
             ("localizando pasta\u{2026}".to_string(), TEXT_WEAK, String::new())
@@ -3609,7 +3659,10 @@ fn upload_status(ui: &mut egui::Ui, upload: &Option<UploadUi>) -> bool {
             size,
         } => {
             let pct = if *size == 0 { 100 } else { sent.saturating_mul(100) / size };
-            let text = if *count > 1 {
+            let text = if name.is_empty() {
+                // Escolha feita; o primeiro andamento ainda nao chegou.
+                "preparando o envio\u{2026}".to_string()
+            } else if *count > 1 {
                 format!("enviando {}/{count} \u{00b7} {pct}%", index + 1)
             } else {
                 format!("enviando {} \u{00b7} {pct}%", elide(name, 28))
@@ -3728,44 +3781,47 @@ fn upload_plan_bar(
                         );
                     }
                     ui.add_space(8.0);
-                    ui.horizontal_wrapped(|ui| {
-                        if let (Some(dir), true) = (&p.dir, p.writable) {
-                            if accent_btn(ui, &format!("Enviar para {}", elide(&show_path(dir), 40))) {
-                                choice = Some(PlanChoice::Send {
-                                    dir: dir.clone(),
-                                    replace: Vec::new(),
-                                });
-                            }
-                            if !plan.conflicts.is_empty() && danger_btn(ui, "Substituir e enviar") {
-                                choice = Some(PlanChoice::Send {
-                                    dir: dir.clone(),
-                                    replace: plan.conflicts.clone(),
-                                });
-                            }
+                    // Um destino por linha, com o caminho cortado no inicio (o
+                    // final e o que distingue as pastas) e completo na dica.
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    let mut send = |dir: &String, replace: Vec<String>| {
+                        choice = Some(PlanChoice::Send {
+                            dir: dir.clone(),
+                            replace,
+                        })
+                    };
+                    let writable_dir = p.dir.as_ref().filter(|_| p.writable);
+                    if let Some(dir) = writable_dir {
+                        let label = format!("Enviar para {}", elide_path(&show_path(dir), 48));
+                        if fit_btn(ui, &label, &BTN_ACCENT, &show_path(dir)) {
+                            send(dir, Vec::new());
                         }
-                        if let Some(shd) = &p.shell_dir {
-                            if p.dir.as_ref() != Some(shd)
-                                && ghost_btn(ui, &format!("Pasta do shell: {}", elide(&show_path(shd), 32)))
-                            {
-                                choice = Some(PlanChoice::Send {
-                                    dir: shd.clone(),
-                                    replace: Vec::new(),
-                                });
-                            }
+                    }
+                    if let Some(shd) = p.shell_dir.as_ref().filter(|s| p.dir.as_ref() != Some(*s)) {
+                        let label = format!("Pasta do shell: {}", elide_path(&show_path(shd), 44));
+                        if fit_btn(ui, &label, &BTN_GHOST, &show_path(shd)) {
+                            send(shd, Vec::new());
                         }
-                        if !plan.home.is_empty()
-                            && p.dir.as_ref() != Some(&plan.home)
-                            && ghost_btn(ui, &format!("Pasta pessoal: {}", elide(&show_path(&plan.home), 32)))
-                        {
-                            choice = Some(PlanChoice::Send {
-                                dir: plan.home.clone(),
-                                replace: Vec::new(),
-                            });
+                    }
+                    if !plan.home.is_empty() && p.dir.as_ref() != Some(&plan.home) {
+                        let label =
+                            format!("Pasta pessoal: {}", elide_path(&show_path(&plan.home), 44));
+                        if fit_btn(ui, &label, &BTN_GHOST, &show_path(&plan.home)) {
+                            send(&plan.home, Vec::new());
                         }
-                        if ghost_btn(ui, "Cancelar") {
-                            choice = Some(PlanChoice::Cancel);
+                    }
+                    // Substituir fica separado dos demais (acao destrutiva).
+                    if let (Some(dir), false) = (writable_dir, plan.conflicts.is_empty()) {
+                        ui.add_space(4.0);
+                        let hint = format!("Substitui em {}: {}", show_path(dir), plan.conflicts.join(", "));
+                        if fit_btn(ui, "Substituir os existentes e enviar", &BTN_DANGER, &hint) {
+                            send(dir, plan.conflicts.clone());
                         }
-                    });
+                    }
+                    ui.add_space(2.0);
+                    if fit_btn(ui, "Cancelar", &BTN_GHOST, "") {
+                        choice = Some(PlanChoice::Cancel);
+                    }
                 });
         });
     choice
@@ -4772,18 +4828,27 @@ fn render_node(
 
                         // Destino incerto para os arquivos soltos: barra com
                         // as opcoes sobre o rodape do painel.
-                        if let Some(UploadUi {
-                            stage: UploadStage::Asking(plan),
-                            ..
-                        }) = &pane.upload
+                        // So com a sessao viva (uma escolha numa sessao morta
+                        // nunca teria resposta).
+                        if let (
+                            Some(UploadUi {
+                                stage: UploadStage::Asking(plan),
+                                ..
+                            }),
+                            SessionState::Connected,
+                        ) = (&pane.upload, &pane.state)
                         {
                             let plan = plan.clone();
                             match upload_plan_bar(ui.ctx(), rect, path, &plan) {
                                 Some(PlanChoice::Send { dir, replace }) => {
-                                    if let Some(ssh) = &pane.ssh {
-                                        ssh.upload(plan.id, dir.clone(), plan.files.clone(), replace);
-                                    }
-                                    if let Some(u) = &mut pane.upload {
+                                    let sent = pane.ssh.as_ref().is_some_and(|ssh| {
+                                        ssh.upload(plan.id, dir.clone(), plan.files.clone(), replace)
+                                    });
+                                    if !sent {
+                                        pane.upload = Some(UploadUi::notice(
+                                            "Sessão encerrada; nada foi enviado.",
+                                        ));
+                                    } else if let Some(u) = &mut pane.upload {
                                         u.stage = UploadStage::Sending {
                                             dir,
                                             index: 0,
@@ -4843,11 +4908,12 @@ impl eframe::App for App {
                 }
             }
             Screen::Session => {
+                // Arquivos soltos primeiro: o painel sob o cursor e achado
+                // pelos retangulos do quadro anterior, antes que atalhos ou
+                // sessoes encerradas mudem a arvore de paineis.
+                self.handle_file_drop(ctx);
                 self.handle_session_keys(ctx);
                 self.drain_ssh_events();
-                // Arquivos soltos: vao ao painel sob o cursor (retangulos do
-                // quadro anterior).
-                self.handle_file_drop(ctx);
             }
             Screen::Gate => {
                 // Abertura/criacao do cofre em dois tempos: o quadro 1 desenha

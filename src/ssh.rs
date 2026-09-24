@@ -153,19 +153,23 @@ impl SshHandle {
         self.supports_upload
     }
 
-    /// Arquivos soltos sobre o terminal (ver `UiToSsh::DropFiles`).
-    pub fn drop_files(&self, id: u64, files: Vec<PathBuf>) {
-        let _ = self.to_ssh.send(UiToSsh::DropFiles { id, files });
+    /// Arquivos soltos sobre o terminal (ver `UiToSsh::DropFiles`). `false`
+    /// se a sessao ja terminou (nenhuma resposta vira).
+    pub fn drop_files(&self, id: u64, files: Vec<PathBuf>) -> bool {
+        self.to_ssh.send(UiToSsh::DropFiles { id, files }).is_ok()
     }
 
     /// Envia para a pasta escolhida pelo usuario (ver `UiToSsh::Upload`).
-    pub fn upload(&self, id: u64, dir: String, files: Vec<PathBuf>, replace: Vec<String>) {
-        let _ = self.to_ssh.send(UiToSsh::Upload {
-            id,
-            dir,
-            files,
-            replace,
-        });
+    /// `false` se a sessao ja terminou.
+    pub fn upload(&self, id: u64, dir: String, files: Vec<PathBuf>, replace: Vec<String>) -> bool {
+        self.to_ssh
+            .send(UiToSsh::Upload {
+                id,
+                dir,
+                files,
+                replace,
+            })
+            .is_ok()
     }
 
     pub fn send_data(&self, data: Vec<u8>) {
@@ -328,7 +332,13 @@ where
         }
     }
 
-    // Envios em andamento morrem com a sessao (a UI avisa o usuario).
+    // Entrega o que ja estava na fila (ex.: um envio que terminou junto com
+    // o `exit`) antes de encerrar; os envios em andamento morrem com a
+    // sessao (a UI avisa o usuario).
+    while let Ok(ev) = up_rx.try_recv() {
+        let _ = from_ssh.send(SshToUi::Upload(ev));
+    }
+    repaint();
     uploads.abort_all();
 
     if !clean_exit {

@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 use russh::client;
 use russh::ChannelMsg;
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::OpenFlags;
+use russh_sftp::client::error::Error as SftpError;
+use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
@@ -117,17 +118,32 @@ pub enum UploadEvent {
     Failed { id: u64, error: String },
 }
 
+/// Programas que abrem outra sessao (outra maquina, conteiner, usuario ou
+/// terminal): o "onde estou" do usuario fica dentro deles, invisivel daqui.
+/// Com um deles em primeiro plano, sempre pergunta.
+const SESSION_HOSTS: &[&str] = &[
+    "ssh", "mosh-client", "telnet", "sshpass", "autossh", "script", "asciinema", "docker",
+    "podman", "kubectl", "lxc", "incus", "nsenter", "machinectl", "chroot", "distrobox",
+    "toolbox", "su", "sudo", "doas", "tmux", "screen", "zellij",
+];
+
 /// A pasta da descoberta e confiavel o bastante para enviar sem perguntar?
 pub fn confident(p: &Probe) -> bool {
     if !p.writable || p.dir.is_none() || p.reason != "ok" {
         return false;
     }
+    let comm = p.fg_comm.as_str();
     match p.method.as_str() {
-        "shell" => true,
-        // Programa em primeiro plano: so se for um shell (aninhado) ou se
-        // estiver na mesma pasta do shell. Um `ssh`, `docker exec` ou `sudo`
-        // em uso poderia levar o arquivo para o lugar errado.
-        "fg" => KNOWN_SHELLS.contains(&p.fg_comm.as_str()) || p.dir == p.shell_dir,
+        // Shell no prompt (o lider da sessao precisa ser um shell de fato: um
+        // login que troca o shell por `exec ssh ...` nao conta).
+        "shell" => KNOWN_SHELLS.contains(&comm),
+        // Programa em primeiro plano: um shell aninhado, ou um programa local
+        // na mesma pasta do shell. Um `ssh`, `docker exec` ou `sudo` em uso
+        // nunca muda de pasta, mas leva o usuario para outro lugar.
+        "fg" => {
+            KNOWN_SHELLS.contains(&comm)
+                || (p.dir == p.shell_dir && !SESSION_HOSTS.contains(&comm))
+        }
         // tmux: a pasta do painel ativo e boa, mas o painel pode estar num
         // ssh/sudo invisivel daqui; confirma.
         _ => false,
@@ -377,7 +393,7 @@ async fn upload_files(
             };
             progress(0);
             let replace_ok = replace.contains(&name);
-            copy_file(sftp, local, &join_remote(dir, &name), replace_ok, &mut buf, progress).await
+            copy_file(sftp, local, dir, &name, replace_ok, &mut buf, progress).await
         }
         .await;
         match result {
@@ -393,37 +409,81 @@ async fn upload_files(
     });
 }
 
-/// Copia um arquivo em blocos. Sem `replace`, cria com EXCLUDE: falha se
-/// qualquer entrada ja existir (inclusive symlink), sem janela de corrida.
-/// Com `replace`, so substitui um arquivo comum (nunca segue symlink).
+/// Envia um arquivo para `dir/name`.
+///
+/// Sem `replace`: cria com EXCLUDE, que falha se qualquer entrada ja existir
+/// (inclusive symlink) sem janela de corrida.
+///
+/// Com `replace` (autorizado pelo usuario), so para um arquivo comum: o novo
+/// conteudo vai para um nome temporario e so depois de completo toma o lugar
+/// do antigo. Remover e renomear nunca seguem symlink, e um envio
+/// interrompido nao destroi o original. As permissoes do original sao
+/// aplicadas antes de gravar o conteudo.
 async fn copy_file(
     sftp: &SftpSession,
     local: &Path,
-    remote: &str,
+    dir: &str,
+    name: &str,
     replace: bool,
     buf: &mut [u8],
     progress: impl Fn(u64),
 ) -> anyhow::Result<()> {
+    let target = join_remote(dir, name);
+    if !replace {
+        let r = write_new(sftp, local, &target, None, buf, &progress).await;
+        if r.is_err() && sftp.symlink_metadata(target).await.is_ok() {
+            anyhow::bail!("ja existe no servidor");
+        }
+        return r;
+    }
+    let mode = match sftp.symlink_metadata(target.clone()).await {
+        Ok(m) if m.file_type().is_file() => m.permissions.map(|p| p & 0o7777),
+        Ok(_) => anyhow::bail!("o destino nao e um arquivo comum; nada foi substituido"),
+        // Sumiu desde a pergunta: vira um envio comum de arquivo novo.
+        Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => {
+            return write_new(sftp, local, &target, None, buf, &progress).await;
+        }
+        Err(e) => anyhow::bail!("nao foi possivel conferir o destino: {e}"),
+    };
+    let tmp = join_remote(dir, &format!(".{name}.sagu-{:08x}.part", rand::random::<u32>()));
+    if let Err(e) = write_new(sftp, local, &tmp, mode, buf, &progress).await {
+        let _ = sftp.remove_file(tmp).await;
+        return Err(e);
+    }
+    if let Err(e) = sftp.remove_file(target.clone()).await {
+        let _ = sftp.remove_file(tmp).await;
+        anyhow::bail!("nao foi possivel substituir o original: {e}");
+    }
+    sftp.rename(tmp.clone(), target)
+        .await
+        .map_err(|e| anyhow::anyhow!("o novo conteudo ficou em {tmp}: {e}"))
+}
+
+/// Cria `remote` (EXCLUDE) e grava o arquivo local em blocos. `mode`:
+/// permissoes aplicadas antes do conteudo (ao substituir um arquivo).
+async fn write_new(
+    sftp: &SftpSession,
+    local: &Path,
+    remote: &str,
+    mode: Option<u32>,
+    buf: &mut [u8],
+    progress: &impl Fn(u64),
+) -> anyhow::Result<()> {
     let mut src = tokio::fs::File::open(local).await?;
-    let flags = if replace {
-        match sftp.symlink_metadata(remote.to_string()).await {
-            Ok(m) if !m.file_type().is_file() => {
-                anyhow::bail!("o destino nao e um arquivo comum; nada foi substituido")
-            }
-            _ => OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
-        }
-    } else {
-        OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::EXCLUDE
-    };
-    let mut dst = match sftp.open_with_flags(remote.to_string(), flags).await {
-        Ok(f) => f,
-        Err(e) => {
-            if !replace && sftp.symlink_metadata(remote.to_string()).await.is_ok() {
-                anyhow::bail!("ja existe no servidor");
-            }
-            anyhow::bail!("{e}");
-        }
-    };
+    let mut dst = sftp
+        .open_with_flags(
+            remote.to_string(),
+            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::EXCLUDE,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(mode) = mode {
+        let mut attrs = FileAttributes::empty();
+        attrs.permissions = Some(mode);
+        dst.set_metadata(attrs)
+            .await
+            .map_err(|e| anyhow::anyhow!("nao foi possivel aplicar as permissoes: {e}"))?;
+    }
     let mut done: u64 = 0;
     let mut last = Instant::now();
     loop {
@@ -538,8 +598,13 @@ mod tests {
         assert!(confident(&probe("fg", "ok", true, "zsh", "/b", "/a")));
         // Programa qualquer na mesma pasta do shell.
         assert!(confident(&probe("fg", "ok", true, "vim", "/a", "/a")));
-        // Programa em outra pasta (ssh aninhado, servidor com chdir...).
-        assert!(!confident(&probe("fg", "ok", true, "ssh", "/b", "/a")));
+        // Sessao em outro lugar (ssh, sudo...), mesmo na pasta do shell.
+        assert!(!confident(&probe("fg", "ok", true, "ssh", "/a", "/a")));
+        assert!(!confident(&probe("fg", "ok", true, "sudo", "/a", "/a")));
+        // Programa local em outra pasta (servidor com chdir...).
+        assert!(!confident(&probe("fg", "ok", true, "python3", "/b", "/a")));
+        // Lider da sessao que nao e um shell (login com `exec ssh ...`).
+        assert!(!confident(&probe("shell", "ok", true, "ssh", "/a", "/a")));
         // Sem permissao, multiplexador, sudo invisivel, tmux, pasta pessoal.
         assert!(!confident(&probe("shell", "ok", false, "bash", "/a", "/a")));
         assert!(!confident(&probe("shell", "multiplexer", true, "tmux:_client", "/a", "/a")));
@@ -671,6 +736,40 @@ mod tests {
             other => panic!("esperava envio direto (bash aninhado): {other:?}"),
         }
         run("exit");
+
+        // 4b. Filho de substituicao de processo fica no grupo do shell (com
+        // entrada em pipe): nao pode ser tomado pelo programa em uso. Depois
+        // de `cd`, o envio vai para a pasta nova, sem perguntar.
+        run("exec 2> >(while read -r l; do echo \"$l\"; done)");
+        run("cd /tmp/sagu-e2e-other");
+        let d = local_dir.join("d.txt");
+        std::fs::write(&d, "d").unwrap();
+        h.drop_files(41, vec![d]);
+        match upload_ev(wait("envio com substituicao de processo", &mut |ev| is_final(ev))) {
+            UploadEvent::Finished { dir, failed, .. } => {
+                assert_eq!(dir, "/tmp/sagu-e2e-other");
+                assert!(failed.is_empty(), "{failed:?}");
+            }
+            other => panic!("esperava envio direto para a pasta nova: {other:?}"),
+        }
+
+        // 4c. Um "ssh" em primeiro plano na mesma pasta do shell: pergunta
+        // (o usuario esta em outra maquina, invisivel daqui).
+        run("cp /bin/sleep /tmp/sagu-e2e-other/ssh && /tmp/sagu-e2e-other/ssh 60");
+        let e = local_dir.join("e.txt");
+        std::fs::write(&e, "e").unwrap();
+        h.drop_files(42, vec![e]);
+        match upload_ev(wait("plano com ssh", &mut |ev| is_final(ev))) {
+            UploadEvent::Plan(p) => {
+                assert_eq!(p.probe.method, "fg", "{p:?}");
+                assert_eq!(p.probe.fg_comm, "ssh");
+                assert_eq!(p.probe.dir, p.probe.shell_dir);
+            }
+            other => panic!("esperava pergunta (ssh em uso): {other:?}"),
+        }
+        h.send_data(vec![0x03]);
+        std::thread::sleep(Duration::from_millis(500));
+        run("cd /tmp/sagu-e2e-dest");
 
         // 5. Dentro do tmux: pergunta, sugerindo a pasta do painel ativo.
         run("tmux -L sagu-e2e new-session");
