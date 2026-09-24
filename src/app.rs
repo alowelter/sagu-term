@@ -7,6 +7,7 @@ use crate::pty;
 use crate::sftp::{self, SftpHandle, SftpToUi};
 use crate::ssh::{self, SshHandle, SshToUi};
 use crate::terminal::Terminal;
+use crate::update::{self, Updater};
 use crate::vault::{self, AuthMethod, Host, Vault};
 
 const INITIAL_COLS: u16 = 80;
@@ -1527,6 +1528,15 @@ pub struct App {
 
     // Host aguardando confirmacao de exclusao (dialogo flutuante).
     pending_delete: Option<uuid::Uuid>,
+
+    // Verificacao/instalacao de versao nova (Releases do GitHub).
+    updater: Updater,
+    // Dialogo "Atualizacao disponivel" aberto (notas + confirmar).
+    show_update: bool,
+    // Aviso de versao nova dispensado ("Depois") nesta execucao.
+    update_dismissed: bool,
+    // Reinicio pos-atualizacao ja disparado (evita abrir o app duas vezes).
+    update_restarting: bool,
 }
 
 /// Nome de exibicao de um host: o apelido, ou o endereco quando sem apelido.
@@ -1576,6 +1586,13 @@ impl App {
             last_pane_focus: None,
             show_help: false,
             pending_delete: None,
+            updater: Updater::check({
+                let ctx = cc.egui_ctx.clone();
+                move || ctx.request_repaint()
+            }),
+            show_update: false,
+            update_dismissed: false,
+            update_restarting: false,
         }
     }
 
@@ -2833,6 +2850,176 @@ impl App {
         }
     }
 
+    /// Faixa na base da janela avisando de versao nova (ou mostrando o
+    /// progresso/erro da atualizacao). Nada aparece enquanto verifica, se ja
+    /// esta atualizado ou se a consulta falhou (ex.: sem internet).
+    fn ui_update_bar(&mut self, ctx: &egui::Context) {
+        let status = self.updater.status();
+        let visible = match &status {
+            update::Status::Available(_) => !self.update_dismissed,
+            update::Status::Downloading { .. }
+            | update::Status::Failed { .. }
+            | update::Status::Installed { .. } => true,
+            _ => false,
+        };
+        if !visible {
+            return;
+        }
+        egui::TopBottomPanel::bottom("update_bar")
+            .frame(
+                egui::Frame::NONE
+                    .fill(CARD_BG)
+                    .inner_margin(egui::Margin::symmetric(10, 6)),
+            )
+            .show_separator_line(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| match &status {
+                    update::Status::Available(r) => {
+                        ui.label(
+                            egui::RichText::new(format!("Nova versão v{} disponível", r.version))
+                                .color(ACCENT)
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("(atual: v{})", update::CURRENT))
+                                .small()
+                                .color(TEXT_WEAK),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ghost_btn(ui, "Depois") {
+                                self.update_dismissed = true;
+                            }
+                            if accent_btn(ui, "Atualizar") {
+                                self.show_update = true;
+                            }
+                        });
+                    }
+                    update::Status::Downloading { release, done, total } => {
+                        ui.label(
+                            egui::RichText::new(format!("Baixando v{}...", release.version))
+                                .color(CARD_TEXT),
+                        );
+                        let frac = if *total > 0 { *done as f32 / *total as f32 } else { 0.0 };
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .desired_width(220.0)
+                                .show_percentage(),
+                        );
+                    }
+                    update::Status::Installed { .. } => {
+                        ui.label(
+                            egui::RichText::new("Atualizado. Reiniciando o SaguTerm...")
+                                .color(ACCENT),
+                        );
+                    }
+                    update::Status::Failed { release, error } => {
+                        ui.label(
+                            egui::RichText::new(format!("Falha ao atualizar: {error}"))
+                                .color(ERROR_FG),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ghost_btn(ui, "Baixar manualmente") {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(&release.page_url));
+                            }
+                            if accent_btn(ui, "Tentar de novo") {
+                                let ctx = ui.ctx().clone();
+                                self.updater
+                                    .install(release.clone(), move || ctx.request_repaint());
+                            }
+                        });
+                    }
+                    _ => {}
+                });
+            });
+    }
+
+    /// Dialogo com as notas da versao nova e a confirmacao da atualizacao.
+    fn ui_update_dialog(&mut self, ctx: &egui::Context) {
+        let update::Status::Available(release) = self.updater.status() else {
+            self.show_update = false;
+            return;
+        };
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.show_update = false;
+            return;
+        }
+
+        let mut confirm = false;
+        let mut cancel = false;
+        let frame = egui::Frame::window(&ctx.style())
+            .fill(CARD_BG)
+            .stroke(egui::Stroke::new(1.0, CARD_BORDER))
+            .corner_radius(12.0)
+            .inner_margin(egui::Margin::same(18));
+        egui::Window::new(egui::RichText::new("Atualização disponível").color(ACCENT).strong())
+            .collapsible(false)
+            .resizable(false)
+            .movable(true)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "v{}  \u{00b7}  nova: v{}",
+                        update::CURRENT,
+                        release.version
+                    ))
+                    .size(14.0)
+                    .color(HIGHLIGHT),
+                );
+                if !release.notes.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Novidades:").color(TEXT_WEAK));
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        ui.label(egui::RichText::new(&release.notes).color(CARD_TEXT));
+                    });
+                }
+                ui.add_space(12.0);
+                let aviso = if self.root.is_some() {
+                    "O SaguTerm será reiniciado e as sessões abertas serão encerradas."
+                } else {
+                    "O SaguTerm será reiniciado ao final do download."
+                };
+                ui.label(egui::RichText::new(aviso).color(TEXT_WEAK));
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    if accent_btn(ui, "Atualizar agora") {
+                        confirm = true;
+                    }
+                    if ghost_btn(ui, "Depois") {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if confirm {
+            self.show_update = false;
+            let ctx = ctx.clone();
+            self.updater.install(release, move || ctx.request_repaint());
+        } else if cancel {
+            self.show_update = false;
+            self.update_dismissed = true;
+        }
+    }
+
+    /// Com o executavel novo instalado, abre-o e fecha esta instancia (as
+    /// sessoes sao encerradas pelo fechamento normal da janela).
+    fn restart_after_update(&mut self, ctx: &egui::Context) {
+        let update::Status::Installed { exe } = self.updater.status() else {
+            return;
+        };
+        if self.update_restarting {
+            return;
+        }
+        self.update_restarting = true;
+        if update::restart(&exe).is_ok() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        // Se nao conseguir abrir, a faixa segue dizendo "Atualizado"; a nova
+        // versao entra na proxima vez que o usuario abrir o app.
+    }
+
     /// Verdadeiro quando o painel focado e um terminal (as teclas de funcao
     /// pertencem ao shell remoto nesse caso).
     fn focused_pane_is_terminal(&self) -> bool {
@@ -2919,6 +3106,27 @@ impl App {
             atalho(ui, "Enter", "confirmar (renomear)");
             atalho(ui, "Ctrl+Enter", "salvar host");
 
+            // Versao e estado da verificacao de atualizacoes.
+            ui.add_space(12.0);
+            let estado = match self.updater.status() {
+                update::Status::Checking => "verificando atualizações...".to_string(),
+                update::Status::UpToDate => "versão mais recente".to_string(),
+                update::Status::CheckFailed(e) => {
+                    format!("não foi possível verificar atualizações ({e})")
+                }
+                update::Status::Available(r) => format!("nova versão v{} disponível", r.version),
+                update::Status::Downloading { release, .. } => {
+                    format!("baixando v{}...", release.version)
+                }
+                update::Status::Installed { .. } => "atualizado; reiniciando...".to_string(),
+                update::Status::Failed { error, .. } => format!("falha ao atualizar ({error})"),
+            };
+            ui.label(
+                egui::RichText::new(format!("SaguTerm v{}  \u{00b7}  {estado}", update::CURRENT))
+                    .small()
+                    .color(TEXT_WEAK),
+            );
+
             ui.add_space(12.0);
             ui.vertical_centered(|ui| {
                 if accent_btn(ui, "Fechar") {
@@ -2945,8 +3153,10 @@ impl App {
         // Foco "grudento": se nenhum widget tem o foco (clique num cartao ou
         // espaco vazio, dialogo fechado...), devolve-o ao ultimo painel focado,
         // para que digitar continue filtrando/indo ao terminal sem o mouse.
-        let modal_open =
-            self.editor.is_some() || self.pending_delete.is_some() || self.show_help;
+        let modal_open = self.editor.is_some()
+            || self.pending_delete.is_some()
+            || self.show_help
+            || self.show_update;
         if pending.is_none() && !modal_open && ui.memory(|m| m.focused().is_none()) {
             pending = self.last_pane_focus.clone();
         }
@@ -4185,6 +4395,17 @@ impl eframe::App for App {
             _ => {}
         }
 
+        // Aviso de versao nova (acima da barra de dicas) e, com a atualizacao
+        // instalada, reinicio no executavel novo.
+        if !matches!(self.screen, Screen::Splash) {
+            self.ui_update_bar(ctx);
+        }
+        self.restart_after_update(ctx);
+        // O dialogo vem antes do conteudo para receber o Esc primeiro.
+        if self.show_update {
+            self.ui_update_dialog(ctx);
+        }
+
         match self.screen {
             Screen::Session => {
                 egui::CentralPanel::default()
@@ -4272,6 +4493,10 @@ mod focus_tests {
             last_pane_focus: None,
             show_help: false,
             pending_delete: None,
+            updater: Updater::idle(),
+            show_update: false,
+            update_dismissed: false,
+            update_restarting: false,
         }
     }
 

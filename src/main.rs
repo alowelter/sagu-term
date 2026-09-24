@@ -6,6 +6,7 @@ mod pty;
 mod sftp;
 mod ssh;
 mod terminal;
+mod update;
 mod vault;
 
 use app::App;
@@ -23,6 +24,9 @@ fn load_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    // Remove o executavel antigo deixado por uma atualizacao automatica.
+    update::cleanup_old();
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1000.0, 680.0])
         .with_min_inner_size([640.0, 420.0])
