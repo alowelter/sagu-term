@@ -1239,6 +1239,9 @@ const ICON_FOLDER_SYNC: egui::ImageSource = egui::include_image!("../assets/fold
 const ICON_PEN: egui::ImageSource = egui::include_image!("../assets/pen.svg");
 const ICON_USERS: egui::ImageSource = egui::include_image!("../assets/users.svg");
 const ICON_PLUS: egui::ImageSource = egui::include_image!("../assets/plus.svg");
+const ICON_KEY: egui::ImageSource = egui::include_image!("../assets/key-round.svg");
+const ICON_PASSWORD: egui::ImageSource =
+    egui::include_image!("../assets/rectangle-ellipsis.svg");
 
 /// Converte uma string hexadecimal (`"#332847"` ou `"332847"`) em
 /// `egui::Color32`. E uma `const fn`, entao pode ser usada tanto em constantes
@@ -1509,6 +1512,10 @@ pub struct App {
     // pelos atalhos Ctrl+B ou ao criar um painel por divisao).
     pending_focus: Option<Vec<usize>>,
 
+    // Ultimo painel que teve o foco do teclado; recebe o foco de volta quando
+    // nenhum widget o detem (ex.: apos clicar num cartao do seletor).
+    last_pane_focus: Option<Vec<usize>>,
+
     // Janela flutuante com a lista de atalhos de teclado (F1 / Ctrl+B, A).
     show_help: bool,
 
@@ -1560,6 +1567,7 @@ impl App {
             chord_armed_at: None,
             pane_rects: Vec::new(),
             pending_focus: None,
+            last_pane_focus: None,
             show_help: false,
             pending_delete: None,
         }
@@ -2913,7 +2921,15 @@ impl App {
         let mut focused: Option<Vec<usize>> = None;
         // O pedido de foco vale por um quadro; os retangulos dos paineis sao
         // recalculados a cada renderizacao.
-        let pending = self.pending_focus.take();
+        let mut pending = self.pending_focus.take();
+        // Foco "grudento": se nenhum widget tem o foco (clique num cartao ou
+        // espaco vazio, dialogo fechado...), devolve-o ao ultimo painel focado,
+        // para que digitar continue filtrando/indo ao terminal sem o mouse.
+        let modal_open =
+            self.editor.is_some() || self.pending_delete.is_some() || self.show_help;
+        if pending.is_none() && !modal_open && ui.memory(|m| m.focused().is_none()) {
+            pending = self.last_pane_focus.clone();
+        }
         self.pane_rects.clear();
         if let Some(root) = &mut self.root {
             let mut path = Vec::new();
@@ -2929,6 +2945,9 @@ impl App {
                 &pending,
             );
         }
+        if focused.is_some() {
+            self.last_pane_focus = focused.clone();
+        }
         self.focused_path = focused;
         for action in actions {
             match action {
@@ -2936,7 +2955,11 @@ impl App {
                     // O novo painel (seletor) ja nasce com o filtro focado.
                     self.pending_focus = self.split_pane(&path, dir);
                 }
-                PaneAction::Close { path } => self.close_pane(&path),
+                PaneAction::Close { path } => {
+                    self.close_pane(&path);
+                    // O foco vai para um painel restante (ex.: Esc no seletor).
+                    self.pending_focus = self.first_pane_path();
+                }
                 PaneAction::Connect { path, host } => self.connect_pane(&path, host),
                 PaneAction::OpenLocal { path, shell } => {
                     self.connect_local_pane(&path, shell)
@@ -3158,7 +3181,7 @@ fn host_tile(
     icon: egui::ImageSource,
     title: &str,
     subtitle: &str,
-    auth: Option<(egui::Color32, &str)>,
+    auth: Option<(egui::Color32, egui::ImageSource<'static>, &str)>,
     selected: bool,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(HOST_TILE_SIZE, egui::Sense::click());
@@ -3194,53 +3217,50 @@ fn host_tile(
     let icon_rect = egui::Rect::from_center_size(badge.center(), egui::vec2(19.0, 19.0));
     egui::Image::new(icon).tint(ACCENT).paint_at(ui, icon_rect);
 
-    // Etiqueta de autenticacao no canto superior direito.
-    if let Some((color, label)) = auth {
-        let galley = painter.layout_no_wrap(
-            label.to_string(),
-            egui::FontId::proportional(11.0),
-            color,
+    // Icone do metodo de autenticacao (chave/senha) no canto superior direito;
+    // o nome do metodo aparece na dica ao passar o mouse.
+    let auth_size = 16.0;
+    let mut title_right = rect.right() - pad;
+    let mut hover = String::new();
+    if let Some((color, icon, label)) = auth {
+        let icon_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - pad - auth_size, rect.top() + pad + 2.0),
+            egui::vec2(auth_size, auth_size),
         );
-        let chip = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - pad - galley.size().x - 12.0, rect.top() + pad + 4.0),
-            egui::vec2(galley.size().x + 12.0, galley.size().y + 4.0),
-        );
-        painter.rect(
-            chip,
-            8.0,
-            color.gamma_multiply(0.18),
-            egui::Stroke::new(1.0, color.gamma_multiply(0.6)),
-            egui::StrokeKind::Inside,
-        );
-        painter.galley(
-            egui::pos2(chip.left() + 6.0, chip.top() + 2.0),
-            galley,
-            color,
-        );
+        egui::Image::new(icon).tint(color).paint_at(ui, icon_rect);
+        title_right = icon_rect.left() - 6.0;
+        hover = format!("Autenticacao por {label} \u{00b7} ");
     }
 
-    // Titulo (nome) e subtitulo (endereco), truncados para caber.
+    // Titulo (nome) e subtitulo (endereco), truncados pela largura disponivel
+    // para nunca invadir o icone de autenticacao nem a borda do cartao.
     let text_x = badge.right() + 10.0;
-    let max_chars = 18;
-    painter.text(
+    let truncated = |text: &str, size: f32, color: egui::Color32, width: f32| {
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            text.to_string(),
+            egui::FontId::proportional(size),
+            color,
+        );
+        job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(0.0));
+        ui.fonts(|f| f.layout_job(job))
+    };
+    painter.galley(
         egui::pos2(text_x, rect.top() + pad + 2.0),
-        egui::Align2::LEFT_TOP,
-        elide(title, max_chars),
-        egui::FontId::proportional(14.0),
+        truncated(title, 14.0, egui::Color32::WHITE, title_right - text_x),
         egui::Color32::WHITE,
     );
-    painter.text(
+    painter.galley(
         egui::pos2(rect.left() + pad, rect.bottom() - pad - 14.0),
-        egui::Align2::LEFT_TOP,
-        elide(subtitle, 26),
-        egui::FontId::proportional(11.0),
+        truncated(subtitle, 11.0, TEXT_WEAK, rect.width() - 2.0 * pad),
         TEXT_WEAK,
     );
 
     // Affordance: o cartao e clicavel (duplo clique conecta).
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("Duplo clique conecta \u{00b7} botao direito para opcoes")
+        .on_hover_text(format!(
+            "{hover}Duplo clique conecta \u{00b7} botao direito para opcoes"
+        ))
 }
 
 /// Acao escolhida pelo usuario no seletor de conexoes compartilhado.
@@ -3395,6 +3415,11 @@ fn connection_picker(
                 .fit_to_exact_size(egui::vec2(16.0, 16.0))
                 .tint(TEXT_WEAK),
         );
+        // Foco forcado e pedido antes de criar o campo: assim ele ja recebe o
+        // texto digitado neste mesmo quadro (senao a 1ª tecla se perderia).
+        if opts.force_focus {
+            ui.memory_mut(|m| m.request_focus(filter_id));
+        }
         let resp = ui.add(
             egui::TextEdit::singleline(filter)
                 .id(filter_id)
@@ -3405,8 +3430,21 @@ fn connection_picker(
         if resp.changed() {
             sel = 0;
         }
-        if opts.force_focus {
-            resp.request_focus();
+        if resp.has_focus() {
+            // Trava setas e Esc no campo: sem isso o egui usaria as setas para
+            // mover o foco a outro widget e o Esc para soltar o foco (entao o
+            // seletor nem veria o Esc e a digitacao deixaria de filtrar).
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    filter_id,
+                    egui::EventFilter {
+                        tab: false,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                );
+            });
         }
         // Foca o campo para que comecar a digitar ja filtre.
         if opts.autofocus && !resp.has_focus() && ui.memory(|m| m.focused().is_none()) {
@@ -3491,8 +3529,10 @@ fn connection_picker(
                             let subtitle =
                                 format!("{}@{}:{}", host.username, host.host, host.port);
                             let auth = match &host.auth {
-                                AuthMethod::Password { .. } => (AUTH_PASS, "senha"),
-                                AuthMethod::Key { .. } => (AUTH_KEY, "chave"),
+                                AuthMethod::Password { .. } => {
+                                    (AUTH_PASS, ICON_PASSWORD, "senha")
+                                }
+                                AuthMethod::Key { .. } => (AUTH_KEY, ICON_KEY, "chave"),
                             };
                             let tile = host_tile(
                                 ui,
@@ -3740,213 +3780,222 @@ fn render_node(
                     });
                 });
 
-            if pane.picking {
-                ui.add_space(8.0);
-                // O painel-seletor participa do modelo de foco: quando o campo
-                // de filtro dele detem o foco, ele e o painel focado (borda
-                // destacada e alvo dos atalhos Ctrl+B).
-                let salt = ("pane_picker", path.clone());
-                let filter_focused = ui.memory(|m| {
-                    m.focused() == Some(egui::Id::new(salt.clone()).with("filter"))
-                });
-                if filter_focused || take {
-                    *focused = Some(path.clone());
-                }
-                // Mesmo seletor de conexoes da tela principal (com filtro), porem
-                // com gerenciamento (Conectar/SFTP/Editar/Excluir).
-                let outcome = connection_picker(
-                    ui,
-                    hosts,
-                    &mut pane.filter,
-                    salt,
-                    PickerOpts {
-                        manage: true,
-                        autofocus: false,
-                        force_focus: take,
-                        closable: true,
-                    },
-                );
-                match outcome {
-                    Some(PickerAction::OpenLocal(s)) => actions.push(PaneAction::OpenLocal {
-                        path: path.clone(),
-                        shell: s,
-                    }),
-                    Some(PickerAction::Connect(h)) => actions.push(PaneAction::Connect {
-                        path: path.clone(),
-                        host: h,
-                    }),
-                    Some(PickerAction::Sftp(h)) => actions.push(PaneAction::Sftp {
-                        path: path.clone(),
-                        host: h,
-                    }),
-                    Some(PickerAction::Edit(h)) => {
-                        actions.push(PaneAction::Edit { host: h })
-                    }
-                    Some(PickerAction::NewHost) => actions.push(PaneAction::NewHost),
-                    Some(PickerAction::Delete(h)) => {
-                        actions.push(PaneAction::Delete { host: h })
-                    }
-                    // Esc com filtro vazio fecha este painel de selecao.
-                    Some(PickerAction::ClosePane) => {
-                        actions.push(PaneAction::Close { path: path.clone() })
-                    }
-                    None => {}
-                }
-            } else if pane.sftp.is_some() {
-                // Painel SFTP: navegador de arquivos remoto (apenas a pasta atual).
-                if let SessionState::Error(msg) = &pane.state {
-                    ui.colored_label(ERROR_FG, msg.clone());
-                }
-
-                // Area focavel cobrindo o conteudo: permite "selecionar" o painel
-                // (clicando) para que F5/setas atuem so no painel SFTP em foco. E
-                // adicionada antes das linhas, ficando atras delas nos cliques.
-                let content_rect = ui.available_rect_before_wrap();
-                let focus_id = ui.id().with(("sftp_focus", path.as_slice()));
-                let focus_resp = ui.interact(content_rect, focus_id, egui::Sense::click());
-                if focus_resp.clicked() || take {
-                    focus_resp.request_focus();
-                }
-                let has_focus = focus_resp.has_focus();
-                if has_focus {
-                    *focused = Some(path.clone());
-                    // Trava as setas neste foco: sem isso o egui as usaria para
-                    // mover o foco para outro widget na primeira tecla.
-                    ui.memory_mut(|m| {
-                        m.set_focus_lock_filter(
-                            focus_id,
-                            egui::EventFilter {
-                                tab: false,
-                                horizontal_arrows: true,
-                                vertical_arrows: true,
-                                escape: false,
-                            },
-                        );
+            // Conteudo recuado das bordas: a borda do painel (mais grossa quando
+            // focado) nao encobre os cartoes do seletor nem a 1ª coluna do terminal.
+            let inset = if pane.picking { 12.0 } else { 4.0 };
+            let content_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.min.x + inset, ui.cursor().min.y),
+                egui::pos2(rect.max.x - inset, rect.max.y - 3.0),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
+                if pane.picking {
+                    ui.add_space(8.0);
+                    // O painel-seletor participa do modelo de foco: quando o campo
+                    // de filtro dele detem o foco, ele e o painel focado (borda
+                    // destacada e alvo dos atalhos Ctrl+B).
+                    let salt = ("pane_picker", path.clone());
+                    let filter_focused = ui.memory(|m| {
+                        m.focused() == Some(egui::Id::new(salt.clone()).with("filter"))
                     });
-                }
-                // F5 atualiza o painel em foco ou sob o cursor.
-                let active = has_focus || focus_resp.hovered();
-                let f5 = active && ui.input(|i| i.key_pressed(egui::Key::F5));
-
-                let pointer_in = ui.rect_contains_pointer(content_rect);
-
-                let mut to_list: Vec<String> = Vec::new();
-                let mut fs_op: Option<FsOp> = None;
-                let mut cur_dir = String::new();
-                if let Some(exp) = &mut pane.explorer {
-                    let out = exp.ui(ui, ("sftp_explorer", path.as_slice()), has_focus);
-                    to_list = out.to_list;
-                    fs_op = out.op;
-                    cur_dir = exp.cur_path.clone();
-                    if out.refresh || f5 {
-                        exp.refresh(&mut to_list);
+                    if filter_focused || take {
+                        *focused = Some(path.clone());
                     }
-                    // Clicar numa linha da listagem tambem seleciona o painel.
-                    if out.clicked_row {
+                    // Mesmo seletor de conexoes da tela principal (com filtro), porem
+                    // com gerenciamento (Conectar/SFTP/Editar/Excluir).
+                    let outcome = connection_picker(
+                        ui,
+                        hosts,
+                        &mut pane.filter,
+                        salt,
+                        PickerOpts {
+                            manage: true,
+                            autofocus: false,
+                            force_focus: take,
+                            closable: true,
+                        },
+                    );
+                    match outcome {
+                        Some(PickerAction::OpenLocal(s)) => actions.push(PaneAction::OpenLocal {
+                            path: path.clone(),
+                            shell: s,
+                        }),
+                        Some(PickerAction::Connect(h)) => actions.push(PaneAction::Connect {
+                            path: path.clone(),
+                            host: h,
+                        }),
+                        Some(PickerAction::Sftp(h)) => actions.push(PaneAction::Sftp {
+                            path: path.clone(),
+                            host: h,
+                        }),
+                        Some(PickerAction::Edit(h)) => {
+                            actions.push(PaneAction::Edit { host: h })
+                        }
+                        Some(PickerAction::NewHost) => actions.push(PaneAction::NewHost),
+                        Some(PickerAction::Delete(h)) => {
+                            actions.push(PaneAction::Delete { host: h })
+                        }
+                        // Esc com filtro vazio fecha este painel de selecao.
+                        Some(PickerAction::ClosePane) => {
+                            actions.push(PaneAction::Close { path: path.clone() })
+                        }
+                        None => {}
+                    }
+                } else if pane.sftp.is_some() {
+                    // Painel SFTP: navegador de arquivos remoto (apenas a pasta atual).
+                    if let SessionState::Error(msg) = &pane.state {
+                        ui.colored_label(ERROR_FG, msg.clone());
+                    }
+
+                    // Area focavel cobrindo o conteudo: permite "selecionar" o painel
+                    // (clicando) para que F5/setas atuem so no painel SFTP em foco. E
+                    // adicionada antes das linhas, ficando atras delas nos cliques.
+                    let content_rect = ui.available_rect_before_wrap();
+                    let focus_id = ui.id().with(("sftp_focus", path.as_slice()));
+                    let focus_resp = ui.interact(content_rect, focus_id, egui::Sense::click());
+                    if focus_resp.clicked() || take {
                         focus_resp.request_focus();
                     }
-                }
+                    let has_focus = focus_resp.has_focus();
+                    if has_focus {
+                        *focused = Some(path.clone());
+                        // Trava as setas neste foco: sem isso o egui as usaria para
+                        // mover o foco para outro widget na primeira tecla.
+                        ui.memory_mut(|m| {
+                            m.set_focus_lock_filter(
+                                focus_id,
+                                egui::EventFilter {
+                                    tab: false,
+                                    horizontal_arrows: true,
+                                    vertical_arrows: true,
+                                    escape: false,
+                                },
+                            );
+                        });
+                    }
+                    // F5 atualiza o painel em foco ou sob o cursor.
+                    let active = has_focus || focus_resp.hovered();
+                    let f5 = active && ui.input(|i| i.key_pressed(egui::Key::F5));
 
-                // Operacao de gerenciamento (renomear/permissoes/excluir).
-                if let (Some(op), Some(sftp)) = (fs_op, &pane.sftp) {
-                    match op {
-                        FsOp::Rename { from, to } => sftp.rename(from, to, cur_dir.clone()),
-                        FsOp::Chmod { path, mode } => sftp.chmod(path, mode, cur_dir.clone()),
-                        FsOp::Chown { path, owner, group } => {
-                            sftp.chown(path, owner, group, cur_dir.clone())
+                    let pointer_in = ui.rect_contains_pointer(content_rect);
+
+                    let mut to_list: Vec<String> = Vec::new();
+                    let mut fs_op: Option<FsOp> = None;
+                    let mut cur_dir = String::new();
+                    if let Some(exp) = &mut pane.explorer {
+                        let out = exp.ui(ui, ("sftp_explorer", path.as_slice()), has_focus);
+                        to_list = out.to_list;
+                        fs_op = out.op;
+                        cur_dir = exp.cur_path.clone();
+                        if out.refresh || f5 {
+                            exp.refresh(&mut to_list);
                         }
-                        FsOp::Remove { path, is_dir } => {
-                            sftp.remove(path, is_dir, cur_dir.clone())
+                        // Clicar numa linha da listagem tambem seleciona o painel.
+                        if out.clicked_row {
+                            focus_resp.request_focus();
                         }
                     }
-                }
 
-                // Arrastar-e-soltar arquivos do SO: envia para o diretorio atual.
-                let dropped: Vec<PathBuf> = if pointer_in {
-                    ui.input(|i| {
-                        i.raw
-                            .dropped_files
-                            .iter()
-                            .filter_map(|f| f.path.clone())
-                            .collect()
-                    })
-                } else {
-                    Vec::new()
-                };
-
-                // Realce + dica enquanto se arrasta um arquivo sobre o painel.
-                let hovering_files = pointer_in && ui.input(|i| !i.raw.hovered_files.is_empty());
-                if hovering_files {
-                    let painter = ui.painter();
-                    painter.rect_filled(content_rect, 6.0, ACCENT.gamma_multiply(0.12));
-                    painter.text(
-                        content_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "Solte para enviar ao servidor",
-                        egui::FontId::proportional(16.0),
-                        ACCENT,
-                    );
-                }
-
-                if let Some(exp) = &pane.explorer {
-                    if let Some(sftp) = &pane.sftp {
-                        let dir = exp.cur_path.clone();
-                        if !dir.is_empty() {
-                            for local in dropped {
-                                sftp.upload(local, dir.clone());
+                    // Operacao de gerenciamento (renomear/permissoes/excluir).
+                    if let (Some(op), Some(sftp)) = (fs_op, &pane.sftp) {
+                        match op {
+                            FsOp::Rename { from, to } => sftp.rename(from, to, cur_dir.clone()),
+                            FsOp::Chmod { path, mode } => sftp.chmod(path, mode, cur_dir.clone()),
+                            FsOp::Chown { path, owner, group } => {
+                                sftp.chown(path, owner, group, cur_dir.clone())
+                            }
+                            FsOp::Remove { path, is_dir } => {
+                                sftp.remove(path, is_dir, cur_dir.clone())
                             }
                         }
                     }
-                }
 
-                if let Some(sftp) = &pane.sftp {
-                    for p in to_list {
-                        sftp.list_dir(p);
-                    }
-                }
-            } else {
-                if let SessionState::Error(msg) = &pane.state {
-                    ui.colored_label(ERROR_FG, msg.clone());
-                }
+                    // Arrastar-e-soltar arquivos do SO: envia para o diretorio atual.
+                    let dropped: Vec<PathBuf> = if pointer_in {
+                        ui.input(|i| {
+                            i.raw
+                                .dropped_files
+                                .iter()
+                                .filter_map(|f| f.path.clone())
+                                .collect()
+                        })
+                    } else {
+                        Vec::new()
+                    };
 
-                // Enquanto conecta, mostra um spinner no corpo do painel em vez
-                // de uma area preta indistinguivel de um terminal ocioso.
-                if matches!(pane.state, SessionState::Connecting) {
-                    ui.add_space((ui.available_height() * 0.4).max(12.0));
-                    ui.vertical_centered(|ui| {
-                        ui.add(egui::Spinner::new().size(20.0));
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Conectando a {}...",
-                                pane.host_name
-                            ))
-                            .color(TEXT_WEAK),
+                    // Realce + dica enquanto se arrasta um arquivo sobre o painel.
+                    let hovering_files = pointer_in && ui.input(|i| !i.raw.hovered_files.is_empty());
+                    if hovering_files {
+                        let painter = ui.painter();
+                        painter.rect_filled(content_rect, 6.0, ACCENT.gamma_multiply(0.12));
+                        painter.text(
+                            content_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Solte para enviar ao servidor",
+                            egui::FontId::proportional(16.0),
+                            ACCENT,
                         );
-                    });
-                } else {
-                    let mut output = None;
-                    if let Some(term) = &mut pane.terminal {
-                        if take {
-                            term.take_focus();
-                        }
-                        output = Some(term.ui(ui));
                     }
-                    if let Some(out) = output {
-                        if out.focused {
-                            *focused = Some(path.clone());
-                        }
-                        if let Some(ssh) = &pane.ssh {
-                            if let Some((c, r)) = out.resize {
-                                ssh.resize(c, r);
+
+                    if let Some(exp) = &pane.explorer {
+                        if let Some(sftp) = &pane.sftp {
+                            let dir = exp.cur_path.clone();
+                            if !dir.is_empty() {
+                                for local in dropped {
+                                    sftp.upload(local, dir.clone());
+                                }
                             }
-                            if !out.input.is_empty() {
-                                ssh.send_data(out.input);
+                        }
+                    }
+
+                    if let Some(sftp) = &pane.sftp {
+                        for p in to_list {
+                            sftp.list_dir(p);
+                        }
+                    }
+                } else {
+                    if let SessionState::Error(msg) = &pane.state {
+                        ui.colored_label(ERROR_FG, msg.clone());
+                    }
+
+                    // Enquanto conecta, mostra um spinner no corpo do painel em vez
+                    // de uma area preta indistinguivel de um terminal ocioso.
+                    if matches!(pane.state, SessionState::Connecting) {
+                        ui.add_space((ui.available_height() * 0.4).max(12.0));
+                        ui.vertical_centered(|ui| {
+                            ui.add(egui::Spinner::new().size(20.0));
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Conectando a {}...",
+                                    pane.host_name
+                                ))
+                                .color(TEXT_WEAK),
+                            );
+                        });
+                    } else {
+                        let mut output = None;
+                        if let Some(term) = &mut pane.terminal {
+                            if take {
+                                term.take_focus();
+                            }
+                            output = Some(term.ui(ui));
+                        }
+                        if let Some(out) = output {
+                            if out.focused {
+                                *focused = Some(path.clone());
+                            }
+                            if let Some(ssh) = &pane.ssh {
+                                if let Some((c, r)) = out.resize {
+                                    ssh.resize(c, r);
+                                }
+                                if !out.input.is_empty() {
+                                    ssh.send_data(out.input);
+                                }
                             }
                         }
                     }
                 }
-            }
+            });
 
             // Borda que delimita a janela do painel (desenhada por ultimo).
             // O painel com o foco do teclado recebe borda roxa mais clara e
@@ -4126,5 +4175,162 @@ impl eframe::App for App {
         if self.pending_delete.is_some() {
             self.ui_confirm_delete(ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod focus_tests {
+    //! Navegacao so por teclado entre paineis: o seletor criado ao dividir a
+    //! tela deve receber (e manter) o foco para que digitar ja filtre.
+    use super::*;
+
+    /// App ja na sessao, com um unico painel de terminal (sem conexao real).
+    fn app() -> App {
+        let mut pane = Pane::picker();
+        pane.picking = false;
+        pane.state = SessionState::Connected;
+        pane.terminal = Some(Terminal::new(80, 24));
+        App {
+            screen: Screen::Session,
+            vault: Vault::default(),
+            vault_path: None,
+            master_password: String::new(),
+            gate_mode: GateMode::Open,
+            gate_path: String::new(),
+            gate_password: String::new(),
+            gate_password_confirm: String::new(),
+            gate_error: None,
+            editor: None,
+            hosts_error: None,
+            hosts_filter: String::new(),
+            root: Some(Node::Leaf(pane)),
+            ctx_for_repaint: None,
+            logo_texture: None,
+            logo_load_attempted: false,
+            splash_start: Instant::now(),
+            last_vault_path: String::new(),
+            gate_focus_requested: false,
+            gate_busy: 0,
+            focused_path: None,
+            chord_armed_at: None,
+            pane_rects: Vec::new(),
+            pending_focus: None,
+            last_pane_focus: None,
+            show_help: false,
+            pending_delete: None,
+        }
+    }
+
+    fn key(k: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    fn click(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 700.0),
+            )),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            app.handle_session_keys(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| app.ui_session(ui));
+        });
+    }
+
+    /// Texto do filtro do seletor criado pela divisao (painel [1]).
+    fn new_pane_filter(app: &App) -> String {
+        match &app.root {
+            Some(Node::Split { children, .. }) => match &children[1] {
+                Node::Leaf(p) => p.filter.clone(),
+                _ => panic!("painel [1] nao e folha"),
+            },
+            _ => panic!("tela nao foi dividida"),
+        }
+    }
+
+    /// Divide pelo atalho Ctrl+B, H e devolve o contexto ja com o seletor.
+    fn split_by_keyboard() -> (egui::Context, App) {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let mut app = app();
+        for _ in 0..3 {
+            frame(&ctx, &mut app, vec![]);
+        }
+        frame(&ctx, &mut app, vec![key(egui::Key::B, egui::Modifiers::CTRL)]);
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::H, egui::Modifiers::NONE), egui::Event::Text("h".into())],
+        );
+        (ctx, app)
+    }
+
+    #[test]
+    fn split_focuses_filter_and_typing_filters() {
+        let (ctx, mut app) = split_by_keyboard();
+        assert_eq!(app.focused_path, Some(vec![1]));
+        frame(&ctx, &mut app, vec![egui::Event::Text("pg".into())]);
+        assert_eq!(new_pane_filter(&app), "pg");
+    }
+
+    #[test]
+    fn arrows_and_esc_keep_focus_on_filter() {
+        let (ctx, mut app) = split_by_keyboard();
+        frame(&ctx, &mut app, vec![egui::Event::Text("pg".into())]);
+        for k in [egui::Key::ArrowDown, egui::Key::ArrowUp, egui::Key::ArrowRight] {
+            frame(&ctx, &mut app, vec![key(k, egui::Modifiers::NONE)]);
+        }
+        // Esc limpa o filtro sem soltar o foco do campo.
+        frame(&ctx, &mut app, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
+        assert_eq!(new_pane_filter(&app), "");
+        frame(&ctx, &mut app, vec![egui::Event::Text("x".into())]);
+        assert_eq!(new_pane_filter(&app), "x");
+    }
+
+    #[test]
+    fn click_inside_picker_returns_focus_to_filter() {
+        let (ctx, mut app) = split_by_keyboard();
+        let r = app.pane_rects.iter().find(|(p, _)| *p == vec![1]).unwrap().1;
+        // Clique no corpo do seletor (fora do campo): o egui solta o foco.
+        let pos = egui::pos2(r.center().x, r.max.y - 20.0);
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos), click(pos, true)]);
+        frame(&ctx, &mut app, vec![click(pos, false)]);
+        frame(&ctx, &mut app, vec![egui::Event::Text("ns".into())]);
+        assert_eq!(new_pane_filter(&app), "ns");
+    }
+
+    #[test]
+    fn mouse_split_focuses_filter() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let mut app = app();
+        for _ in 0..3 {
+            frame(&ctx, &mut app, vec![]);
+        }
+        let r = app.pane_rects[0].1;
+        // Os botoes de divisao ficam no canto direito da barra de titulo.
+        let mut x = r.max.x - 2.0;
+        while !matches!(app.root, Some(Node::Split { .. })) && x > r.max.x - 80.0 {
+            let pos = egui::pos2(x, r.min.y + 10.0);
+            frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos)]);
+            frame(&ctx, &mut app, vec![click(pos, true)]);
+            frame(&ctx, &mut app, vec![click(pos, false)]);
+            x -= 2.0;
+        }
+        frame(&ctx, &mut app, vec![egui::Event::Text("pg".into())]);
+        assert_eq!(new_pane_filter(&app), "pg");
     }
 }
