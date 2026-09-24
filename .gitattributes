@@ -1,0 +1,2 @@
+# Scripts enviados a servidores Linux: sempre LF (sh falha com CRLF).
+*.sh text eol=lf

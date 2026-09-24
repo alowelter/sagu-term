@@ -10,6 +10,7 @@ use std::sync::Arc;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
 use crate::ssh::{SshHandle, SshToUi, UiToSsh};
+use crate::upload::UploadEvent;
 
 /// Qual shell local executar no PTY.
 #[derive(Clone, Copy, PartialEq)]
@@ -162,6 +163,15 @@ where
                     });
                 }
                 UiToSsh::Disconnect => break,
+                // A UI nao envia arquivos para terminais locais
+                // (`supports_upload` e falso); responde por garantia.
+                UiToSsh::DropFiles { id, .. } | UiToSsh::Upload { id, .. } => {
+                    let _ = from_pty_tx.send(SshToUi::Upload(UploadEvent::Failed {
+                        id,
+                        error: "terminais locais nao recebem arquivos".into(),
+                    }));
+                    (*repaint)();
+                }
             }
         }
 

@@ -7,6 +7,7 @@ mod sftp;
 mod ssh;
 mod terminal;
 mod update;
+mod upload;
 mod vault;
 
 use app::App;

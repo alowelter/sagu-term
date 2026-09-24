@@ -4,7 +4,11 @@
 //! um runtime tokio. A comunicacao acontece por dois canais:
 //! - `UiToSsh`: a UI envia teclado/redimensionamento/desconexao;
 //! - `SshToUi`: a sessao envia status e bytes recebidos do servidor.
+//!
+//! Arquivos soltos sobre o terminal sao enviados por tarefas paralelas na
+//! mesma conexao (ver [`crate::upload`]).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +16,9 @@ use russh::client;
 use russh::keys::{decode_secret_key, PrivateKeyWithHashAlg};
 use russh::ChannelMsg;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinSet;
 
+use crate::upload::{self, UploadEvent};
 use crate::vault::{AuthMethod, Host};
 
 /// Mensagens da sessao SSH para a UI.
@@ -21,6 +27,8 @@ pub enum SshToUi {
     Data(Vec<u8>),
     Error(String),
     Closed,
+    /// Andamento/resultado de um envio de arquivos soltos sobre o terminal.
+    Upload(UploadEvent),
 }
 
 /// Mensagens da UI para a sessao SSH.
@@ -28,6 +36,17 @@ pub enum UiToSsh {
     Data(Vec<u8>),
     Resize { cols: u16, rows: u16 },
     Disconnect,
+    /// Arquivos soltos sobre o terminal: descobre a pasta do shell e envia,
+    /// ou devolve um `UploadEvent::Plan` para o usuario decidir.
+    DropFiles { id: u64, files: Vec<PathBuf> },
+    /// Envia para a pasta escolhida pelo usuario (resposta a um `Plan`);
+    /// `replace` lista os nomes que ele autorizou substituir.
+    Upload {
+        id: u64,
+        dir: String,
+        files: Vec<PathBuf>,
+        replace: Vec<String>,
+    },
 }
 
 /// Handler do cliente russh. Aceita a chave do servidor automaticamente
@@ -91,6 +110,8 @@ pub(crate) async fn connect_and_auth(host: &Host) -> anyhow::Result<client::Hand
 pub struct SshHandle {
     to_ssh: UnboundedSender<UiToSsh>,
     pub from_ssh: std::sync::mpsc::Receiver<SshToUi>,
+    /// Aceita arquivos soltos (so sessoes SSH; terminais locais nao).
+    supports_upload: bool,
 }
 
 impl SshHandle {
@@ -101,7 +122,50 @@ impl SshHandle {
         to_ssh: UnboundedSender<UiToSsh>,
         from_ssh: std::sync::mpsc::Receiver<SshToUi>,
     ) -> Self {
-        SshHandle { to_ssh, from_ssh }
+        SshHandle {
+            to_ssh,
+            from_ssh,
+            supports_upload: false,
+        }
+    }
+
+    /// Handle ligado a canais de teste: devolve tambem o lado "sessao" (o que
+    /// a UI mandou e por onde injetar eventos).
+    #[cfg(test)]
+    pub(crate) fn test_pair(
+        supports_upload: bool,
+    ) -> (
+        Self,
+        UnboundedReceiver<UiToSsh>,
+        std::sync::mpsc::Sender<SshToUi>,
+    ) {
+        let (to_tx, to_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (from_tx, from_rx) = std::sync::mpsc::channel();
+        let handle = SshHandle {
+            to_ssh: to_tx,
+            from_ssh: from_rx,
+            supports_upload,
+        };
+        (handle, to_rx, from_tx)
+    }
+
+    pub fn supports_upload(&self) -> bool {
+        self.supports_upload
+    }
+
+    /// Arquivos soltos sobre o terminal (ver `UiToSsh::DropFiles`).
+    pub fn drop_files(&self, id: u64, files: Vec<PathBuf>) {
+        let _ = self.to_ssh.send(UiToSsh::DropFiles { id, files });
+    }
+
+    /// Envia para a pasta escolhida pelo usuario (ver `UiToSsh::Upload`).
+    pub fn upload(&self, id: u64, dir: String, files: Vec<PathBuf>, replace: Vec<String>) {
+        let _ = self.to_ssh.send(UiToSsh::Upload {
+            id,
+            dir,
+            files,
+            replace,
+        });
     }
 
     pub fn send_data(&self, data: Vec<u8>) {
@@ -152,6 +216,7 @@ where
     SshHandle {
         to_ssh: to_ssh_tx,
         from_ssh: from_ssh_rx,
+        supports_upload: true,
     }
 }
 
@@ -166,7 +231,9 @@ async fn run_session<F>(
 where
     F: Fn() + Send + 'static,
 {
-    let session = connect_and_auth(&host).await?;
+    // Compartilhada com as tarefas de envio de arquivos (canais extras na
+    // mesma conexao; abrir canal so precisa de `&self`).
+    let session = Arc::new(connect_and_auth(&host).await?);
 
     let mut channel = session.channel_open_session().await?;
     channel
@@ -187,8 +254,20 @@ where
     // aparece como fim do canal (`None`) sem CLOSE nem exit-status.
     let mut clean_exit = false;
 
+    // Envios de arquivos: cada lote roda numa tarefa propria (nunca dentro
+    // deste loop: um canal nao drenado trava a conexao inteira, shell junto)
+    // e reporta por `up_rx`, repassado a UI aqui.
+    let mut uploads: JoinSet<()> = JoinSet::new();
+    let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<UploadEvent>();
+
     loop {
         tokio::select! {
+            Some(ev) = up_rx.recv() => {
+                let _ = from_ssh.send(SshToUi::Upload(ev));
+                repaint();
+            }
+            // Recolhe tarefas terminadas (o JoinSet as guarda ate serem lidas).
+            Some(_) = uploads.join_next(), if !uploads.is_empty() => {}
             cmd = to_ssh_rx.recv() => {
                 match cmd {
                     Some(UiToSsh::Data(data)) => {
@@ -201,6 +280,23 @@ where
                         clean_exit = true;
                         let _ = channel.eof().await;
                         break;
+                    }
+                    Some(UiToSsh::DropFiles { id, files }) => {
+                        let (session, tx) = (Arc::clone(&session), up_tx.clone());
+                        uploads.spawn(async move {
+                            if let Err(e) = upload::handle_drop(&session, id, files, &tx).await {
+                                let _ = tx.send(UploadEvent::Failed { id, error: format!("{e:#}") });
+                            }
+                        });
+                    }
+                    Some(UiToSsh::Upload { id, dir, files, replace }) => {
+                        let (session, tx) = (Arc::clone(&session), up_tx.clone());
+                        uploads.spawn(async move {
+                            let r = upload::handle_upload(&session, id, dir, files, replace, &tx).await;
+                            if let Err(e) = r {
+                                let _ = tx.send(UploadEvent::Failed { id, error: format!("{e:#}") });
+                            }
+                        });
                     }
                 }
             }
@@ -231,6 +327,9 @@ where
             }
         }
     }
+
+    // Envios em andamento morrem com a sessao (a UI avisa o usuario).
+    uploads.abort_all();
 
     if !clean_exit {
         anyhow::bail!("conexao perdida (a sessao caiu sem encerramento normal)");

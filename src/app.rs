@@ -8,6 +8,7 @@ use crate::sftp::{self, SftpHandle, SftpToUi};
 use crate::ssh::{self, SshHandle, SshToUi};
 use crate::terminal::Terminal;
 use crate::update::{self, Updater};
+use crate::upload::{self, UploadEvent};
 use crate::vault::{self, AuthMethod, Host, Vault};
 
 const INITIAL_COLS: u16 = 80;
@@ -123,6 +124,54 @@ struct Pane {
     /// Marcado quando a sessao encerra normalmente (ex.: `exit`); leva ao
     /// fechamento automatico do painel no proximo quadro.
     should_close: bool,
+    /// Envio de arquivos soltos sobre este terminal (um lote por vez).
+    upload: Option<UploadUi>,
+}
+
+/// Envio de arquivos soltos sobre um terminal SSH, visto pela UI.
+struct UploadUi {
+    /// Identifica o lote nos eventos da sessao (0 = so uma mensagem local).
+    id: u64,
+    /// Pastas soltas junto, ignoradas (ainda nao sao enviadas).
+    skipped_dirs: usize,
+    stage: UploadStage,
+}
+
+enum UploadStage {
+    /// Descobrindo a pasta do shell e conferindo o destino.
+    Locating { since: Instant },
+    /// Destino incerto: aguardando a escolha do usuario (barra no painel).
+    Asking(upload::DropPlan),
+    Sending {
+        dir: String,
+        index: usize,
+        count: usize,
+        name: String,
+        sent: u64,
+        size: u64,
+    },
+    /// Resultado final; quando `ok`, some sozinho apos alguns segundos.
+    Done { text: String, ok: bool, at: Instant },
+}
+
+impl UploadUi {
+    /// Mensagem avulsa (drop recusado), sem lote na sessao.
+    fn notice(text: &str) -> Self {
+        UploadUi {
+            id: 0,
+            skipped_dirs: 0,
+            stage: UploadStage::Done {
+                text: text.to_string(),
+                ok: false,
+                at: Instant::now(),
+            },
+        }
+    }
+
+    /// Lote em andamento (nao aceita outro drop ate terminar).
+    fn busy(&self) -> bool {
+        !matches!(self.stage, UploadStage::Done { .. })
+    }
 }
 
 impl Pane {
@@ -138,6 +187,7 @@ impl Pane {
             picking: true,
             filter: String::new(),
             should_close: false,
+            upload: None,
         }
     }
 }
@@ -1537,6 +1587,9 @@ pub struct App {
     update_dismissed: bool,
     // Reinicio pos-atualizacao ja disparado (evita abrir o app duas vezes).
     update_restarting: bool,
+
+    // Proximo id de lote de envio de arquivos soltos sobre um terminal.
+    next_upload_id: u64,
 }
 
 /// Nome de exibicao de um host: o apelido, ou o endereco quando sem apelido.
@@ -1593,6 +1646,7 @@ impl App {
             show_update: false,
             update_dismissed: false,
             update_restarting: false,
+            next_upload_id: 1,
         }
     }
 
@@ -2507,7 +2561,23 @@ impl App {
                             }
                         }
                         SshToUi::Error(msg) => pane.state = SessionState::Error(msg),
+                        SshToUi::Upload(ev) => apply_upload_event(pane, ev),
                         SshToUi::Closed => {
+                            // Envio em andamento morre com a sessao: mantem o
+                            // painel aberto com o aviso em vez de fecha-lo.
+                            if pane.upload.as_ref().is_some_and(|u| {
+                                matches!(
+                                    u.stage,
+                                    UploadStage::Locating { .. } | UploadStage::Sending { .. }
+                                )
+                            }) {
+                                pane.upload = Some(UploadUi::notice(
+                                    "Envio interrompido: a sessão foi encerrada.",
+                                ));
+                                pane.state = SessionState::Error(
+                                    "sessao encerrada durante o envio de arquivos".into(),
+                                );
+                            }
                             // Encerramento normal (ex.: `exit`): fecha o painel.
                             if matches!(pane.state, SessionState::Error(_)) {
                                 // Mantem o painel para o usuario ler o erro.
@@ -3003,6 +3073,119 @@ impl App {
         }
     }
 
+    /// Arquivos soltos na janela (vindos do Explorer): vao para o painel sob o
+    /// cursor. Painel SFTP: pasta aberta nele. Terminal SSH: pasta atual do
+    /// shell (a sessao descobre qual e). Outros paineis recusam com aviso.
+    fn handle_file_drop(&mut self, ctx: &egui::Context) {
+        let files: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        let modal_open = self.editor.is_some()
+            || self.pending_delete.is_some()
+            || self.show_help
+            || self.show_update;
+        if files.is_empty() || modal_open {
+            return;
+        }
+        let Some(path) = drop_target(ctx, &self.pane_rects) else {
+            return;
+        };
+        let Some(Node::Leaf(pane)) = self.root.as_mut().and_then(|r| node_at_mut(r, &path)) else {
+            return;
+        };
+        if pane.picking {
+            return;
+        }
+        if let (Some(sftp), Some(exp)) = (&pane.sftp, &pane.explorer) {
+            if !exp.cur_path.is_empty() {
+                for f in files {
+                    sftp.upload(f, exp.cur_path.clone());
+                }
+            }
+            return;
+        }
+        let Some(ssh) = &pane.ssh else {
+            return;
+        };
+        if pane.upload.as_ref().is_some_and(UploadUi::busy) {
+            // Um lote por vez (a dica sobre o painel ja avisou).
+            return;
+        }
+        if !ssh.supports_upload() {
+            pane.upload = Some(UploadUi::notice(
+                "Terminais locais não recebem arquivos; solte sobre um terminal SSH.",
+            ));
+            return;
+        }
+        if !matches!(pane.state, SessionState::Connected) {
+            pane.upload = Some(UploadUi::notice("Aguarde a conexão para enviar arquivos."));
+            return;
+        }
+        let (dirs, files): (Vec<PathBuf>, Vec<PathBuf>) =
+            files.into_iter().partition(|f| f.is_dir());
+        if files.is_empty() {
+            pane.upload = Some(UploadUi::notice(
+                "Pastas ainda não são enviadas; arraste os arquivos.",
+            ));
+            return;
+        }
+        let id = self.next_upload_id;
+        self.next_upload_id += 1;
+        ssh.drop_files(id, files);
+        pane.upload = Some(UploadUi {
+            id,
+            skipped_dirs: dirs.len(),
+            stage: UploadStage::Locating {
+                since: Instant::now(),
+            },
+        });
+        // O painel que recebeu os arquivos passa a ser o focado.
+        self.pending_focus = Some(path);
+    }
+
+    /// Realce do painel sob o cursor enquanto arquivos sao arrastados sobre a
+    /// janela, com a dica de para onde iriam.
+    fn ui_drop_overlay(&self, ctx: &egui::Context) {
+        if ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            return;
+        }
+        // O Windows nao avisa o movimento do mouse durante o arrasto:
+        // redesenha em ciclo curto para o realce acompanhar o cursor.
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        let Some(path) = drop_target(ctx, &self.pane_rects) else {
+            return;
+        };
+        let Some(rect) = self.pane_rects.iter().find(|(p, _)| *p == path).map(|(_, r)| *r) else {
+            return;
+        };
+        let Some(Node::Leaf(pane)) = self.root.as_ref().and_then(|r| node_at(r, &path)) else {
+            return;
+        };
+        let (text, accepts) = drop_hint(pane);
+        if text.is_empty() {
+            return;
+        }
+        let color = if accepts { ACCENT } else { TEXT_WEAK };
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("drop_overlay"),
+        ));
+        let r = rect.shrink(3.0);
+        painter.rect_filled(r, 6.0, color.gamma_multiply(0.14));
+        painter.rect_stroke(r, 6.0, egui::Stroke::new(2.0, color), egui::StrokeKind::Inside);
+        painter.text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::proportional(16.0),
+            color,
+        );
+    }
+
     /// Com o executavel novo instalado, abre-o e fecha esta instancia (as
     /// sessoes sao encerradas pelo fechamento normal da janela).
     fn restart_after_update(&mut self, ctx: &egui::Context) {
@@ -3236,6 +3419,356 @@ fn disconnect_tree(node: &Node) {
             }
         }
     }
+}
+
+/// Aplica um evento de envio ao estado do painel (ignora lotes antigos).
+fn apply_upload_event(pane: &mut Pane, ev: UploadEvent) {
+    let Some(u) = &mut pane.upload else {
+        return;
+    };
+    let id = match &ev {
+        UploadEvent::Plan(p) => p.id,
+        UploadEvent::Progress { id, .. }
+        | UploadEvent::Finished { id, .. }
+        | UploadEvent::Failed { id, .. } => *id,
+    };
+    if u.id != id {
+        return;
+    }
+    u.stage = match ev {
+        UploadEvent::Plan(plan) => UploadStage::Asking(plan),
+        UploadEvent::Progress {
+            dir,
+            index,
+            count,
+            name,
+            sent,
+            size,
+            ..
+        } => UploadStage::Sending {
+            dir,
+            index,
+            count,
+            name,
+            sent,
+            size,
+        },
+        UploadEvent::Finished {
+            dir, sent, failed, ..
+        } => UploadStage::Done {
+            text: finished_text(&dir, &sent, &failed, u.skipped_dirs),
+            ok: failed.is_empty(),
+            at: Instant::now(),
+        },
+        UploadEvent::Failed { error, .. } => UploadStage::Done {
+            text: format!("Falha no envio: {error}"),
+            ok: false,
+            at: Instant::now(),
+        },
+    };
+}
+
+/// Resumo de um lote concluido.
+fn finished_text(dir: &str, sent: &[String], failed: &[(String, String)], skipped: usize) -> String {
+    let dir = show_path(dir);
+    let mut text = if failed.is_empty() {
+        match sent.len() {
+            1 => format!("{} enviado para {dir}", sent[0]),
+            n => format!("{n} arquivos enviados para {dir}"),
+        }
+    } else {
+        let (name, err) = &failed[0];
+        let mut t = format!(
+            "{} de {} enviados para {dir}; {name}: {err}",
+            sent.len(),
+            sent.len() + failed.len()
+        );
+        if failed.len() > 1 {
+            t.push_str(&format!(" (+{} com erro)", failed.len() - 1));
+        }
+        t
+    };
+    if skipped > 0 {
+        text.push_str(&format!(" \u{00b7} {skipped} pasta(s) ignorada(s)"));
+    }
+    text
+}
+
+/// Caminho remoto para exibir: troca caracteres de controle e de direcao de
+/// texto (que poderiam disfarcar o destino) por '?'.
+fn show_path(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let bidi = matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+            if c.is_control() || bidi {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Posicao do cursor em pontos da janela, perguntada ao Windows. Durante um
+/// arrasto vindo do Explorer o egui nao recebe movimento do mouse (a posicao
+/// dele fica velha ou vazia), entao o painel alvo e achado por aqui.
+#[cfg(windows)]
+fn os_cursor_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetCursorPos(p: *mut Point) -> i32;
+    }
+    // Origem da area cliente em pontos (None em testes, sem janela real).
+    let inner = ctx.input(|i| i.viewport().inner_rect)?;
+    let mut p = Point { x: 0, y: 0 };
+    // SAFETY: GetCursorPos apenas escreve no POINT fornecido.
+    if unsafe { GetCursorPos(&mut p) } == 0 {
+        return None;
+    }
+    let ppp = ctx.pixels_per_point();
+    Some(egui::pos2(p.x as f32 / ppp, p.y as f32 / ppp) - inner.min.to_vec2())
+}
+
+#[cfg(not(windows))]
+fn os_cursor_pos(_ctx: &egui::Context) -> Option<egui::Pos2> {
+    None
+}
+
+/// Painel sob o cursor (retangulos do ultimo quadro). Sem posicao confiavel,
+/// nenhum painel: nunca "chuta" o painel focado (poderia ir ao servidor errado).
+fn drop_target(ctx: &egui::Context, rects: &[(Vec<usize>, egui::Rect)]) -> Option<Vec<usize>> {
+    let pos = os_cursor_pos(ctx).or_else(|| ctx.input(|i| i.pointer.latest_pos()))?;
+    rects
+        .iter()
+        .find(|(_, r)| r.contains(pos))
+        .map(|(p, _)| p.clone())
+}
+
+/// Dica exibida sobre o painel enquanto arquivos sao arrastados por cima;
+/// `true` quando o painel aceita o drop.
+fn drop_hint(pane: &Pane) -> (String, bool) {
+    if pane.picking {
+        return ("Escolha uma conexão antes de soltar arquivos".into(), false);
+    }
+    if let Some(exp) = &pane.explorer {
+        return if exp.cur_path.is_empty() {
+            ("Aguarde a pasta carregar".into(), false)
+        } else {
+            (format!("Solte para enviar a {}", show_path(&exp.cur_path)), true)
+        };
+    }
+    let Some(ssh) = &pane.ssh else {
+        return (String::new(), false);
+    };
+    if !ssh.supports_upload() {
+        ("Terminal local: não recebe arquivos".into(), false)
+    } else if !matches!(pane.state, SessionState::Connected) {
+        ("Aguarde a conexão para enviar arquivos".into(), false)
+    } else if pane.upload.as_ref().is_some_and(UploadUi::busy) {
+        ("Aguarde o envio atual terminar".into(), false)
+    } else {
+        (
+            format!("Solte para enviar a {}\n(pasta atual do terminal)", pane.host_name),
+            true,
+        )
+    }
+}
+
+/// Situacao do envio na barra de titulo do painel. Devolve `true` quando o
+/// usuario clica para dispensar uma mensagem de erro.
+fn upload_status(ui: &mut egui::Ui, upload: &Option<UploadUi>) -> bool {
+    let Some(u) = upload else {
+        return false;
+    };
+    let (text, color, full) = match &u.stage {
+        UploadStage::Locating { since } => {
+            // Evita piscar quando a descoberta e rapida.
+            let wait = std::time::Duration::from_millis(300);
+            if since.elapsed() < wait {
+                ui.ctx().request_repaint_after(wait - since.elapsed());
+                return false;
+            }
+            ("localizando pasta\u{2026}".to_string(), TEXT_WEAK, String::new())
+        }
+        UploadStage::Asking(_) => (
+            "escolha o destino do envio".to_string(),
+            HIGHLIGHT,
+            String::new(),
+        ),
+        UploadStage::Sending {
+            dir,
+            index,
+            count,
+            name,
+            sent,
+            size,
+        } => {
+            let pct = if *size == 0 { 100 } else { sent.saturating_mul(100) / size };
+            let text = if *count > 1 {
+                format!("enviando {}/{count} \u{00b7} {pct}%", index + 1)
+            } else {
+                format!("enviando {} \u{00b7} {pct}%", elide(name, 28))
+            };
+            (text, ACCENT, format!("{name} \u{2192} {}", show_path(dir)))
+        }
+        UploadStage::Done { text, ok, .. } => {
+            let color = if *ok { AUTH_KEY } else { ERROR_FG };
+            let full = if *ok {
+                text.clone()
+            } else {
+                format!("{text}\n(clique para dispensar)")
+            };
+            (elide(text, 60), color, full)
+        }
+    };
+    let resp = ui.add(
+        egui::Label::new(egui::RichText::new(text).small().color(color))
+            .sense(egui::Sense::click()),
+    );
+    let resp = if full.is_empty() { resp } else { resp.on_hover_text(full) };
+    matches!(u.stage, UploadStage::Done { ok: false, .. }) && resp.clicked()
+}
+
+/// Escolha feita na barra de destino.
+enum PlanChoice {
+    Send { dir: String, replace: Vec<String> },
+    Cancel,
+}
+
+/// Explica por que o destino nao foi usado direto.
+fn plan_headline(plan: &upload::DropPlan) -> String {
+    let p = &plan.probe;
+    // O script troca espacos por '_' no nome do programa (ex.: "tmux: client").
+    let comm = if p.fg_comm.is_empty() {
+        "?".to_string()
+    } else {
+        p.fg_comm.replace('_', " ")
+    };
+    if upload::confident(p) {
+        return "Já existe arquivo com o mesmo nome na pasta do terminal.".into();
+    }
+    if let (Some(dir), false) = (&p.dir, p.writable) {
+        if p.method != "home" && p.method != "none" {
+            return format!("Sem permissão de escrita em {}.", show_path(dir));
+        }
+    }
+    match (p.method.as_str(), p.reason.as_str()) {
+        ("tmux", _) => "O terminal está no tmux; a pasta abaixo é a do painel ativo dele.".into(),
+        (_, "multiplexer") | (_, "tmux-failed") => format!(
+            "O terminal está num multiplexador ({comm}); a pasta pode estar desatualizada."
+        ),
+        (_, "fg-unreadable") => format!(
+            "O programa em uso no terminal ({comm}) roda como outro usuário; não vejo a pasta dele."
+        ),
+        ("fg", _) => format!("O terminal está executando '{comm}', numa pasta diferente da do shell."),
+        (_, reason) => {
+            let motivo = match reason {
+                "no-shell" => "o shell deste terminal não foi encontrado no servidor",
+                "cwd-unreadable" => "a pasta atual não pôde ser lida",
+                "no-proc" => "o servidor não oferece /proc",
+                "timeout" => "o servidor não respondeu a tempo",
+                "exec-refused" => "o servidor não permite executar comandos",
+                "no-marker" => "o shell do servidor não executou a verificação",
+                other => other,
+            };
+            format!("Não consegui descobrir a pasta atual do terminal ({motivo}).")
+        }
+    }
+}
+
+/// Barra flutuante no rodape do painel com as opcoes de destino. So botoes:
+/// nenhuma tecla e capturada (o que se digita continua indo ao terminal).
+fn upload_plan_bar(
+    ctx: &egui::Context,
+    pane_rect: egui::Rect,
+    path: &[usize],
+    plan: &upload::DropPlan,
+) -> Option<PlanChoice> {
+    let p = &plan.probe;
+    let mut choice = None;
+    let width = (pane_rect.width() - 24.0).clamp(160.0, 640.0);
+    egui::Area::new(egui::Id::new(("upload_plan", path.to_vec())))
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .fixed_pos(pane_rect.left_bottom() + egui::vec2(12.0, -12.0))
+        .show(ctx, |ui| {
+            egui::Frame::NONE
+                .fill(CARD_BG)
+                .stroke(egui::Stroke::new(1.0, HIGHLIGHT))
+                .corner_radius(8.0)
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_max_width(width);
+                    ui.label(egui::RichText::new(plan_headline(plan)).color(HIGHLIGHT).strong());
+                    let nomes: Vec<String> = plan
+                        .files
+                        .iter()
+                        .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
+                        .collect();
+                    ui.label(
+                        egui::RichText::new(format!("Arquivos: {}", elide(&nomes.join(", "), 90)))
+                            .small()
+                            .color(TEXT_WEAK),
+                    );
+                    if !plan.conflicts.is_empty() {
+                        let mais = plan.conflicts.len().saturating_sub(5);
+                        let mut lista = plan.conflicts.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                        if mais > 0 {
+                            lista.push_str(&format!(" e mais {mais}"));
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("Já existe(m) no destino: {lista}"))
+                                .small()
+                                .color(ERROR_FG),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if let (Some(dir), true) = (&p.dir, p.writable) {
+                            if accent_btn(ui, &format!("Enviar para {}", elide(&show_path(dir), 40))) {
+                                choice = Some(PlanChoice::Send {
+                                    dir: dir.clone(),
+                                    replace: Vec::new(),
+                                });
+                            }
+                            if !plan.conflicts.is_empty() && danger_btn(ui, "Substituir e enviar") {
+                                choice = Some(PlanChoice::Send {
+                                    dir: dir.clone(),
+                                    replace: plan.conflicts.clone(),
+                                });
+                            }
+                        }
+                        if let Some(shd) = &p.shell_dir {
+                            if p.dir.as_ref() != Some(shd)
+                                && ghost_btn(ui, &format!("Pasta do shell: {}", elide(&show_path(shd), 32)))
+                            {
+                                choice = Some(PlanChoice::Send {
+                                    dir: shd.clone(),
+                                    replace: Vec::new(),
+                                });
+                            }
+                        }
+                        if !plan.home.is_empty()
+                            && p.dir.as_ref() != Some(&plan.home)
+                            && ghost_btn(ui, &format!("Pasta pessoal: {}", elide(&show_path(&plan.home), 32)))
+                        {
+                            choice = Some(PlanChoice::Send {
+                                dir: plan.home.clone(),
+                                replace: Vec::new(),
+                            });
+                        }
+                        if ghost_btn(ui, "Cancelar") {
+                            choice = Some(PlanChoice::Cancel);
+                        }
+                    });
+                });
+        });
+    choice
 }
 
 /// Novo caminho de um painel `f` depois de fechar o filho `idx` da divisao em
@@ -3965,6 +4498,20 @@ fn render_node(
                 SessionState::Error(_) => "erro",
             };
 
+            // Mensagem de envio concluido some sozinha apos alguns segundos.
+            if let Some(UploadUi {
+                stage: UploadStage::Done { ok: true, at, .. },
+                ..
+            }) = &pane.upload
+            {
+                let left = std::time::Duration::from_secs(6).saturating_sub(at.elapsed());
+                if left.is_zero() {
+                    pane.upload = None;
+                } else {
+                    ui.ctx().request_repaint_after(left);
+                }
+            }
+
             // Barra de titulo com fundo proprio, ocupando toda a largura.
             egui::Frame::NONE
                 .fill(TITLE_BG)
@@ -4038,6 +4585,11 @@ fn render_node(
                                         path: path.clone(),
                                         dir: SplitDir::SideBySide,
                                     });
+                                }
+                                // Andamento/resultado do envio de arquivos.
+                                ui.add_space(6.0);
+                                if upload_status(ui, &pane.upload) {
+                                    pane.upload = None;
                                 }
                             },
                         );
@@ -4140,8 +4692,6 @@ fn render_node(
                     let active = has_focus || focus_resp.hovered();
                     let f5 = active && ui.input(|i| i.key_pressed(egui::Key::F5));
 
-                    let pointer_in = ui.rect_contains_pointer(content_rect);
-
                     let mut to_list: Vec<String> = Vec::new();
                     let mut fs_op: Option<FsOp> = None;
                     let mut cur_dir = String::new();
@@ -4169,44 +4719,6 @@ fn render_node(
                             }
                             FsOp::Remove { path, is_dir } => {
                                 sftp.remove(path, is_dir, cur_dir.clone())
-                            }
-                        }
-                    }
-
-                    // Arrastar-e-soltar arquivos do SO: envia para o diretorio atual.
-                    let dropped: Vec<PathBuf> = if pointer_in {
-                        ui.input(|i| {
-                            i.raw
-                                .dropped_files
-                                .iter()
-                                .filter_map(|f| f.path.clone())
-                                .collect()
-                        })
-                    } else {
-                        Vec::new()
-                    };
-
-                    // Realce + dica enquanto se arrasta um arquivo sobre o painel.
-                    let hovering_files = pointer_in && ui.input(|i| !i.raw.hovered_files.is_empty());
-                    if hovering_files {
-                        let painter = ui.painter();
-                        painter.rect_filled(content_rect, 6.0, ACCENT.gamma_multiply(0.12));
-                        painter.text(
-                            content_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "Solte para enviar ao servidor",
-                            egui::FontId::proportional(16.0),
-                            ACCENT,
-                        );
-                    }
-
-                    if let Some(exp) = &pane.explorer {
-                        if let Some(sftp) = &pane.sftp {
-                            let dir = exp.cur_path.clone();
-                            if !dir.is_empty() {
-                                for local in dropped {
-                                    sftp.upload(local, dir.clone());
-                                }
                             }
                         }
                     }
@@ -4257,6 +4769,35 @@ fn render_node(
                                 }
                             }
                         }
+
+                        // Destino incerto para os arquivos soltos: barra com
+                        // as opcoes sobre o rodape do painel.
+                        if let Some(UploadUi {
+                            stage: UploadStage::Asking(plan),
+                            ..
+                        }) = &pane.upload
+                        {
+                            let plan = plan.clone();
+                            match upload_plan_bar(ui.ctx(), rect, path, &plan) {
+                                Some(PlanChoice::Send { dir, replace }) => {
+                                    if let Some(ssh) = &pane.ssh {
+                                        ssh.upload(plan.id, dir.clone(), plan.files.clone(), replace);
+                                    }
+                                    if let Some(u) = &mut pane.upload {
+                                        u.stage = UploadStage::Sending {
+                                            dir,
+                                            index: 0,
+                                            count: plan.files.len(),
+                                            name: String::new(),
+                                            sent: 0,
+                                            size: 0,
+                                        };
+                                    }
+                                }
+                                Some(PlanChoice::Cancel) => pane.upload = None,
+                                None => {}
+                            }
+                        }
                     }
                 }
             });
@@ -4304,6 +4845,9 @@ impl eframe::App for App {
             Screen::Session => {
                 self.handle_session_keys(ctx);
                 self.drain_ssh_events();
+                // Arquivos soltos: vao ao painel sob o cursor (retangulos do
+                // quadro anterior).
+                self.handle_file_drop(ctx);
             }
             Screen::Gate => {
                 // Abertura/criacao do cofre em dois tempos: o quadro 1 desenha
@@ -4441,6 +4985,11 @@ impl eframe::App for App {
             }
         }
 
+        // Realce do painel alvo enquanto arquivos sao arrastados sobre a janela.
+        if matches!(self.screen, Screen::Session) {
+            self.ui_drop_overlay(ctx);
+        }
+
         // Janela flutuante com a lista de atalhos (F1 / Ctrl+B, A).
         if self.show_help {
             self.ui_help(ctx);
@@ -4497,6 +5046,7 @@ mod focus_tests {
             show_update: false,
             update_dismissed: false,
             update_restarting: false,
+            next_upload_id: 1,
         }
     }
 
@@ -4658,5 +5208,213 @@ mod focus_tests {
         frame(&ctx, &mut app, vec![egui::Event::Text("pg".into())]);
         assert_eq!(new_pane_filter(&app), "pg");
     }
-}
 
+    // --- Arquivos soltos sobre paineis -----------------------------------
+
+    /// Quadro completo da sessao, como em `update()`, com arquivos soltos
+    /// e/ou sendo arrastados sobre a janela.
+    fn frame_drop(
+        ctx: &egui::Context,
+        app: &mut App,
+        events: Vec<egui::Event>,
+        dropped: Vec<PathBuf>,
+    ) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 700.0),
+            )),
+            events,
+            dropped_files: dropped
+                .into_iter()
+                .map(|p| egui::DroppedFile {
+                    path: Some(p),
+                    ..Default::default()
+                })
+                .collect(),
+            focused: true,
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            app.handle_session_keys(ctx);
+            app.drain_ssh_events();
+            app.handle_file_drop(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| app.ui_session(ui));
+            app.ui_drop_overlay(ctx);
+        });
+    }
+
+    /// App com um terminal SSH "conectado" a canais de teste.
+    fn ssh_app(
+        supports_upload: bool,
+    ) -> (
+        App,
+        tokio::sync::mpsc::UnboundedReceiver<crate::ssh::UiToSsh>,
+        std::sync::mpsc::Sender<crate::ssh::SshToUi>,
+    ) {
+        let mut app = app();
+        let (handle, to_rx, from_tx) = crate::ssh::SshHandle::test_pair(supports_upload);
+        if let Some(Node::Leaf(pane)) = &mut app.root {
+            pane.ssh = Some(handle);
+            pane.host_name = "servidor".into();
+        }
+        (app, to_rx, from_tx)
+    }
+
+    /// Pedidos de envio que a UI mandou a sessao (ignora teclado/resize).
+    fn upload_requests(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::ssh::UiToSsh>,
+    ) -> Vec<crate::ssh::UiToSsh> {
+        use crate::ssh::UiToSsh;
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if matches!(m, UiToSsh::DropFiles { .. } | UiToSsh::Upload { .. }) {
+                out.push(m);
+            }
+        }
+        out
+    }
+
+    fn pane0(app: &App) -> &Pane {
+        match &app.root {
+            Some(Node::Leaf(p)) => p,
+            _ => panic!("esperava um unico painel"),
+        }
+    }
+
+    fn temp_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sagu-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join(name);
+        std::fs::write(&f, b"conteudo").unwrap();
+        f
+    }
+
+    /// Solta `files` com o mouse no centro do (unico) painel.
+    fn drop_on_pane(ctx: &egui::Context, app: &mut App, files: Vec<PathBuf>) {
+        for _ in 0..2 {
+            frame_drop(ctx, app, vec![], vec![]);
+        }
+        let center = app.pane_rects[0].1.center();
+        frame_drop(ctx, app, vec![egui::Event::PointerMoved(center)], vec![]);
+        frame_drop(ctx, app, vec![], files);
+    }
+
+    #[test]
+    fn drop_on_ssh_terminal_asks_session_then_follows_events() {
+        use crate::ssh::{SshToUi, UiToSsh};
+        use crate::upload::{DropPlan, Probe, UploadEvent};
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let (mut app, mut to_rx, from_tx) = ssh_app(true);
+        let f = temp_file("relatorio.txt");
+        drop_on_pane(&ctx, &mut app, vec![f.clone()]);
+
+        // A sessao recebeu o pedido com o arquivo; o painel esta localizando.
+        let mut reqs = upload_requests(&mut to_rx);
+        assert_eq!(reqs.len(), 1);
+        let (id, files) = match reqs.remove(0) {
+            UiToSsh::DropFiles { id, files } => (id, files),
+            _ => panic!("DropFiles nao enviado"),
+        };
+        assert_eq!(files, vec![f.clone()]);
+        assert!(matches!(
+            pane0(&app).upload.as_ref().map(|u| &u.stage),
+            Some(UploadStage::Locating { .. })
+        ));
+        // Outro drop durante o lote: ignorado (um lote por vez).
+        frame_drop(&ctx, &mut app, vec![], vec![f.clone()]);
+        assert!(upload_requests(&mut to_rx).is_empty());
+
+        // Destino incerto: a sessao devolve um plano e o painel pergunta.
+        let plan = DropPlan {
+            id,
+            files: files.clone(),
+            probe: Probe {
+                method: "home".into(),
+                reason: "no-shell".into(),
+                writable: true,
+                fg_comm: String::new(),
+                dir: Some("/home/user".into()),
+                shell_dir: None,
+            },
+            home: "/home/user".into(),
+            conflicts: vec![],
+        };
+        from_tx.send(SshToUi::Upload(UploadEvent::Plan(plan))).unwrap();
+        frame_drop(&ctx, &mut app, vec![], vec![]);
+        assert!(matches!(
+            pane0(&app).upload.as_ref().map(|u| &u.stage),
+            Some(UploadStage::Asking(_))
+        ));
+
+        // Conclusao: mensagem de sucesso na barra de titulo.
+        from_tx
+            .send(SshToUi::Upload(UploadEvent::Finished {
+                id,
+                dir: "/home/user".into(),
+                sent: vec!["relatorio.txt".into()],
+                failed: vec![],
+            }))
+            .unwrap();
+        frame_drop(&ctx, &mut app, vec![], vec![]);
+        match pane0(&app).upload.as_ref().map(|u| &u.stage) {
+            Some(UploadStage::Done { text, ok: true, .. }) => {
+                assert_eq!(text, "relatorio.txt enviado para /home/user")
+            }
+            _ => panic!("esperava envio concluido"),
+        }
+    }
+
+    #[test]
+    fn drop_on_local_terminal_or_folder_is_refused() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        // Terminal local: recusado com aviso, nada vai para a sessao.
+        let (mut app, mut to_rx, _tx) = ssh_app(false);
+        drop_on_pane(&ctx, &mut app, vec![temp_file("a.txt")]);
+        assert!(upload_requests(&mut to_rx).is_empty());
+        assert!(matches!(
+            pane0(&app).upload.as_ref().map(|u| &u.stage),
+            Some(UploadStage::Done { ok: false, .. })
+        ));
+
+        // So uma pasta: recusada (pastas ainda nao sao enviadas).
+        let (mut app, mut to_rx, _tx) = ssh_app(true);
+        let pasta = temp_file("b.txt").parent().unwrap().to_path_buf();
+        drop_on_pane(&ctx, &mut app, vec![pasta]);
+        assert!(upload_requests(&mut to_rx).is_empty());
+        match pane0(&app).upload.as_ref().map(|u| &u.stage) {
+            Some(UploadStage::Done { text, ok: false, .. }) => assert!(text.contains("Pastas")),
+            _ => panic!("esperava aviso de pasta"),
+        }
+    }
+
+    #[test]
+    fn session_closed_during_upload_keeps_pane_open() {
+        use crate::ssh::SshToUi;
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let (mut app, _to_rx, from_tx) = ssh_app(true);
+        drop_on_pane(&ctx, &mut app, vec![temp_file("c.txt")]);
+        from_tx.send(SshToUi::Closed).unwrap();
+        frame_drop(&ctx, &mut app, vec![], vec![]);
+        let pane = pane0(&app);
+        assert!(!pane.should_close, "painel nao pode fechar no meio do envio");
+        assert!(matches!(pane.state, SessionState::Error(_)));
+    }
+
+    #[test]
+    fn drop_without_pointer_position_goes_nowhere() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let (mut app, mut to_rx, _tx) = ssh_app(true);
+        for _ in 0..2 {
+            frame_drop(&ctx, &mut app, vec![], vec![]);
+        }
+        // Sem posicao conhecida do cursor: nao "chuta" o painel focado.
+        frame_drop(&ctx, &mut app, vec![], vec![temp_file("d.txt")]);
+        assert!(upload_requests(&mut to_rx).is_empty());
+        assert!(pane0(&app).upload.is_none());
+    }
+}
