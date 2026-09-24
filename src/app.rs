@@ -446,8 +446,14 @@ impl FileExplorer {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
+                                let x = egui::ImageButton::new(
+                                    egui::Image::new(ICON_CLOSE)
+                                        .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                                        .tint(ERROR_FG),
+                                )
+                                .frame(false);
                                 if ui
-                                    .add(egui::Button::new("\u{2715}").frame(false))
+                                    .add(x)
                                     .on_hover_text("Dispensar")
                                     .clicked()
                                 {
@@ -2878,12 +2884,12 @@ impl App {
             };
 
             secao(ui, "Paineis da sessao");
-            atalho(ui, "Alt+(setas)", "trocar de painel (na direcao)");
+            atalho(ui, "Alt+setas", "trocar de painel (na direcao)");
 
             secao(ui, "Paineis da sessao (prefixo Ctrl+B)");
             atalho(ui, "Ctrl+B, H", "dividir lado a lado");
             atalho(ui, "Ctrl+B, V", "dividir empilhado");
-            atalho(ui, "Ctrl+B, \u{2190}\u{2191}\u{2193}\u{2192}", "trocar de painel (alternativa)");
+            atalho(ui, "Ctrl+B, setas", "trocar de painel (alternativa)");
             atalho(ui, "Ctrl+B, O", "ciclar o foco");
             atalho(ui, "Ctrl+B, X", "fechar o painel focado");
             atalho(ui, "Ctrl+B, Ctrl+B", "enviar Ctrl+B ao terminal");
@@ -2892,7 +2898,7 @@ impl App {
 
             secao(ui, "Selecao de conexoes");
             atalho(ui, "digitar", "filtrar pelo nome da conexao");
-            atalho(ui, "\u{2190}\u{2191}\u{2193}\u{2192}", "escolher na grade");
+            atalho(ui, "setas", "escolher na grade");
             atalho(ui, "Enter", "conectar a selecao");
             atalho(ui, "Ctrl+Enter", "abrir SFTP da selecao");
             atalho(ui, "Esc", "limpar filtro / fechar seletor");
@@ -2900,7 +2906,7 @@ impl App {
             atalho(ui, "Ctrl+L", "bloquear o cofre (tela de conexoes)");
 
             secao(ui, "Navegador SFTP (painel em foco)");
-            atalho(ui, "\u{2191}\u{2193}", "selecionar arquivo/pasta");
+            atalho(ui, "setas", "selecionar arquivo/pasta");
             atalho(ui, "Enter", "abrir a pasta selecionada");
             atalho(ui, "Backspace", "voltar a pasta anterior");
             atalho(ui, "F2", "renomear a selecao");
@@ -3493,7 +3499,14 @@ fn connection_picker(
         }
         if !filter.is_empty()
             && ui
-                .add(egui::Button::new("\u{2715}").frame(false))
+                .add(
+                    egui::ImageButton::new(
+                        egui::Image::new(ICON_CLOSE)
+                            .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                            .tint(TEXT_WEAK),
+                    )
+                    .frame(false),
+                )
                 .on_hover_text("Limpar filtro")
                 .clicked()
         {
@@ -4137,7 +4150,7 @@ impl eframe::App for App {
                                 ui.label(
                                     egui::RichText::new(
                                         "H dividir  \u{00b7}  V empilhar  \u{00b7}  \
-                                         \u{2190}\u{2191}\u{2193}\u{2192} trocar painel  \u{00b7}  \
+                                         setas trocar painel  \u{00b7}  \
                                          O ciclar  \u{00b7}  X fechar  \u{00b7}  \
                                          Ctrl+B literal  \u{00b7}  A ajuda  \u{00b7}  Esc cancela",
                                     )
@@ -4147,7 +4160,7 @@ impl eframe::App for App {
                             } else if in_session {
                                 ui.label(
                                     egui::RichText::new(
-                                        "Alt+\u{2190}\u{2191}\u{2193}\u{2192} troca de painel  \
+                                        "Alt+setas troca de painel  \
                                          \u{00b7}  Ctrl+B + A: Ajuda  \u{00b7}  F5 atualiza SFTP",
                                     )
                                     .small()
@@ -4157,7 +4170,7 @@ impl eframe::App for App {
                                 ui.label(
                                     egui::RichText::new(
                                         "Digite para filtrar  \u{00b7}  \
-                                         \u{2190}\u{2191}\u{2193}\u{2192} escolher  \u{00b7}  \
+                                         setas escolher  \u{00b7}  \
                                          Enter conectar  \u{00b7}  Ctrl+Enter SFTP  \u{00b7}  \
                                          Ctrl+N novo host  \u{00b7}  Ctrl+L bloquear  \u{00b7}  \
                                          F1 ajuda",
@@ -4421,3 +4434,4 @@ mod focus_tests {
         assert_eq!(new_pane_filter(&app), "pg");
     }
 }
+
