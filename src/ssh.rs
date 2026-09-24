@@ -178,9 +178,13 @@ where
     repaint();
 
     // Distingue o encerramento esperado (usuario desconectou ou o shell saiu
-    // com `exit`, que envia ExitStatus) da queda de conexao: nesse ultimo caso
-    // devolve erro para a UI preservar o painel com a mensagem em vez de
-    // fecha-lo silenciosamente.
+    // com `exit`) da queda de conexao: nesse ultimo caso devolve erro para a UI
+    // preservar o painel com a mensagem em vez de fecha-lo silenciosamente.
+    //
+    // No `exit`, o OpenSSH envia EOF, depois exit-status e por fim CLOSE. Por
+    // isso o EOF nao encerra o loop (o exit-status ainda esta a caminho); um
+    // CLOSE do servidor e um fechamento ordenado do canal. Queda de conexao
+    // aparece como fim do canal (`None`) sem CLOSE nem exit-status.
     let mut clean_exit = false;
 
     loop {
@@ -210,10 +214,16 @@ where
                         let _ = from_ssh.send(SshToUi::Data(data.to_vec()));
                         repaint();
                     }
-                    Some(ChannelMsg::ExitStatus { .. }) => {
+                    Some(ChannelMsg::ExitStatus { .. }) | Some(ChannelMsg::ExitSignal { .. }) => {
                         clean_exit = true;
                     }
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                    // Fim da saida do shell; exit-status e CLOSE vem em seguida.
+                    Some(ChannelMsg::Eof) => {}
+                    Some(ChannelMsg::Close) => {
+                        clean_exit = true;
+                        break;
+                    }
+                    None => {
                         break;
                     }
                     _ => {}

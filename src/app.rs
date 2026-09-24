@@ -1468,7 +1468,7 @@ pub struct App {
     editor: Option<HostEditor>,
     hosts_error: Option<String>,
 
-    // Texto de busca para filtrar a listagem de hosts (por nome/apelido/host).
+    // Texto de busca para filtrar a listagem de hosts (pelo nome da conexao).
     hosts_filter: String,
 
     // Sessao: arvore de paineis (divisoes recursivas).
@@ -1646,6 +1646,7 @@ impl App {
             disconnect_tree(root);
         }
         self.root = None;
+        self.last_pane_focus = None;
         self.vault = Vault::default();
         self.master_password.clear();
         self.gate_password.clear();
@@ -2426,6 +2427,7 @@ impl App {
         if path.is_empty() {
             self.root = None;
             self.screen = Screen::Hosts;
+            self.last_pane_focus = None;
             return;
         }
         let Some(root) = &mut self.root else {
@@ -2441,11 +2443,24 @@ impl App {
                 collapse = Some(children.pop().unwrap());
             }
         }
+        let collapsed = collapse.is_some();
         if let Some(only) = collapse {
             if let Some(parent) = node_at_mut(root, parent_path) {
                 *parent = only;
             }
         }
+
+        // Reposiciona o foco: a arvore mudou, entao o caminho do painel focado
+        // e ajustado (irmaos deslocados / divisao colapsada) e ele retoma o
+        // foco; se o painel fechado era o focado, o foco vai ao primeiro.
+        let target = self
+            .last_pane_focus
+            .as_deref()
+            .and_then(|f| remap_after_close(f, parent_path, idx, collapsed))
+            .or_else(|| self.first_pane_path());
+        self.focused_path = None;
+        self.last_pane_focus = target.clone();
+        self.pending_focus = target;
     }
 
     fn drain_ssh_events(&mut self) {
@@ -2656,9 +2671,8 @@ impl App {
         } else if cycle {
             self.focus_cycle();
         } else if close {
-            if let Some(path) = self.focused_path.take() {
+            if let Some(path) = self.focused_path.clone() {
                 self.close_pane(&path);
-                self.pending_focus = self.first_pane_path();
             }
         } else if help {
             self.show_help = !self.show_help;
@@ -2877,7 +2891,7 @@ impl App {
             atalho(ui, "Ctrl+B, Esc", "cancelar o prefixo");
 
             secao(ui, "Selecao de conexoes");
-            atalho(ui, "digitar", "filtrar por nome/endereco");
+            atalho(ui, "digitar", "filtrar pelo nome da conexao");
             atalho(ui, "\u{2190}\u{2191}\u{2193}\u{2192}", "escolher na grade");
             atalho(ui, "Enter", "conectar a selecao");
             atalho(ui, "Ctrl+Enter", "abrir SFTP da selecao");
@@ -2955,11 +2969,7 @@ impl App {
                     // O novo painel (seletor) ja nasce com o filtro focado.
                     self.pending_focus = self.split_pane(&path, dir);
                 }
-                PaneAction::Close { path } => {
-                    self.close_pane(&path);
-                    // O foco vai para um painel restante (ex.: Esc no seletor).
-                    self.pending_focus = self.first_pane_path();
-                }
+                PaneAction::Close { path } => self.close_pane(&path),
                 PaneAction::Connect { path, host } => self.connect_pane(&path, host),
                 PaneAction::OpenLocal { path, shell } => {
                     self.connect_local_pane(&path, shell)
@@ -3010,6 +3020,33 @@ fn disconnect_tree(node: &Node) {
             }
         }
     }
+}
+
+/// Novo caminho de um painel `f` depois de fechar o filho `idx` da divisao em
+/// `parent` (`collapsed` = a divisao ficou com um so filho e foi substituida
+/// por ele). `None` quando `f` era o proprio painel fechado (ou estava dentro).
+fn remap_after_close(
+    f: &[usize],
+    parent: &[usize],
+    idx: usize,
+    collapsed: bool,
+) -> Option<Vec<usize>> {
+    let depth = parent.len();
+    if f.len() <= depth || !f.starts_with(parent) {
+        return Some(f.to_vec());
+    }
+    let k = f[depth];
+    if k == idx {
+        return None;
+    }
+    let mut out = f.to_vec();
+    if k > idx {
+        out[depth] -= 1;
+    }
+    if collapsed {
+        out.remove(depth);
+    }
+    Some(out)
 }
 
 /// Retorna o caminho da primeira folha marcada para fechamento, se houver.
@@ -3338,11 +3375,8 @@ fn connection_picker(
         tiles.push(PickerTile::Local(pty::LocalShell::Wsl));
     }
     for (i, host) in hosts.iter().enumerate() {
-        let title = display_name(host);
-        if !termo.is_empty()
-            && !title.to_lowercase().contains(&termo)
-            && !host.host.to_lowercase().contains(&termo)
-        {
+        // Filtra so pelo nome exibido no cartao (o endereco/IP nao conta).
+        if !termo.is_empty() && !display_name(host).to_lowercase().contains(&termo) {
             continue;
         }
         tiles.push(PickerTile::Host(i));
@@ -3431,6 +3465,13 @@ fn connection_picker(
             sel = 0;
         }
         if resp.has_focus() {
+            // A trava abaixo so vale a partir do 2º quadro com foco. Quando o
+            // campo acaba de ganhar o foco, pede uma 2ª passada imediata (sem
+            // eventos novos) para a trava ja valer na proxima tecla — senao um
+            // Esc/seta logo apos dividir a tela escaparia para o egui.
+            if !ui.memory(|m| m.had_focus_last_frame(filter_id)) {
+                ui.ctx().request_discard("filtro do seletor recebeu o foco");
+            }
             // Trava setas e Esc no campo: sem isso o egui usaria as setas para
             // mover o foco a outro widget e o Esc para soltar o foco (entao o
             // seletor nem veria o Esc e a digitacao deixaria de filtrar).
@@ -4310,6 +4351,52 @@ mod focus_tests {
         frame(&ctx, &mut app, vec![click(pos, false)]);
         frame(&ctx, &mut app, vec![egui::Event::Text("ns".into())]);
         assert_eq!(new_pane_filter(&app), "ns");
+    }
+
+    #[test]
+    fn remap_after_close_paths() {
+        // [0,1,2] lado a lado; fecha [1]: [2] vira [1], [0] fica igual.
+        assert_eq!(remap_after_close(&[2], &[], 1, false), Some(vec![2 - 1]));
+        assert_eq!(remap_after_close(&[0], &[], 1, false), Some(vec![0]));
+        assert_eq!(remap_after_close(&[1], &[], 1, false), None);
+        // Divisao [1] com 2 filhos colapsa: [1,0,3] -> [1,3] ao fechar [1,1].
+        assert_eq!(remap_after_close(&[1, 0, 3], &[1], 1, true), Some(vec![1, 3]));
+        // Fora da divisao afetada: inalterado.
+        assert_eq!(remap_after_close(&[0, 2], &[1], 0, true), Some(vec![0, 2]));
+        // Painel dentro da subarvore fechada.
+        assert_eq!(remap_after_close(&[1, 1, 0], &[1], 1, true), None);
+    }
+
+    #[test]
+    fn esc_on_empty_filter_closes_pane_and_refocuses_terminal() {
+        let (ctx, mut app) = split_by_keyboard();
+        frame(&ctx, &mut app, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
+        assert!(matches!(app.root, Some(Node::Leaf(_))), "seletor nao fechou");
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(app.focused_path, Some(vec![]));
+    }
+
+    #[test]
+    fn closing_other_pane_keeps_focus_where_it_was() {
+        // Tres paineis lado a lado; o foco no terceiro. Fechar o primeiro
+        // (ex.: sessao encerrada) mantem o foco no mesmo painel, agora [1].
+        let (ctx, mut app) = split_by_keyboard();
+        frame(&ctx, &mut app, vec![key(egui::Key::B, egui::Modifiers::CTRL)]);
+        frame(&ctx, &mut app, vec![key(egui::Key::H, egui::Modifiers::NONE)]);
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(app.focused_path, Some(vec![2]));
+        frame(&ctx, &mut app, vec![egui::Event::Text("ab".into())]);
+        app.close_pane(&[0]);
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(app.focused_path, Some(vec![1]));
+        match &app.root {
+            Some(Node::Split { children, .. }) => match &children[1] {
+                Node::Leaf(p) => assert_eq!(p.filter, "ab"),
+                _ => panic!(),
+            },
+            _ => panic!(),
+        }
     }
 
     #[test]
