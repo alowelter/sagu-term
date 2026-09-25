@@ -1,6 +1,6 @@
 [package]
 name = "sagu-term"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Cliente SSH desktop em Rust puro com cofre criptografado e terminal com auto-copia"
 license = "MIT"

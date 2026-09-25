@@ -13,8 +13,7 @@
 //! e fecha este; o `*.exe.old` e apagado na proxima abertura (`cleanup_old`).
 //!
 //! As Releases sao geradas pelo workflow `.github/workflows/release.yml`, que
-//! anexa `SaguTerm.exe` e `SaguTerm.exe.sha256` a cada tag `v*` (e, na
-//! transicao, uma copia com o nome antigo `sagu-term.exe`).
+//! anexa `SaguTerm.exe` e `SaguTerm.exe.sha256` a cada tag `v*`.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -27,13 +26,9 @@ use sha2::{Digest, Sha256};
 
 /// Repositorio (dono/nome) cujas Releases publicam o executavel.
 pub const REPO: &str = "alowelter/sagu-term";
-/// Executavel anexado a cada Release e o arquivo com o SHA-256 dele, em
-/// ordem de preferencia: o nome atual e o antigo (ate a v0.1.4), para ainda
-/// aceitar Releases publicadas so com ele.
-const ASSETS: &[(&str, &str)] = &[
-    ("SaguTerm.exe", "SaguTerm.exe.sha256"),
-    ("sagu-term.exe", "sagu-term.exe.sha256"),
-];
+/// Executavel anexado a cada Release e o arquivo com o SHA-256 dele.
+const ASSET_EXE: &str = "SaguTerm.exe";
+const ASSET_SHA: &str = "SaguTerm.exe.sha256";
 /// Versao deste executavel (do Cargo.toml).
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
@@ -206,11 +201,8 @@ fn parse_release(api: ApiRelease) -> anyhow::Result<Option<Release>> {
         return Ok(None);
     }
     let asset = |name: &str| api.assets.iter().find(|a| a.name == name);
-    let Some((exe, sha)) = ASSETS
-        .iter()
-        .find_map(|(exe, sha)| Some((asset(exe)?, asset(sha)?)))
-    else {
-        anyhow::bail!("a Release {} nao traz o executavel e o .sha256", api.tag_name);
+    let (Some(exe), Some(sha)) = (asset(ASSET_EXE), asset(ASSET_SHA)) else {
+        anyhow::bail!("a Release {} nao traz {ASSET_EXE} e {ASSET_SHA}", api.tag_name);
     };
     Ok(Some(Release {
         version,
@@ -388,11 +380,11 @@ mod tests {
     #[test]
     fn sha256_file_parsing() {
         let h = "A".repeat(64);
-        assert_eq!(parse_sha256_file(&format!("{h}  sagu-term.exe")), Some("a".repeat(64)));
+        assert_eq!(parse_sha256_file(&format!("{h}  SaguTerm.exe")), Some("a".repeat(64)));
         assert_eq!(parse_sha256_file(&format!("\u{feff}{h}\r\n")), Some("a".repeat(64)));
         let ps = format!("SHA256 hash of x.zip:\r\n{h}\r\n");
         assert_eq!(parse_sha256_file(&ps), Some("a".repeat(64)));
-        assert_eq!(parse_sha256_file("abc  sagu-term.exe"), None);
+        assert_eq!(parse_sha256_file("abc  SaguTerm.exe"), None);
         assert_eq!(parse_sha256_file(&"g".repeat(64)), None);
         assert_eq!(parse_sha256_file(""), None);
     }
@@ -491,27 +483,18 @@ mod tests {
 
     #[test]
     fn release_parsing() {
-        let all = [
-            "SaguTerm.exe",
-            "SaguTerm.exe.sha256",
-            "sagu-term.exe",
-            "sagu-term.exe.sha256",
-        ];
+        let all = [ASSET_EXE, ASSET_SHA];
         let r = parse_release(api("v9.9.9", &all)).unwrap().unwrap();
         assert_eq!(r.version, "9.9.9");
         assert_eq!(r.notes, "notas");
-        // Com os dois nomes publicados, prefere o atual.
         assert_eq!(r.exe_url, "https://example/SaguTerm.exe");
         assert_eq!(r.sha_url, "https://example/SaguTerm.exe.sha256");
         assert_eq!(r.exe_size, 10);
-        // Release so com o nome antigo ainda e aceita.
-        let r = parse_release(api("v9.9.9", &all[2..])).unwrap().unwrap();
-        assert_eq!(r.exe_url, "https://example/sagu-term.exe");
         // Mesma versao: nada a fazer.
         assert!(parse_release(api(&format!("v{CURRENT}"), &all)).unwrap().is_none());
         // Versao nova sem o .sha256: erro (nunca instala sem conferir).
-        assert!(parse_release(api("v9.9.9", &["SaguTerm.exe"])).is_err());
-        // Nunca mistura o executavel de um nome com o hash do outro.
-        assert!(parse_release(api("v9.9.9", &["SaguTerm.exe", "sagu-term.exe.sha256"])).is_err());
+        assert!(parse_release(api("v9.9.9", &[ASSET_EXE])).is_err());
+        // Nome antigo (ate a v0.1.5) nao e mais aceito.
+        assert!(parse_release(api("v9.9.9", &["sagu-term.exe", "sagu-term.exe.sha256"])).is_err());
     }
 }
