@@ -150,7 +150,7 @@ enum UploadStage {
         sent: u64,
         size: u64,
     },
-    /// Resultado final; quando `ok`, some sozinho apos alguns segundos.
+    /// Resultado final; quando `ok`, some sozinho apos 8 segundos.
     Done { text: String, ok: bool, at: Instant },
 }
 
@@ -3643,10 +3643,10 @@ fn upload_status(ui: &mut egui::Ui, upload: &Option<UploadUi>) -> bool {
                 ui.ctx().request_repaint_after(left);
                 return false;
             }
-            ("localizando pasta\u{2026}".to_string(), TEXT_WEAK, String::new())
+            ("\u{00b7} localizando pasta\u{2026}".to_string(), TEXT_WEAK, String::new())
         }
         UploadStage::Asking(_) => (
-            "escolha o destino do envio".to_string(),
+            "\u{00b7} escolha o destino do envio".to_string(),
             HIGHLIGHT,
             String::new(),
         ),
@@ -3661,13 +3661,17 @@ fn upload_status(ui: &mut egui::Ui, upload: &Option<UploadUi>) -> bool {
             let pct = if *size == 0 { 100 } else { sent.saturating_mul(100) / size };
             let text = if name.is_empty() {
                 // Escolha feita; o primeiro andamento ainda nao chegou.
-                "preparando o envio\u{2026}".to_string()
+                "\u{00b7} preparando o envio\u{2026}".to_string()
             } else if *count > 1 {
-                format!("enviando {}/{count} \u{00b7} {pct}%", index + 1)
+                format!(
+                    "\u{00b7} enviando {}/{count}: {} \u{00b7} {pct}%",
+                    index + 1,
+                    elide(name, 24)
+                )
             } else {
-                format!("enviando {} \u{00b7} {pct}%", elide(name, 28))
+                format!("\u{00b7} enviando {} \u{00b7} {pct}%", elide(name, 28))
             };
-            (text, ACCENT, format!("{name} \u{2192} {}", show_path(dir)))
+            (text, HIGHLIGHT, format!("{name} \u{2192} {}", show_path(dir)))
         }
         UploadStage::Done { text, ok, .. } => {
             let color = if *ok { AUTH_KEY } else { ERROR_FG };
@@ -3676,13 +3680,22 @@ fn upload_status(ui: &mut egui::Ui, upload: &Option<UploadUi>) -> bool {
             } else {
                 format!("{text}\n(clique para dispensar)")
             };
-            (elide(text, 60), color, full)
+            (format!("\u{00b7} {}", elide(text, 60)), color, full)
         }
     };
-    let resp = ui.add(
-        egui::Label::new(egui::RichText::new(text).small().color(color))
-            .sense(egui::Sense::click()),
-    );
+    // Deixa espaco para os botoes de dividir a direita: com o painel
+    // estreito o texto e cortado ("...") em vez de ficar atras deles.
+    let max_w = (ui.available_width() - 56.0).max(40.0);
+    let resp = ui
+        .scope(|ui| {
+            ui.set_max_width(max_w);
+            ui.add(
+                egui::Label::new(egui::RichText::new(text).color(color))
+                    .truncate()
+                    .sense(egui::Sense::click()),
+            )
+        })
+        .inner;
     let resp = if full.is_empty() { resp } else { resp.on_hover_text(full) };
     matches!(u.stage, UploadStage::Done { ok: false, .. }) && resp.clicked()
 }
@@ -4560,7 +4573,7 @@ fn render_node(
                 ..
             }) = &pane.upload
             {
-                let left = std::time::Duration::from_secs(6).saturating_sub(at.elapsed());
+                let left = std::time::Duration::from_secs(8).saturating_sub(at.elapsed());
                 if left.is_zero() {
                     pane.upload = None;
                 } else {
@@ -4569,7 +4582,7 @@ fn render_node(
             }
 
             // Barra de titulo com fundo proprio, ocupando toda a largura.
-            egui::Frame::NONE
+            let title_resp = egui::Frame::NONE
                 .fill(TITLE_BG)
                 .inner_margin(egui::Margin::symmetric(4, 2))
                 .show(ui, |ui| {
@@ -4606,6 +4619,11 @@ fn render_node(
                         };
                         ui.label(egui::RichText::new(title).strong().color(egui::Color32::WHITE))
                             .on_hover_text(status);
+                        // Andamento/resultado do envio de arquivos, ao lado do
+                        // nome (a direita os botoes o encobririam).
+                        if upload_status(ui, &pane.upload) {
+                            pane.upload = None;
+                        }
 
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -4642,15 +4660,34 @@ fn render_node(
                                         dir: SplitDir::SideBySide,
                                     });
                                 }
-                                // Andamento/resultado do envio de arquivos.
-                                ui.add_space(6.0);
-                                if upload_status(ui, &pane.upload) {
-                                    pane.upload = None;
-                                }
                             },
                         );
                     });
                 });
+
+            // Barra de progresso fina na base do titulo durante um envio.
+            if let Some(UploadUi {
+                stage: UploadStage::Sending { sent, size, .. },
+                ..
+            }) = &pane.upload
+            {
+                let frac = if *size == 0 { 0.0 } else { (*sent as f32 / *size as f32).min(1.0) };
+                let bar = title_resp.response.rect;
+                let track = egui::Rect::from_min_max(
+                    egui::pos2(bar.left(), bar.bottom() - 2.0),
+                    bar.right_bottom(),
+                );
+                let painter = ui.painter();
+                painter.rect_filled(track, 0.0, HIGHLIGHT.gamma_multiply(0.25));
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        track.min,
+                        egui::vec2(track.width() * frac, track.height()),
+                    ),
+                    0.0,
+                    HIGHLIGHT,
+                );
+            }
 
             // Conteudo recuado das bordas: a borda do painel (mais grossa quando
             // focado) nao encobre os cartoes do seletor nem a 1ª coluna do terminal.
@@ -5482,5 +5519,81 @@ mod focus_tests {
         frame_drop(&ctx, &mut app, vec![], vec![temp_file("d.txt")]);
         assert!(upload_requests(&mut to_rx).is_empty());
         assert!(pane0(&app).upload.is_none());
+    }
+
+    /// Textos pintados no quadro, com a area que ocupam.
+    fn painted_texts(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        out.shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some((
+                    t.galley.text().to_string(),
+                    egui::Rect::from_min_size(t.pos, t.galley.size()),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// O andamento do envio aparece no titulo do painel, inteiro dentro do
+    /// painel e antes dos botoes de dividir (a direita) — inclusive com a tela
+    /// dividida e nome de arquivo longo.
+    #[test]
+    fn upload_status_is_visible_in_title_bar() {
+        use crate::ssh::SshToUi;
+        use crate::upload::UploadEvent;
+        for split in [false, true] {
+            let ctx = egui::Context::default();
+            egui_extras::install_image_loaders(&ctx);
+            let (mut app, _rx, tx) = ssh_app(true);
+            if split {
+                // Painel SSH a esquerda, seletor a direita (metade da tela).
+                app.split_pane(&[], SplitDir::SideBySide);
+            }
+            let path: Vec<usize> = if split { vec![0] } else { vec![] };
+            if let Some(Node::Leaf(p)) = app.root.as_mut().and_then(|r| node_at_mut(r, &path)) {
+                p.upload = Some(UploadUi {
+                    id: 7,
+                    skipped_dirs: 0,
+                    stage: UploadStage::Locating { since: Instant::now() },
+                });
+            }
+            let name = "relatorio-financeiro-consolidado-do-trimestre.xlsx";
+            tx.send(SshToUi::Upload(UploadEvent::Progress {
+                id: 7,
+                dir: "/srv".into(),
+                index: 0,
+                count: 1,
+                name: name.into(),
+                sent: 50,
+                size: 100,
+            }))
+            .unwrap();
+            let mut out = None;
+            for _ in 0..3 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 700.0),
+                    )),
+                    ..Default::default()
+                };
+                out = Some(ctx.run(raw, |ctx| {
+                    app.drain_ssh_events();
+                    egui::CentralPanel::default().show(ctx, |ui| app.ui_session(ui));
+                }));
+            }
+            let pane = app.pane_rects.iter().find(|(p, _)| *p == path).unwrap().1;
+            let texts = painted_texts(out.as_ref().unwrap());
+            let (text, r) = texts
+                .iter()
+                .find(|(t, _)| t.contains("enviando"))
+                .unwrap_or_else(|| panic!("status nao pintado: {texts:?}"));
+            assert!(text.contains("50%"), "{text}");
+            assert!(
+                r.left() >= pane.left() && r.right() <= pane.right() - 40.0,
+                "status fora da area visivel (split={split}): {r:?} em {pane:?}"
+            );
+        }
     }
 }
