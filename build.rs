@@ -21,6 +21,8 @@ fn main() {
     let mut res = winresource::WindowsResource::new();
     res.set_icon(ico.to_str().expect("caminho do .ico"));
     res.set("ProductName", "SaguTerm");
+    res.set("OriginalFilename", "SaguTerm.exe");
+    res.set("InternalName", "SaguTerm");
     res.set("FileDescription", "SaguTerm — cliente SSH/SFTP");
     res.compile().expect("falha ao compilar o recurso do Windows");
 }

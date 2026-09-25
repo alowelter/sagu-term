@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/alowelter/sagu-term/releases/latest/download/sagu-term.exe"><strong>⬇️ Baixar para Windows</strong></a>
+  <a href="https://github.com/alowelter/sagu-term/releases/latest/download/SaguTerm.exe"><strong>⬇️ Baixar para Windows</strong></a>
   &nbsp;·&nbsp;
   <a href="#comecar">Comece em 1 minuto</a>
   &nbsp;·&nbsp;
@@ -95,7 +95,7 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
 
 ## 🚀 Comece em 1 minuto
 
-1. **[Baixe o `sagu-term.exe`](https://github.com/alowelter/sagu-term/releases/latest/download/sagu-term.exe)**
+1. **[Baixe o `SaguTerm.exe`](https://github.com/alowelter/sagu-term/releases/latest/download/SaguTerm.exe)**
    e coloque-o numa pasta sua (por exemplo, `Documentos\SaguTerm`).
 2. **Abra o executável.** Na primeira vez, o Windows pode mostrar *"O Windows protegeu o
    computador"*, porque o executável ainda não tem assinatura digital paga. Clique em
@@ -157,7 +157,7 @@ Requisitos: [Rust](https://rustup.rs) estável e o **Visual Studio Build Tools**
 git clone https://github.com/alowelter/sagu-term.git
 cd sagu-term
 cargo build --release
-# executável em target\release\sagu-term.exe
+# executável em target\release\SaguTerm.exe
 ```
 
 Para publicar uma versão, suba o `version` do `Cargo.toml` e envie uma tag `vX.Y.Z`.

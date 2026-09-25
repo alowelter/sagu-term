@@ -2,8 +2,14 @@
 #   git tag v0.1.3 && git push origin v0.1.3
 #
 # Compila o executavel no Windows, confere que a tag bate com a versao do
-# Cargo.toml e anexa `sagu-term.exe` + `sagu-term.exe.sha256` a Release. O app
-# procura exatamente esses dois arquivos para se autoatualizar (src/update.rs).
+# Cargo.toml e anexa `SaguTerm.exe` + `SaguTerm.exe.sha256` a Release. O app
+# procura esses arquivos para se autoatualizar (src/update.rs).
+#
+# Transicao: ate a v0.1.4 o executavel se chamava `sagu-term.exe` e o
+# atualizador dessas versoes procura so esse nome. Por isso a Release tambem
+# leva uma copia com o nome antigo; sem ela, quem esta na v0.1.4 ou anterior
+# nunca receberia atualizacoes. Pode ser removida quando ninguem mais usar
+# essas versoes.
 name: Release
 
 on:
@@ -43,14 +49,19 @@ jobs:
       - name: SHA-256
         shell: pwsh
         run: |
-          $hash = (Get-FileHash target/release/sagu-term.exe -Algorithm SHA256).Hash.ToLower()
+          $hash = (Get-FileHash target/release/SaguTerm.exe -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("target/release/SaguTerm.exe.sha256", "$hash  SaguTerm.exe`n")
+          Get-Content target/release/SaguTerm.exe.sha256
+          # Copia com o nome antigo para os atualizadores da v0.1.4 e anteriores.
+          Copy-Item target/release/SaguTerm.exe target/release/sagu-term.exe
           [IO.File]::WriteAllText("target/release/sagu-term.exe.sha256", "$hash  sagu-term.exe`n")
-          Get-Content target/release/sagu-term.exe.sha256
 
       - name: Publicar Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            target/release/SaguTerm.exe
+            target/release/SaguTerm.exe.sha256
             target/release/sagu-term.exe
             target/release/sagu-term.exe.sha256
           generate_release_notes: true

@@ -1,9 +1,14 @@
 [package]
 name = "sagu-term"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Cliente SSH desktop em Rust puro com cofre criptografado e terminal com auto-copia"
 license = "MIT"
+
+# Executavel "SaguTerm.exe" (o pacote segue "sagu-term", como o repositorio).
+[[bin]]
+name = "SaguTerm"
+path = "src/main.rs"
 
 [dependencies]
 # GUI

@@ -13,7 +13,8 @@
 //! e fecha este; o `*.exe.old` e apagado na proxima abertura (`cleanup_old`).
 //!
 //! As Releases sao geradas pelo workflow `.github/workflows/release.yml`, que
-//! anexa `sagu-term.exe` e `sagu-term.exe.sha256` a cada tag `v*`.
+//! anexa `SaguTerm.exe` e `SaguTerm.exe.sha256` a cada tag `v*` (e, na
+//! transicao, uma copia com o nome antigo `sagu-term.exe`).
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -26,9 +27,13 @@ use sha2::{Digest, Sha256};
 
 /// Repositorio (dono/nome) cujas Releases publicam o executavel.
 pub const REPO: &str = "alowelter/sagu-term";
-/// Executavel anexado a cada Release e o arquivo com o SHA-256 dele.
-const ASSET_EXE: &str = "sagu-term.exe";
-const ASSET_SHA: &str = "sagu-term.exe.sha256";
+/// Executavel anexado a cada Release e o arquivo com o SHA-256 dele, em
+/// ordem de preferencia: o nome atual e o antigo (ate a v0.1.4), para ainda
+/// aceitar Releases publicadas so com ele.
+const ASSETS: &[(&str, &str)] = &[
+    ("SaguTerm.exe", "SaguTerm.exe.sha256"),
+    ("sagu-term.exe", "sagu-term.exe.sha256"),
+];
 /// Versao deste executavel (do Cargo.toml).
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
@@ -201,8 +206,11 @@ fn parse_release(api: ApiRelease) -> anyhow::Result<Option<Release>> {
         return Ok(None);
     }
     let asset = |name: &str| api.assets.iter().find(|a| a.name == name);
-    let (Some(exe), Some(sha)) = (asset(ASSET_EXE), asset(ASSET_SHA)) else {
-        anyhow::bail!("a Release {} nao traz {ASSET_EXE} e {ASSET_SHA}", api.tag_name);
+    let Some((exe, sha)) = ASSETS
+        .iter()
+        .find_map(|(exe, sha)| Some((asset(exe)?, asset(sha)?)))
+    else {
+        anyhow::bail!("a Release {} nao traz o executavel e o .sha256", api.tag_name);
     };
     Ok(Some(Release {
         version,
@@ -242,7 +250,7 @@ fn parse_sha256_file(text: &str) -> Option<String> {
         .map(|t| t.to_ascii_lowercase())
 }
 
-/// `sagu-term.exe` -> `sagu-term.exe.<suffix>` (no mesmo diretorio).
+/// `SaguTerm.exe` -> `SaguTerm.exe.<suffix>` (no mesmo diretorio).
 fn sibling(exe: &Path, suffix: &str) -> PathBuf {
     let mut name = exe.file_name().unwrap_or_default().to_os_string();
     name.push(".");
@@ -270,7 +278,7 @@ fn download_verified(release: &Release, dest: &Path, progress: impl Fn(u64)) -> 
         let mut resp = agent.get(&release.sha_url).call()?;
         let text = resp.body_mut().read_to_string()?;
         parse_sha256_file(&text)
-            .ok_or_else(|| anyhow::anyhow!("arquivo {ASSET_SHA} publicado e invalido"))?
+            .ok_or_else(|| anyhow::anyhow!("o .sha256 publicado na Release e invalido"))?
     };
 
     // Download calculando o hash durante a gravacao. O limite de leitura
@@ -391,9 +399,9 @@ mod tests {
 
     #[test]
     fn sibling_paths() {
-        let exe = Path::new(r"C:\apps\sagu-term.exe");
-        assert_eq!(sibling(exe, "old"), Path::new(r"C:\apps\sagu-term.exe.old"));
-        assert_eq!(sibling(exe, "new"), Path::new(r"C:\apps\sagu-term.exe.new"));
+        let exe = Path::new(r"C:\apps\SaguTerm.exe");
+        assert_eq!(sibling(exe, "old"), Path::new(r"C:\apps\SaguTerm.exe.old"));
+        assert_eq!(sibling(exe, "new"), Path::new(r"C:\apps\SaguTerm.exe.new"));
     }
 
     fn api(tag: &str, assets: &[&str]) -> ApiRelease {
@@ -483,16 +491,27 @@ mod tests {
 
     #[test]
     fn release_parsing() {
-        let r = parse_release(api("v9.9.9", &[ASSET_EXE, ASSET_SHA])).unwrap().unwrap();
+        let all = [
+            "SaguTerm.exe",
+            "SaguTerm.exe.sha256",
+            "sagu-term.exe",
+            "sagu-term.exe.sha256",
+        ];
+        let r = parse_release(api("v9.9.9", &all)).unwrap().unwrap();
         assert_eq!(r.version, "9.9.9");
         assert_eq!(r.notes, "notas");
-        assert_eq!(r.exe_url, format!("https://example/{ASSET_EXE}"));
+        // Com os dois nomes publicados, prefere o atual.
+        assert_eq!(r.exe_url, "https://example/SaguTerm.exe");
+        assert_eq!(r.sha_url, "https://example/SaguTerm.exe.sha256");
         assert_eq!(r.exe_size, 10);
+        // Release so com o nome antigo ainda e aceita.
+        let r = parse_release(api("v9.9.9", &all[2..])).unwrap().unwrap();
+        assert_eq!(r.exe_url, "https://example/sagu-term.exe");
         // Mesma versao: nada a fazer.
-        assert!(parse_release(api(&format!("v{CURRENT}"), &[ASSET_EXE, ASSET_SHA]))
-            .unwrap()
-            .is_none());
+        assert!(parse_release(api(&format!("v{CURRENT}"), &all)).unwrap().is_none());
         // Versao nova sem o .sha256: erro (nunca instala sem conferir).
-        assert!(parse_release(api("v9.9.9", &[ASSET_EXE])).is_err());
+        assert!(parse_release(api("v9.9.9", &["SaguTerm.exe"])).is_err());
+        // Nunca mistura o executavel de um nome com o hash do outro.
+        assert!(parse_release(api("v9.9.9", &["SaguTerm.exe", "sagu-term.exe.sha256"])).is_err());
     }
 }
