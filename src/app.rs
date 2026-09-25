@@ -2707,8 +2707,9 @@ impl App {
     ///
     /// O restante usa o prefixo `Ctrl+B` em dois tempos (estilo tmux): `H`/`V`
     /// dividem o painel focado, setas tambem movem o foco (alias do Alt+setas),
-    /// `O` cicla, `X` fecha o painel, `A` abre a ajuda e `Ctrl+B` de novo envia
-    /// um Ctrl+B literal ao terminal (util para tmux remoto). Teclas invalidas
+    /// `O` cicla, `X` fecha o painel, `A` abre a ajuda, `Ctrl+B` de novo envia
+    /// um Ctrl+B literal ao terminal (util para tmux remoto) e `F1` envia o F1
+    /// que, sem o prefixo, abre a ajuda (ex.: ajuda do htop/mc). Teclas invalidas
     /// apos o prefixo sao engolidas (nao vazam para o shell) e o prefixo expira
     /// sozinho. Todos os eventos usados sao consumidos.
     fn handle_session_keys(&mut self, ctx: &egui::Context) {
@@ -2750,7 +2751,8 @@ impl App {
         let mut cycle = false;
         let mut close = false;
         let mut help = false;
-        let mut literal_b = false;
+        // Tecla que o app usaria, enviada tal qual ao terminal focado.
+        let mut literal: Option<&[u8]> = None;
         // Segunda tecla recebida (valida ou nao): o prefixo desarma.
         let mut acted = false;
 
@@ -2792,7 +2794,8 @@ impl App {
                     egui::Key::O => cycle = true,
                     egui::Key::X => close = true,
                     egui::Key::A => help = true,
-                    egui::Key::B if modifiers.ctrl => literal_b = true,
+                    egui::Key::B if modifiers.ctrl => literal = Some(&[0x02]),
+                    egui::Key::F1 => literal = Some(b"\x1bOP"),
                     egui::Key::Escape => {} // apenas cancela o prefixo
                     _ => {} // tecla invalida: engolida, sem acao (estilo tmux)
                 }
@@ -2816,11 +2819,11 @@ impl App {
             }
         } else if help {
             self.show_help = !self.show_help;
-        } else if literal_b {
+        } else if let Some(bytes) = literal {
             if let (Some(path), Some(root)) = (&self.focused_path, &mut self.root) {
                 if let Some(Node::Leaf(pane)) = node_at_mut(root, path) {
                     if let Some(ssh) = &pane.ssh {
-                        ssh.send_data(vec![0x02]);
+                        ssh.send_data(bytes.to_vec());
                     }
                 }
             }
@@ -3253,16 +3256,18 @@ impl App {
         // versao entra na proxima vez que o usuario abrir o app.
     }
 
-    /// Verdadeiro quando o painel focado e um terminal (as teclas de funcao
-    /// pertencem ao shell remoto nesse caso).
-    fn focused_pane_is_terminal(&self) -> bool {
-        let (Some(path), Some(root)) = (&self.focused_path, &self.root) else {
-            return false;
-        };
-        matches!(
-            node_at(root, path),
-            Some(Node::Leaf(pane)) if pane.terminal.is_some() && !pane.picking
-        )
+    /// F1 abre/fecha a ajuda de atalhos em qualquer tela, inclusive com um
+    /// terminal em foco (o F1 e consumido antes de chegar a ele; para envia-lo
+    /// ao servidor ha o `Ctrl+B, F1`). Esc fecha a ajuda.
+    fn handle_help_keys(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+            self.show_help = !self.show_help;
+        }
+        if self.show_help
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.show_help = false;
+        }
     }
 
     /// Janela flutuante com todos os atalhos de teclado, agrupados por area.
@@ -3303,6 +3308,9 @@ impl App {
                 });
             };
 
+            secao(ui, "Geral");
+            atalho(ui, "F1", "abrir/fechar esta ajuda (em qualquer tela)");
+
             secao(ui, "Paineis da sessao");
             atalho(ui, "Alt+setas", "trocar de painel (na direcao)");
 
@@ -3313,6 +3321,7 @@ impl App {
             atalho(ui, "Ctrl+B, O", "ciclar o foco");
             atalho(ui, "Ctrl+B, X", "fechar o painel focado");
             atalho(ui, "Ctrl+B, Ctrl+B", "enviar Ctrl+B ao terminal");
+            atalho(ui, "Ctrl+B, F1", "enviar F1 ao terminal");
             atalho(ui, "Ctrl+B, A", "abrir/fechar esta ajuda");
             atalho(ui, "Ctrl+B, Esc", "cancelar o prefixo");
 
@@ -4970,18 +4979,7 @@ impl eframe::App for App {
             _ => {}
         }
 
-        // F1 abre/fecha a ajuda de atalhos — exceto com um terminal em foco
-        // (la o F1 pertence ao shell remoto; use Ctrl+B, A). Esc fecha.
-        if !self.focused_pane_is_terminal()
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1))
-        {
-            self.show_help = !self.show_help;
-        }
-        if self.show_help
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
-        {
-            self.show_help = false;
-        }
+        self.handle_help_keys(ctx);
 
         // Barra de dicas de atalhos na base (Session e Hosts).
         match self.screen {
@@ -5009,7 +5007,8 @@ impl eframe::App for App {
                                         "H dividir  \u{00b7}  V empilhar  \u{00b7}  \
                                          setas trocar painel  \u{00b7}  \
                                          O ciclar  \u{00b7}  X fechar  \u{00b7}  \
-                                         Ctrl+B literal  \u{00b7}  A ajuda  \u{00b7}  Esc cancela",
+                                         Ctrl+B / F1 literal  \u{00b7}  A ajuda  \u{00b7}  \
+                                         Esc cancela",
                                     )
                                     .small()
                                     .color(CARD_TEXT),
@@ -5018,7 +5017,7 @@ impl eframe::App for App {
                                 ui.label(
                                     egui::RichText::new(
                                         "Alt+setas troca de painel  \
-                                         \u{00b7}  Ctrl+B + A: Ajuda  \u{00b7}  F5 atualiza SFTP",
+                                         \u{00b7}  F1 ajuda  \u{00b7}  F5 atualiza SFTP",
                                     )
                                     .small()
                                     .color(TEXT_WEAK),
@@ -5178,6 +5177,7 @@ mod focus_tests {
         };
         let _ = ctx.run(raw, |ctx| {
             app.handle_session_keys(ctx);
+            app.handle_help_keys(ctx);
             egui::CentralPanel::default().show(ctx, |ui| app.ui_session(ui));
         });
     }
@@ -5595,5 +5595,43 @@ mod focus_tests {
                 "status fora da area visivel (split={split}): {r:?} em {pane:?}"
             );
         }
+    }
+
+    /// Bytes de teclado que a UI mandou a sessao (ignora resize e envios).
+    fn sent_bytes(rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::ssh::UiToSsh>) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let crate::ssh::UiToSsh::Data(d) = m {
+                out.extend(d);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn f1_opens_help_even_with_terminal_focused() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let (mut app, mut to_rx, _tx) = ssh_app(false);
+        app.pending_focus = Some(vec![]);
+        for _ in 0..3 {
+            frame(&ctx, &mut app, vec![]);
+        }
+        // O terminal tem o foco: uma tecla comum chega ao servidor.
+        frame(&ctx, &mut app, vec![egui::Event::Text("x".into())]);
+        assert_eq!(sent_bytes(&mut to_rx), b"x");
+
+        // F1 abre a ajuda sem vazar para o servidor; F1 de novo fecha.
+        frame(&ctx, &mut app, vec![key(egui::Key::F1, egui::Modifiers::NONE)]);
+        assert!(app.show_help);
+        frame(&ctx, &mut app, vec![key(egui::Key::F1, egui::Modifiers::NONE)]);
+        assert!(!app.show_help);
+        assert!(sent_bytes(&mut to_rx).is_empty());
+
+        // Ctrl+B, F1 envia o F1 ao servidor sem abrir a ajuda.
+        frame(&ctx, &mut app, vec![key(egui::Key::B, egui::Modifiers::CTRL)]);
+        frame(&ctx, &mut app, vec![key(egui::Key::F1, egui::Modifiers::NONE)]);
+        assert!(!app.show_help);
+        assert_eq!(sent_bytes(&mut to_rx), b"\x1bOP");
     }
 }

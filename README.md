@@ -111,7 +111,7 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
 
 ## ⌨️ Atalhos de teclado
 
-A lista completa fica sempre à mão com **F1** (ou `Ctrl+B, A` dentro de um terminal).
+A lista completa fica sempre à mão com **F1**, em qualquer tela (também em `Ctrl+B, A`).
 
 | Onde | Atalho | Ação |
 |---|---|---|
@@ -120,6 +120,7 @@ A lista completa fica sempre à mão com **F1** (ou `Ctrl+B, A` dentro de um ter
 | Painéis | `Ctrl+B, O` | Ciclar entre os painéis |
 | Painéis | `Ctrl+B, X` | Fechar o painel ativo |
 | Painéis | `Ctrl+B, Ctrl+B` | Enviar `Ctrl+B` ao terminal (útil com tmux remoto) |
+| Painéis | `Ctrl+B, F1` | Enviar `F1` ao terminal (ex.: ajuda do htop ou do mc) |
 | Conexões | *digitar* | Filtrar pelo nome |
 | Conexões | `Enter` / `Ctrl+Enter` | Conectar via SSH / abrir SFTP |
 | Conexões | `Ctrl+N` | Cadastrar novo host |
