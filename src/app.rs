@@ -3,11 +3,12 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::download::{self, ConflictChoice, DownloadEvent};
+use crate::hostkey::{self, HostKeyAnswer, HostKeyPrompt, KeyCheck};
 use crate::pty;
 use crate::sftp::{self, SftpHandle, SftpToUi};
 use crate::ssh::{self, SshHandle, SshToUi};
 use crate::terminal::Terminal;
-use crate::update::{self, Updater};
 use crate::upload::{self, UploadEvent};
 use crate::vault::{self, AuthMethod, Host, Vault};
 
@@ -126,6 +127,34 @@ struct Pane {
     should_close: bool,
     /// Envio de arquivos soltos sobre este terminal (um lote por vez).
     upload: Option<UploadUi>,
+    /// Pergunta sobre a chave do servidor aguardando o usuario (a sessao
+    /// espera). Descartar o painel descarta a pergunta e aborta a conexao.
+    host_key: Option<PendingHostKey>,
+    /// Download do navegador SFTP (um por vez por painel).
+    download: Option<DownloadUi>,
+}
+
+/// Pergunta de chave cancelada porque o host saiu do cofre.
+const HOST_KEY_DELETED: &str = "Conexão cancelada: esta conexão foi excluída do cofre.";
+/// Pergunta de chave cancelada porque o endereco/porta do host mudou: a chave
+/// deste servidor nunca e gravada num host que agora aponta para outro lugar.
+const HOST_KEY_MOVED: &str =
+    "Conexão cancelada: o endereço ou a porta desta conexão mudou; conecte de novo.";
+
+/// Legenda do painel enquanto a sessao espera a confirmacao da chave.
+const HOST_KEY_WAIT: &str = "Aguardando confirmação da chave do servidor...";
+
+/// Clique ou Esc so valem apos este tempo com a pergunta visivel: um duplo
+/// clique no cartao (que conecta) ou uma tecla em curso nao podem responder.
+const HOST_KEY_ARM: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// Pergunta de chave do servidor pendente num painel (a sessao espera).
+struct PendingHostKey {
+    prompt: HostKeyPrompt,
+    /// Ordem de chegada: a janela mostra sempre a mais antiga (fila).
+    seq: u64,
+    /// Primeiro quadro em que a janela desta pergunta apareceu.
+    shown_at: Option<Instant>,
 }
 
 /// Envio de arquivos soltos sobre um terminal SSH, visto pela UI.
@@ -174,6 +203,141 @@ impl UploadUi {
     }
 }
 
+/// Download pelo navegador SFTP, visto pela UI.
+struct DownloadUi {
+    /// Identifica o lote nos eventos da sessao.
+    id: u64,
+    /// Pasta local escolhida pelo usuario.
+    dest: PathBuf,
+    /// Itens tirados antes de comecar (nome invalido, "pular existentes").
+    pre_skipped: Vec<(String, String)>,
+    stage: DownloadStage,
+}
+
+enum DownloadStage {
+    /// Ha itens que ja existem no destino: dialogo aberto.
+    Asking(download::Prepared),
+    Running {
+        cancel: download::Cancel,
+        /// "Cancelar" clicado; aguardando a tarefa terminar.
+        cancelling: bool,
+        /// Ainda varrendo as pastas remotas (`found` entradas vistas).
+        scanning: bool,
+        found: usize,
+        /// Arquivo atual (0-based) de `count`; bytes somados do lote.
+        index: usize,
+        count: usize,
+        name: String,
+        done: u64,
+        total: u64,
+    },
+    /// Resultado; `tone` define a cor e se some sozinho (Ok/Neutral em 8 s).
+    Done {
+        text: String,
+        /// Erros, ignorados e nomes ajustados (dica do rodape).
+        detail: String,
+        tone: Tone,
+        at: Instant,
+    },
+}
+
+/// Tom de uma mensagem de resultado.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Tone {
+    Ok,
+    Neutral,
+    Error,
+}
+
+impl DownloadUi {
+    /// Perguntando ou em andamento (nao aceita outro pedido ate terminar).
+    fn busy(&self) -> bool {
+        !matches!(self.stage, DownloadStage::Done { .. })
+    }
+}
+
+impl DownloadStage {
+    /// Resultado so com texto (sem detalhes).
+    fn done(text: &str, tone: Tone) -> Self {
+        DownloadStage::Done {
+            text: text.to_string(),
+            detail: String::new(),
+            tone,
+            at: Instant::now(),
+        }
+    }
+
+    /// Texto do rodape durante o download.
+    fn running_text(&self) -> String {
+        let DownloadStage::Running {
+            cancelling,
+            scanning,
+            found,
+            index,
+            count,
+            name,
+            done,
+            total,
+            ..
+        } = self
+        else {
+            return String::new();
+        };
+        if *cancelling {
+            return "Cancelando\u{2026}".to_string();
+        }
+        if *scanning || name.is_empty() {
+            return if *found == 0 {
+                "Preparando o download\u{2026}".to_string()
+            } else {
+                format!("Preparando o download\u{2026} {found} itens encontrados")
+            };
+        }
+        let pct = (download_fraction(*index, *count, *done, *total) * 100.0) as u32;
+        let sizes = format!("{} de {}", human_size(*done), human_size(*total));
+        if *count > 1 {
+            format!(
+                "Baixando {}/{count}: {} \u{00b7} {pct}% \u{00b7} {sizes}",
+                index + 1,
+                show_path(name)
+            )
+        } else {
+            format!("Baixando {} \u{00b7} {pct}% \u{00b7} {sizes}", show_path(name))
+        }
+    }
+}
+
+/// Fracao concluida de um download: pelos bytes, ou pelos arquivos quando o
+/// lote so tem arquivos vazios.
+fn download_fraction(index: usize, count: usize, done: u64, total: u64) -> f32 {
+    if total > 0 {
+        (done as f32 / total as f32).min(1.0)
+    } else if count > 0 {
+        (index as f32 / count as f32).min(1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Se o navegador SFTP pode pedir um download agora (botao, menu e Ctrl+S).
+#[derive(Clone, Copy, PartialEq)]
+enum DlAvail {
+    Ready,
+    /// Outro download perguntando ou em andamento neste painel.
+    Busy,
+    /// Sessao ainda nao conectada (ou encerrada).
+    Offline,
+}
+
+/// Download pedido no navegador, aguardando a escolha da pasta de destino.
+struct PendingDownload {
+    /// Painel que pediu.
+    path: Vec<usize>,
+    /// Pasta remota exibida quando o pedido foi feito.
+    remote_dir: String,
+    picks: Vec<download::Pick>,
+}
+
 impl Pane {
     /// Painel vazio que mostra a lista de hosts para escolher uma conexao.
     fn picker() -> Self {
@@ -188,6 +352,8 @@ impl Pane {
             filter: String::new(),
             should_close: false,
             upload: None,
+            host_key: None,
+            download: None,
         }
     }
 }
@@ -254,6 +420,8 @@ struct ExplorerOut {
     op: Option<FsOp>,
     /// Verdadeiro se alguma linha foi clicada (o painel deve tomar o foco).
     clicked_row: bool,
+    /// Itens a baixar (botao, menu de contexto ou Ctrl+S).
+    download: Option<Vec<download::Pick>>,
 }
 
 /// Estado do navegador de arquivos SFTP de um painel: mostra apenas o conteudo
@@ -271,8 +439,13 @@ struct FileExplorer {
     editing_path: Option<String>,
     /// Pede foco para o campo de edicao do caminho no proximo quadro (uma vez).
     focus_path_edit: bool,
-    /// Indice da entrada selecionada (teclado ou clique simples).
+    /// Cursor do teclado (contorno); Enter/F2/Delete agem nele.
     sel: Option<usize>,
+    /// Nomes marcados na pasta atual (selecao multipla), por nome para
+    /// sobreviver a uma nova listagem.
+    marked: std::collections::BTreeSet<String>,
+    /// Ponta fixa do intervalo do Shift.
+    anchor: Option<usize>,
 }
 
 impl FileExplorer {
@@ -286,14 +459,21 @@ impl FileExplorer {
             editing_path: None,
             focus_path_edit: false,
             sel: None,
+            marked: std::collections::BTreeSet::new(),
+            anchor: None,
         }
     }
 
     /// Aplica a listagem recebida, se for a do diretorio atualmente exibido.
+    /// O cursor e reposicionado pelo nome e os marcados que sumiram saem.
     fn apply_listing(&mut self, path: &str, entries: Vec<sftp::RemoteEntry>) {
         if path != self.cur_path {
             return;
         }
+        let cursor = self
+            .sel
+            .and_then(|s| self.entries.get(s))
+            .map(|n| n.name.clone());
         self.entries = entries
             .into_iter()
             .map(|e| FsNode {
@@ -308,6 +488,99 @@ impl FileExplorer {
             })
             .collect();
         self.loading = false;
+        self.sel = cursor.and_then(|c| self.entries.iter().position(|n| n.name == c));
+        let names: std::collections::HashSet<&str> =
+            self.entries.iter().map(|n| n.name.as_str()).collect();
+        self.marked.retain(|m| names.contains(m.as_str()));
+        self.anchor = self.sel;
+    }
+
+    /// Marca as entradas de `a` ate `b` (inclusive, em qualquer ordem).
+    fn mark_range(&mut self, a: usize, b: usize) {
+        let (lo, hi) = (a.min(b), a.max(b));
+        self.marked = self
+            .entries
+            .iter()
+            .skip(lo)
+            .take(hi - lo + 1)
+            .map(|n| n.name.clone())
+            .collect();
+    }
+
+    /// Clique numa linha: sem modificador seleciona so ela; Ctrl marca ou
+    /// desmarca; Shift seleciona o intervalo desde a ancora.
+    fn click(&mut self, idx: usize, ctrl: bool, shift: bool) {
+        let Some(name) = self.entries.get(idx).map(|n| n.name.clone()) else {
+            return;
+        };
+        match self.anchor.filter(|&a| shift && a < self.entries.len()) {
+            Some(a) => self.mark_range(a, idx),
+            None if ctrl => {
+                if !self.marked.remove(&name) {
+                    self.marked.insert(name);
+                }
+                self.anchor = Some(idx);
+            }
+            None => {
+                self.marked = [name].into();
+                self.anchor = Some(idx);
+            }
+        }
+        self.sel = Some(idx);
+    }
+
+    /// Move o cursor (setas). Com `extend` (Shift) marca o intervalo desde a
+    /// ancora; sem, seleciona so o item novo.
+    fn move_cursor(&mut self, delta: i32, extend: bool) {
+        let Some(last) = self.entries.len().checked_sub(1) else {
+            return;
+        };
+        let cur = self.sel.filter(|&s| s <= last);
+        let next = match (cur, delta > 0) {
+            (None, true) => 0,
+            (None, false) => last,
+            (Some(s), true) => (s + 1).min(last),
+            (Some(s), false) => s.saturating_sub(1),
+        };
+        self.sel = Some(next);
+        if extend {
+            let a = self.anchor.filter(|&a| a <= last).or(cur).unwrap_or(next);
+            self.anchor = Some(a);
+            self.mark_range(a, next);
+        } else {
+            self.marked = [self.entries[next].name.clone()].into();
+            self.anchor = Some(next);
+        }
+    }
+
+    /// Marca todas as entradas (Ctrl+A).
+    fn select_all(&mut self) {
+        self.marked = self.entries.iter().map(|n| n.name.clone()).collect();
+        if self.sel.is_none() && !self.entries.is_empty() {
+            self.sel = Some(0);
+        }
+    }
+
+    /// Itens a baixar: os marcados, na ordem da listagem. O cursor sozinho
+    /// nao conta (ex.: Ctrl+clique desmarcou o ultimo): so vale o que aparece
+    /// selecionado.
+    fn picks(&self) -> Vec<download::Pick> {
+        self.entries
+            .iter()
+            .filter(|n| self.marked.contains(&n.name))
+            .map(|n| download::Pick {
+                remote: n.path.clone(),
+                name: n.name.clone(),
+            })
+            .collect()
+    }
+
+    /// Alvo de F2/Delete: o cursor, so quando ele e o unico item marcado. Com
+    /// varios, ou com o cursor fora da selecao, nada acontece (nunca age num
+    /// item sem o usuario perceber).
+    fn single_target(&self) -> Option<usize> {
+        let s = self.sel.filter(|&s| s < self.entries.len())?;
+        (self.marked.len() == 1 && self.marked.contains(&self.entries[s].name)).then_some(s)
     }
 
     /// Navega para `path`: limpa a lista e pede a nova listagem.
@@ -318,6 +591,8 @@ impl FileExplorer {
         self.loading = true;
         self.editing_path = None;
         self.sel = None;
+        self.marked.clear();
+        self.anchor = None;
         to_list.push(path);
     }
 
@@ -333,20 +608,39 @@ impl FileExplorer {
 
     /// Desenha o navegador do diretorio atual e devolve os diretorios a carregar
     /// (apos navegar) e se o usuario pediu refresh pelo botao do cabecalho.
-    /// Com `has_focus`, trata a navegacao por teclado: setas selecionam, Enter
-    /// abre a pasta, Backspace volta, F2 renomeia e Delete exclui.
-    fn ui(&mut self, ui: &mut egui::Ui, id_salt: impl std::hash::Hash, has_focus: bool) -> ExplorerOut {
+    /// Com `has_focus`, trata o teclado: setas movem o cursor (Shift estende a
+    /// selecao), Ctrl+A marca tudo, Enter abre a pasta, Backspace volta, F2
+    /// renomeia, Delete exclui e Ctrl+S baixa a selecao. `dl` diz se um
+    /// download pode ser pedido agora.
+    fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        id_salt: impl std::hash::Hash,
+        has_focus: bool,
+        dl: DlAvail,
+    ) -> ExplorerOut {
         let mut to_list: Vec<String> = Vec::new();
         let mut navigate: Option<String> = None;
         let mut refresh = false;
         let mut new_dialog: Option<FsDialog> = None;
         let mut clicked_row = false;
+        let mut download: Option<Vec<download::Pick>> = None;
 
         // --- Teclado (somente com o painel em foco e sem dialogo/edicao) ---
         let mut sel_changed = false;
         if has_focus && self.dialog.is_none() && self.editing_path.is_none() {
             use egui::{Key, Modifiers};
-            let (mv, open, back, rename, del) = ui.input_mut(|i| {
+            let (ext, mv, open, back, rename, del, all, save) = ui.input_mut(|i| {
+                // Shift+setas antes das setas simples: o padrao sem
+                // modificador tambem casaria com Shift (o egui ignora
+                // shift/alt a mais no padrao).
+                let mut ext = 0i32;
+                if i.consume_key(Modifiers::SHIFT, Key::ArrowDown) {
+                    ext += 1;
+                }
+                if i.consume_key(Modifiers::SHIFT, Key::ArrowUp) {
+                    ext -= 1;
+                }
                 let mut mv = 0i32;
                 if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
                     mv += 1;
@@ -355,34 +649,41 @@ impl FileExplorer {
                     mv -= 1;
                 }
                 (
+                    ext,
                     mv,
                     i.consume_key(Modifiers::NONE, Key::Enter),
                     i.consume_key(Modifiers::NONE, Key::Backspace),
                     i.consume_key(Modifiers::NONE, Key::F2),
                     i.consume_key(Modifiers::NONE, Key::Delete),
+                    i.consume_key(Modifiers::CTRL, Key::A),
+                    // Consumido sempre, mesmo sem efeito.
+                    i.consume_key(Modifiers::CTRL, Key::S),
                 )
             });
-            if mv != 0 && !self.entries.is_empty() {
-                let last = self.entries.len() - 1;
-                let next = match (self.sel, mv) {
-                    (None, m) if m > 0 => 0,
-                    (None, _) => last,
-                    (Some(s), m) if m > 0 => (s + 1).min(last),
-                    (Some(s), _) => s.saturating_sub(1),
-                };
-                self.sel = Some(next);
+            if ext != 0 && !self.entries.is_empty() {
+                self.move_cursor(ext, true);
                 sel_changed = true;
+            }
+            if mv != 0 && !self.entries.is_empty() {
+                self.move_cursor(mv, false);
+                sel_changed = true;
+            }
+            if all {
+                self.select_all();
             }
             if back {
                 if let Some(parent) = parent_path(&self.cur_path) {
                     navigate = Some(parent);
                 }
             }
-            if let Some(s) = self.sel.filter(|&s| s < self.entries.len()) {
-                let node = &self.entries[s];
+            if let Some(node) = self.sel.and_then(|s| self.entries.get(s)) {
                 if open && node.is_dir {
                     navigate = Some(node.path.clone());
                 }
+            }
+            // F2/Delete: so com um item selecionado (ver `single_target`).
+            if let Some(s) = self.single_target() {
+                let node = &self.entries[s];
                 if rename {
                     new_dialog = Some(FsDialog::Rename {
                         path: node.path.clone(),
@@ -397,9 +698,18 @@ impl FileExplorer {
                     });
                 }
             }
+            if save && dl == DlAvail::Ready {
+                let picks = self.picks();
+                if !picks.is_empty() {
+                    download = Some(picks);
+                }
+            }
         }
 
-        // Cabecalho: caminho do diretorio atual e botao de atualizar (direita).
+        // Cabecalho: caminho do diretorio atual e botoes de baixar e de
+        // atualizar (direita).
+        let has_picks = !self.marked.is_empty();
+        let mut want_download = false;
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.add_space(3.0);
@@ -408,8 +718,8 @@ impl FileExplorer {
                     .fit_to_exact_size(egui::vec2(16.0, 16.0))
                     .tint(ACCENT),
             );
-            // O botao de refresh fica a direita; reservamos o espaco dele antes
-            // para que o caminho/edicao ocupe o restante da largura.
+            // Os botoes de refresh e de baixar ficam a direita; reservamos o
+            // espaco deles antes para que o caminho/edicao ocupe o restante.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(5.0);
                 let btn = egui::ImageButton::new(
@@ -420,6 +730,26 @@ impl FileExplorer {
                 .frame(false);
                 if ui.add(btn).on_hover_text("Atualizar (F5)").clicked() {
                     refresh = true;
+                }
+                ui.add_space(4.0);
+                let dl_btn = egui::ImageButton::new(
+                    egui::Image::new(ICON_DOWNLOAD)
+                        .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                        .tint(ACCENT),
+                )
+                .frame(false);
+                let why_not = match dl {
+                    DlAvail::Ready => "Selecione arquivos ou pastas para baixar",
+                    DlAvail::Busy => "Aguarde o download atual terminar",
+                    DlAvail::Offline => "Aguarde a conexão",
+                };
+                if ui
+                    .add_enabled(dl == DlAvail::Ready && has_picks, dl_btn)
+                    .on_hover_text("Baixar a seleção para o computador (Ctrl+S)")
+                    .on_disabled_hover_text(why_not)
+                    .clicked()
+                {
+                    want_download = true;
                 }
 
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -482,6 +812,9 @@ impl FileExplorer {
                 });
             });
         });
+        if want_download {
+            download = Some(self.picks());
+        }
         // Erros de operacao (listar/renomear/excluir...) numa faixa visivel,
         // com botao para dispensar.
         if let Some(err) = self.error.clone() {
@@ -561,7 +894,7 @@ impl FileExplorer {
 
                 // Primeira linha: voltar ao diretorio anterior (pasta acima).
                 if let Some(parent) = parent_path(&self.cur_path) {
-                    let up = file_row(ui, ICON_FOLDER_UP, "..", ACCENT, None, false);
+                    let up = file_row(ui, ICON_FOLDER_UP, "..", ACCENT, None, false, false);
                     if up.clicked() {
                         clicked_row = true;
                     }
@@ -585,7 +918,9 @@ impl FileExplorer {
                     });
                 }
 
-                let mut click_sel: Option<usize> = None;
+                // Clique: (linha, Ctrl, Shift), aplicado depois do laco.
+                let mods = ui.input(|i| i.modifiers);
+                let mut click_sel: Option<(usize, bool, bool)> = None;
                 for (idx, node) in self.entries.iter().enumerate() {
                     let (icon, color, size) = if node.is_dir {
                         (ICON_FOLDER, ACCENT, None)
@@ -599,36 +934,87 @@ impl FileExplorer {
                         date: &node.date,
                         size,
                     };
-                    let selected = self.sel == Some(idx);
-                    let resp = file_row(ui, icon, &node.name, color, Some(cols), selected);
-                    // Mantem a linha selecionada visivel ao navegar com as setas.
-                    if selected && sel_changed {
+                    let selected = self.marked.contains(&node.name);
+                    let is_cursor = self.sel == Some(idx);
+                    let resp = file_row(
+                        ui,
+                        icon,
+                        &node.name,
+                        color,
+                        Some(cols),
+                        selected,
+                        is_cursor && has_focus,
+                    );
+                    // Mantem o cursor visivel ao navegar com as setas.
+                    if is_cursor && sel_changed {
                         resp.scroll_to_me(None);
                     }
-                    // Clique simples seleciona (e o painel toma o foco do teclado).
+                    // Clique seleciona (Ctrl marca/desmarca, Shift estende) e o
+                    // painel toma o foco do teclado.
                     if resp.clicked() {
-                        click_sel = Some(idx);
+                        click_sel = Some((idx, mods.command || mods.ctrl, mods.shift));
                         clicked_row = true;
+                    }
+                    // Botao direito fora da selecao: a selecao passa a ser so
+                    // essa linha (como no Explorer).
+                    if resp.secondary_clicked() && !selected {
+                        click_sel = Some((idx, false, false));
                     }
                     // Duplo clique numa pasta entra nela.
                     if node.is_dir && resp.double_clicked() {
                         navigate = Some(node.path.clone());
                     }
-                    // Menu de contexto: renomear / permissoes / excluir.
+                    // Menu de contexto: baixar / renomear / permissoes / excluir.
                     resp.context_menu(|ui| {
                         let bg = style_context_menu(ui);
-                        ui.label(
-                            egui::RichText::new(elide(&node.name, 24)).small().color(TEXT_WEAK),
-                        );
+                        // Baixar: a selecao inteira se a linha faz parte dela.
+                        let in_sel = self.marked.contains(&node.name);
+                        let n = if in_sel { self.marked.len() } else { 1 };
+                        // Com varios marcados, o menu e da selecao: as acoes de
+                        // um item so ficam desativadas (como F2/Delete).
+                        let one = n == 1;
+                        let title = if one {
+                            elide(&node.name, 24)
+                        } else {
+                            format!("{n} itens selecionados")
+                        };
+                        ui.label(egui::RichText::new(title).small().color(TEXT_WEAK));
                         ui.add_space(2.0);
-                        if menu_item(ui, ICON_PEN, "Renomear", CARD_TEXT) {
+                        let single = |ui: &mut egui::Ui, icon, text: &str, color| {
+                            ui.add_enabled_ui(one, |ui| menu_item(ui, icon, text, color)).inner
+                        };
+                        let label = if n > 1 {
+                            format!("Baixar {n} itens\u{2026}")
+                        } else {
+                            "Baixar\u{2026}".to_string()
+                        };
+                        let clicked = ui
+                            .add_enabled_ui(dl == DlAvail::Ready, |ui| {
+                                menu_item(ui, ICON_DOWNLOAD, &label, CARD_TEXT)
+                            })
+                            .inner;
+                        if clicked {
+                            download = Some(if in_sel {
+                                self.picks()
+                            } else {
+                                vec![download::Pick {
+                                    remote: node.path.clone(),
+                                    name: node.name.clone(),
+                                }]
+                            });
+                            ui.close_menu();
+                        }
+                        ui.add_space(2.0);
+                        ui.separator();
+                        ui.add_space(2.0);
+                        if single(ui, ICON_PEN, "Renomear", CARD_TEXT) {
                             new_dialog = Some(FsDialog::Rename {
                                 path: node.path.clone(),
                                 name: node.name.clone(),
                             });
                             ui.close_menu();
                         }
-                        if menu_item(ui, ICON_SETTINGS, "Permissoes", CARD_TEXT) {
+                        if single(ui, ICON_SETTINGS, "Permissoes", CARD_TEXT) {
                             new_dialog = Some(FsDialog::Chmod {
                                 path: node.path.clone(),
                                 name: node.name.clone(),
@@ -637,7 +1023,7 @@ impl FileExplorer {
                             });
                             ui.close_menu();
                         }
-                        if menu_item(ui, ICON_USERS, "Proprietario/Grupo", CARD_TEXT) {
+                        if single(ui, ICON_USERS, "Proprietario/Grupo", CARD_TEXT) {
                             new_dialog = Some(FsDialog::Chown {
                                 path: node.path.clone(),
                                 name: node.name.clone(),
@@ -649,7 +1035,7 @@ impl FileExplorer {
                         ui.add_space(2.0);
                         ui.separator();
                         ui.add_space(2.0);
-                        if menu_item(ui, ICON_TRASH, "Excluir", DANGER) {
+                        if single(ui, ICON_TRASH, "Excluir", DANGER) {
                             new_dialog = Some(FsDialog::Delete {
                                 path: node.path.clone(),
                                 name: node.name.clone(),
@@ -660,8 +1046,8 @@ impl FileExplorer {
                         paint_menu_bg(ui, bg);
                     });
                 }
-                if let Some(s) = click_sel {
-                    self.sel = Some(s);
+                if let Some((idx, ctrl, shift)) = click_sel {
+                    self.click(idx, ctrl, shift);
                 }
             });
 
@@ -675,7 +1061,13 @@ impl FileExplorer {
         // Dialogo de gerenciamento (se aberto) pode produzir uma operacao.
         let op = self.show_dialog(ui.ctx());
 
-        ExplorerOut { to_list, refresh, op, clicked_row }
+        ExplorerOut {
+            to_list,
+            refresh,
+            op,
+            clicked_row,
+            download,
+        }
     }
 
     /// Renderiza o dialogo de gerenciamento aberto (se houver) e devolve a
@@ -1139,6 +1531,7 @@ fn file_row(
     color: egui::Color32,
     cols: Option<RowCols>,
     selected: bool,
+    cursor: bool,
 ) -> egui::Response {
     let width = ui.available_width();
     let (rect, response) =
@@ -1150,6 +1543,15 @@ fn file_row(
     } else if response.hovered() {
         ui.painter()
             .rect_filled(rect, 4.0, ACCENT.gamma_multiply(0.18));
+    }
+    // Cursor do teclado (painel em foco): contorno fino.
+    if cursor {
+        ui.painter().rect_stroke(
+            rect.shrink(0.5),
+            4.0,
+            egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.6)),
+            egui::StrokeKind::Inside,
+        );
     }
 
     let pad = 6.0;
@@ -1286,6 +1688,12 @@ enum PaneAction {
     NewHost,
     /// Excluir o host indicado (a partir do seletor de um painel).
     Delete { host: usize },
+    /// Baixar itens do navegador SFTP do painel (pede a pasta no fim do quadro).
+    Download {
+        path: Vec<usize>,
+        remote_dir: String,
+        picks: Vec<download::Pick>,
+    },
 }
 
 /// Caminho ate uma folha: indices de filho da raiz ate o no.
@@ -1328,6 +1736,7 @@ const ICON_FOLDER: egui::ImageSource = egui::include_image!("../assets/folder.sv
 const ICON_FILE: egui::ImageSource = egui::include_image!("../assets/file.svg");
 const ICON_FOLDER_UP: egui::ImageSource = egui::include_image!("../assets/folder-up.svg");
 const ICON_FOLDER_SYNC: egui::ImageSource = egui::include_image!("../assets/folder-sync.svg");
+const ICON_DOWNLOAD: egui::ImageSource = egui::include_image!("../assets/download.svg");
 const ICON_PEN: egui::ImageSource = egui::include_image!("../assets/pen.svg");
 const ICON_USERS: egui::ImageSource = egui::include_image!("../assets/users.svg");
 const ICON_PLUS: egui::ImageSource = egui::include_image!("../assets/plus.svg");
@@ -1467,6 +1876,8 @@ struct HostEditor {
     password: String,
     private_key: String,
     passphrase: String,
+    /// "Esquecer chave" do servidor: vale so ao salvar (Cancelar descarta).
+    forget_key: bool,
 }
 
 impl HostEditor {
@@ -1481,6 +1892,7 @@ impl HostEditor {
             password: String::new(),
             private_key: String::new(),
             passphrase: String::new(),
+            forget_key: false,
         }
     }
 
@@ -1507,10 +1919,14 @@ impl HostEditor {
             password,
             private_key,
             passphrase,
+            forget_key: false,
         }
     }
 
-    fn to_host(&self, id: uuid::Uuid) -> Host {
+    /// Host com os dados do formulario. A chave do servidor vem do cofre ATUAL
+    /// (`current`), pois pode ter sido aceita com o editor aberto; so e mantida
+    /// se o endereco e a porta nao mudaram e o usuario nao pediu para esquece-la.
+    fn to_host(&self, id: uuid::Uuid, current: Option<&Host>) -> Host {
         let auth = if self.use_key {
             AuthMethod::Key {
                 private_key: self.private_key.clone(),
@@ -1525,14 +1941,19 @@ impl HostEditor {
                 password: self.password.clone(),
             }
         };
-        Host {
+        let mut host = Host {
             id,
             name: self.name.trim().to_string(),
             host: self.host.trim().to_string(),
             port: self.parsed_port().unwrap_or(22),
             username: self.username.trim().to_string(),
             auth,
-        }
+            host_key: None,
+        };
+        host.host_key = current
+            .filter(|c| !self.forget_key && same_endpoint(&host.host, host.port, c))
+            .and_then(|c| c.host_key.clone());
+        host
     }
 
     /// Porta valida (1..=65535) a partir do texto digitado, se houver.
@@ -1614,17 +2035,33 @@ pub struct App {
     // Host aguardando confirmacao de exclusao (dialogo flutuante).
     pending_delete: Option<uuid::Uuid>,
 
-    // Verificacao/instalacao de versao nova (Releases do GitHub).
-    updater: Updater,
-    // Dialogo "Atualizacao disponivel" aberto (notas + confirmar).
-    show_update: bool,
-    // Aviso de versao nova dispensado ("Depois") nesta execucao.
-    update_dismissed: bool,
-    // Reinicio pos-atualizacao ja disparado (evita abrir o app duas vezes).
-    update_restarting: bool,
-
     // Proximo id de lote de envio de arquivos soltos sobre um terminal.
     next_upload_id: u64,
+
+    // Ordem de chegada da proxima pergunta de chave do servidor (fila).
+    next_host_key_seq: u64,
+
+    // Esc (sem modificadores) recebido neste quadro com uma pergunta de chave
+    // aberta: cancela, se a janela ja estiver armada.
+    host_key_esc: bool,
+
+    // Download pedido no navegador SFTP aguardando a escolha da pasta (o
+    // dialogo do Windows abre no fim do quadro).
+    pending_download: Option<PendingDownload>,
+
+    // Ultima pasta escolhida para downloads (so em memoria; o dialogo do
+    // Windows tambem lembra a ultima usada).
+    download_dir: Option<PathBuf>,
+
+    // Proximo id de lote de download.
+    next_download_id: u64,
+}
+
+/// `host`:`port` e o mesmo endereco do host do cofre (sem diferenciar
+/// maiusculas, ignorando espacos nas pontas). A chave do servidor guardada so
+/// vale para o mesmo endereco e porta.
+fn same_endpoint(host: &str, port: u16, h: &Host) -> bool {
+    port == h.port && host.trim().eq_ignore_ascii_case(h.host.trim())
 }
 
 /// Nome de exibicao de um host: o apelido, ou o endereco quando sem apelido.
@@ -1674,14 +2111,12 @@ impl App {
             last_pane_focus: None,
             show_help: false,
             pending_delete: None,
-            updater: Updater::check({
-                let ctx = cc.egui_ctx.clone();
-                move || ctx.request_repaint()
-            }),
-            show_update: false,
-            update_dismissed: false,
-            update_restarting: false,
             next_upload_id: 1,
+            next_host_key_seq: 1,
+            host_key_esc: false,
+            pending_download: None,
+            download_dir: None,
+            next_download_id: 1,
         }
     }
 
@@ -1748,7 +2183,15 @@ impl App {
         // cima. Uma falha no meio (queda de energia, disco cheio) nunca deixa
         // o cofre — unico arquivo com todas as credenciais — corrompido.
         let tmp = path.with_extension("sagu.tmp");
-        std::fs::write(&tmp, bytes)?;
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            // Dados no disco antes do rename: sem isso o NTFS pode gravar o
+            // rename (metadado, com journal) antes do conteudo e, numa queda
+            // de energia, o cofre voltaria zerado.
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
@@ -1759,6 +2202,7 @@ impl App {
         }
         self.root = None;
         self.last_pane_focus = None;
+        self.pending_download = None;
         self.vault = Vault::default();
         self.master_password.clear();
         self.gate_password.clear();
@@ -2179,6 +2623,12 @@ impl App {
         // Largura util dos campos (mesmo padrao do portao do cofre).
         const FIELD_W: f32 = 360.0;
 
+        // Host em edicao como esta no cofre agora (a chave do servidor pode
+        // ser aceita ou esquecida por outro caminho com o editor aberto).
+        let stored = editor
+            .id
+            .and_then(|id| self.vault.hosts.iter().find(|h| h.id == id));
+
         let frame = egui::Frame::window(&ctx.style())
             .fill(CARD_BG)
             .stroke(egui::Stroke::new(1.0, CARD_BORDER))
@@ -2324,6 +2774,81 @@ impl App {
                     );
                 }
 
+                // Chave do servidor ja aceita (so ao editar um host existente).
+                if let Some(cur) = stored {
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Chave do servidor").small().color(TEXT_WEAK));
+                    let same = editor
+                        .parsed_port()
+                        .is_some_and(|port| same_endpoint(&editor.host, port, cur));
+                    match &cur.host_key {
+                        Some(_) if editor.forget_key => {
+                            ui.label(
+                                egui::RichText::new(
+                                    "A chave será esquecida ao salvar e confirmada de novo \
+                                     na próxima conexão.",
+                                )
+                                .color(TEXT_WEAK),
+                            );
+                            if fit_btn(ui, "Desfazer", &BTN_GHOST, "") {
+                                editor.forget_key = false;
+                            }
+                        }
+                        Some(key) if same => {
+                            match hostkey::describe(key) {
+                                Some(info) => {
+                                    ui.label(
+                                        egui::RichText::new(info.fingerprint)
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(CARD_TEXT),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(info.algorithm)
+                                            .small()
+                                            .color(TEXT_WEAK),
+                                    );
+                                }
+                                None => {
+                                    ui.label(
+                                        egui::RichText::new("(chave guardada ilegível)")
+                                            .small()
+                                            .color(ERROR_FG),
+                                    );
+                                }
+                            }
+                            if fit_btn(
+                                ui,
+                                "Esquecer chave",
+                                &BTN_GHOST,
+                                "A chave será pedida de novo na próxima conexão.",
+                            ) {
+                                editor.forget_key = true;
+                            }
+                        }
+                        Some(_) => {
+                            ui.label(
+                                egui::RichText::new(
+                                    "O endereço ou a porta mudou: a chave guardada será \
+                                     apagada ao salvar.",
+                                )
+                                .small()
+                                .color(HIGHLIGHT),
+                            );
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Nenhuma chave guardada; ela será confirmada na \
+                                     primeira conexão.",
+                                )
+                                .small()
+                                .color(TEXT_WEAK),
+                            );
+                        }
+                    }
+                }
+
                 ui.add_space(16.0);
 
                 // Acoes: Salvar (acento, principal) e Cancelar lado a lado.
@@ -2370,7 +2895,10 @@ impl App {
                     // Resolve o host pelo id no momento do save: a lista pode
                     // ter mudado (exclusoes) com o editor aberto.
                     match self.vault.hosts.iter().position(|h| h.id == id) {
-                        Some(i) => self.vault.hosts[i] = editor.to_host(id),
+                        Some(i) => {
+                            let host = editor.to_host(id, Some(&self.vault.hosts[i]));
+                            self.vault.hosts[i] = host;
+                        }
                         None => {
                             self.hosts_error =
                                 Some("Este host foi removido enquanto era editado.".into());
@@ -2380,7 +2908,9 @@ impl App {
                     }
                 }
                 None => {
-                    self.vault.hosts.push(editor.to_host(uuid::Uuid::new_v4()));
+                    self.vault
+                        .hosts
+                        .push(editor.to_host(uuid::Uuid::new_v4(), None));
                 }
             }
             self.editor = None;
@@ -2582,8 +3112,20 @@ impl App {
 
     fn drain_ssh_events(&mut self) {
         {
+            let next_seq = &mut self.next_host_key_seq;
             let Some(root) = &mut self.root else {
                 return;
+            };
+            // Pergunta de chave recebida: entra na fila (a janela mostra a
+            // mais antiga). Uma anterior no mesmo painel (nao deveria haver)
+            // e descartada, o que aborta a conexao dela.
+            let mut ask = |pane: &mut Pane, prompt: HostKeyPrompt| {
+                pane.host_key = Some(PendingHostKey {
+                    prompt,
+                    seq: *next_seq,
+                    shown_at: None,
+                });
+                *next_seq += 1;
             };
             for_each_pane_mut(root, &mut |pane| {
                 let mut events = Vec::new();
@@ -2600,9 +3142,16 @@ impl App {
                                 term.process(&bytes);
                             }
                         }
-                        SshToUi::Error(msg) => pane.state = SessionState::Error(msg),
+                        SshToUi::Error(msg) => {
+                            pane.state = SessionState::Error(msg);
+                            // A sessao desistiu (ex.: servidor caiu durante a
+                            // pergunta): a janela da chave some.
+                            pane.host_key = None;
+                        }
                         SshToUi::Upload(ev) => apply_upload_event(pane, ev),
+                        SshToUi::HostKey(p) => ask(pane, p),
                         SshToUi::Closed => {
+                            pane.host_key = None;
                             // Envio em andamento morre com a sessao: mantem o
                             // painel aberto com o aviso em vez de fecha-lo.
                             match pane.upload.as_ref().map(|u| &u.stage) {
@@ -2658,7 +3207,10 @@ impl App {
                                 exp.apply_listing(&path, entries);
                             }
                         }
+                        SftpToUi::HostKey(p) => ask(pane, p),
+                        SftpToUi::Download(ev) => apply_download_event(pane, ev),
                         SftpToUi::Error(msg) => {
+                            pane.host_key = None;
                             // Erro antes de conectar e fatal: marca o painel
                             // como erro para que o `Closed` seguinte nao o
                             // feche silenciosamente (o usuario precisa ler).
@@ -2674,6 +3226,33 @@ impl App {
                             }
                         }
                         SftpToUi::Closed => {
+                            pane.host_key = None;
+                            // Download em andamento morre com a sessao: mantem o
+                            // painel aberto com o aviso em vez de fecha-lo.
+                            if let Some(d) = &mut pane.download {
+                                match d.stage {
+                                    DownloadStage::Running { .. } => {
+                                        d.stage = DownloadStage::done(
+                                            "Download interrompido: a sessão foi encerrada.",
+                                            Tone::Error,
+                                        );
+                                        // Preserva o erro real, se houver.
+                                        if !matches!(pane.state, SessionState::Error(_)) {
+                                            pane.state = SessionState::Error(
+                                                "sessão encerrada durante o download".into(),
+                                            );
+                                        }
+                                    }
+                                    // A pergunta de conflito nao vale mais.
+                                    DownloadStage::Asking(_) => {
+                                        d.stage = DownloadStage::done(
+                                            "Download cancelado: a sessão foi encerrada.",
+                                            Tone::Neutral,
+                                        );
+                                    }
+                                    DownloadStage::Done { .. } => {}
+                                }
+                            }
                             if !matches!(pane.state, SessionState::Error(_)) {
                                 pane.state = SessionState::Closed;
                                 pane.should_close = true;
@@ -2970,159 +3549,6 @@ impl App {
         }
     }
 
-    /// Faixa na base da janela avisando de versao nova (ou mostrando o
-    /// progresso/erro da atualizacao). Nada aparece enquanto verifica, se ja
-    /// esta atualizado ou se a consulta falhou (ex.: sem internet).
-    fn ui_update_bar(&mut self, ctx: &egui::Context) {
-        let status = self.updater.status();
-        let visible = match &status {
-            update::Status::Available(_) => !self.update_dismissed,
-            update::Status::Downloading { .. }
-            | update::Status::Failed { .. }
-            | update::Status::Installed { .. } => true,
-            _ => false,
-        };
-        if !visible {
-            return;
-        }
-        egui::TopBottomPanel::bottom("update_bar")
-            .frame(
-                egui::Frame::NONE
-                    .fill(CARD_BG)
-                    .inner_margin(egui::Margin::symmetric(10, 6)),
-            )
-            .show_separator_line(false)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| match &status {
-                    update::Status::Available(r) => {
-                        ui.label(
-                            egui::RichText::new(format!("Nova versão v{} disponível", r.version))
-                                .color(ACCENT)
-                                .strong(),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!("(atual: v{})", update::CURRENT))
-                                .small()
-                                .color(TEXT_WEAK),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ghost_btn(ui, "Depois") {
-                                self.update_dismissed = true;
-                            }
-                            if accent_btn(ui, "Atualizar") {
-                                self.show_update = true;
-                            }
-                        });
-                    }
-                    update::Status::Downloading { release, done, total } => {
-                        ui.label(
-                            egui::RichText::new(format!("Baixando v{}...", release.version))
-                                .color(CARD_TEXT),
-                        );
-                        let frac = if *total > 0 { *done as f32 / *total as f32 } else { 0.0 };
-                        ui.add(
-                            egui::ProgressBar::new(frac)
-                                .desired_width(220.0)
-                                .show_percentage(),
-                        );
-                    }
-                    update::Status::Installed { .. } => {
-                        ui.label(
-                            egui::RichText::new("Atualizado. Reiniciando o SaguTerm...")
-                                .color(ACCENT),
-                        );
-                    }
-                    update::Status::Failed { release, error } => {
-                        ui.label(
-                            egui::RichText::new(format!("Falha ao atualizar: {error}"))
-                                .color(ERROR_FG),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ghost_btn(ui, "Baixar manualmente") {
-                                ui.ctx().open_url(egui::OpenUrl::new_tab(&release.page_url));
-                            }
-                            if accent_btn(ui, "Tentar de novo") {
-                                let ctx = ui.ctx().clone();
-                                self.updater
-                                    .install(release.clone(), move || ctx.request_repaint());
-                            }
-                        });
-                    }
-                    _ => {}
-                });
-            });
-    }
-
-    /// Dialogo com as notas da versao nova e a confirmacao da atualizacao.
-    fn ui_update_dialog(&mut self, ctx: &egui::Context) {
-        let update::Status::Available(release) = self.updater.status() else {
-            self.show_update = false;
-            return;
-        };
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            self.show_update = false;
-            return;
-        }
-
-        let mut confirm = false;
-        let mut cancel = false;
-        let frame = egui::Frame::window(&ctx.style())
-            .fill(CARD_BG)
-            .stroke(egui::Stroke::new(1.0, CARD_BORDER))
-            .corner_radius(12.0)
-            .inner_margin(egui::Margin::same(18));
-        egui::Window::new(egui::RichText::new("Atualização disponível").color(ACCENT).strong())
-            .collapsible(false)
-            .resizable(false)
-            .movable(true)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .frame(frame)
-            .show(ctx, |ui| {
-                ui.set_min_width(380.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "v{}  \u{00b7}  nova: v{}",
-                        update::CURRENT,
-                        release.version
-                    ))
-                    .size(14.0)
-                    .color(HIGHLIGHT),
-                );
-                if !release.notes.is_empty() {
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("Novidades:").color(TEXT_WEAK));
-                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                        ui.label(egui::RichText::new(&release.notes).color(CARD_TEXT));
-                    });
-                }
-                ui.add_space(12.0);
-                let aviso = if self.root.is_some() {
-                    "O SaguTerm será reiniciado e as sessões abertas serão encerradas."
-                } else {
-                    "O SaguTerm será reiniciado ao final do download."
-                };
-                ui.label(egui::RichText::new(aviso).color(TEXT_WEAK));
-                ui.add_space(18.0);
-                ui.horizontal(|ui| {
-                    if accent_btn(ui, "Atualizar agora") {
-                        confirm = true;
-                    }
-                    if ghost_btn(ui, "Depois") {
-                        cancel = true;
-                    }
-                });
-            });
-
-        if confirm {
-            self.show_update = false;
-            let ctx = ctx.clone();
-            self.updater.install(release, move || ctx.request_repaint());
-        } else if cancel {
-            self.show_update = false;
-            self.update_dismissed = true;
-        }
-    }
-
     /// Arquivos soltos na janela (vindos do Explorer): vao para o painel sob o
     /// cursor. Painel SFTP: pasta aberta nele. Terminal SSH: pasta atual do
     /// shell (a sessao descobre qual e). Outros paineis recusam com aviso.
@@ -3137,7 +3563,7 @@ impl App {
         let modal_open = self.editor.is_some()
             || self.pending_delete.is_some()
             || self.show_help
-            || self.show_update;
+            || self.host_key_pending();
         if files.is_empty() || modal_open {
             return;
         }
@@ -3203,7 +3629,8 @@ impl App {
     /// Realce do painel sob o cursor enquanto arquivos sao arrastados sobre a
     /// janela, com a dica de para onde iriam.
     fn ui_drop_overlay(&self, ctx: &egui::Context) {
-        if ctx.input(|i| i.raw.hovered_files.is_empty()) {
+        // Com a pergunta de chave aberta, arquivos soltos sao ignorados.
+        if ctx.input(|i| i.raw.hovered_files.is_empty()) || self.host_key_pending() {
             return;
         }
         // O Windows nao avisa o movimento do mouse durante o arrasto:
@@ -3237,23 +3664,6 @@ impl App {
             egui::FontId::proportional(16.0),
             color,
         );
-    }
-
-    /// Com o executavel novo instalado, abre-o e fecha esta instancia (as
-    /// sessoes sao encerradas pelo fechamento normal da janela).
-    fn restart_after_update(&mut self, ctx: &egui::Context) {
-        let update::Status::Installed { exe } = self.updater.status() else {
-            return;
-        };
-        if self.update_restarting {
-            return;
-        }
-        self.update_restarting = true;
-        if update::restart(&exe).is_ok() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        // Se nao conseguir abrir, a faixa segue dizendo "Atualizado"; a nova
-        // versao entra na proxima vez que o usuario abrir o app.
     }
 
     /// F1 abre/fecha a ajuda de atalhos em qualquer tela, inclusive com um
@@ -3336,10 +3746,14 @@ impl App {
 
             secao(ui, "Navegador SFTP (painel em foco)");
             atalho(ui, "setas", "selecionar arquivo/pasta");
+            atalho(ui, "Ctrl+clique", "marcar/desmarcar itens");
+            atalho(ui, "Shift+clique, Shift+setas", "selecionar um intervalo");
+            atalho(ui, "Ctrl+A", "selecionar tudo");
+            atalho(ui, "Ctrl+S", "baixar a seleção para o computador");
             atalho(ui, "Enter", "abrir a pasta selecionada");
             atalho(ui, "Backspace", "voltar a pasta anterior");
-            atalho(ui, "F2", "renomear a selecao");
-            atalho(ui, "Delete", "excluir a selecao");
+            atalho(ui, "F2", "renomear o item selecionado");
+            atalho(ui, "Delete", "excluir o item selecionado");
             atalho(ui, "F5", "atualizar a listagem");
             atalho(ui, "clique no caminho", "editar/navegar direto");
 
@@ -3348,23 +3762,10 @@ impl App {
             atalho(ui, "Enter", "confirmar (renomear)");
             atalho(ui, "Ctrl+Enter", "salvar host");
 
-            // Versao e estado da verificacao de atualizacoes.
+            // Versao do app (vem do Cargo.toml, em tempo de compilacao).
             ui.add_space(12.0);
-            let estado = match self.updater.status() {
-                update::Status::Checking => "verificando atualizações...".to_string(),
-                update::Status::UpToDate => "versão mais recente".to_string(),
-                update::Status::CheckFailed(e) => {
-                    format!("não foi possível verificar atualizações ({e})")
-                }
-                update::Status::Available(r) => format!("nova versão v{} disponível", r.version),
-                update::Status::Downloading { release, .. } => {
-                    format!("baixando v{}...", release.version)
-                }
-                update::Status::Installed { .. } => "atualizado; reiniciando...".to_string(),
-                update::Status::Failed { error, .. } => format!("falha ao atualizar ({error})"),
-            };
             ui.label(
-                egui::RichText::new(format!("SaguTerm v{}  \u{00b7}  {estado}", update::CURRENT))
+                egui::RichText::new(concat!("SaguTerm v", env!("CARGO_PKG_VERSION")))
                     .small()
                     .color(TEXT_WEAK),
             );
@@ -3380,6 +3781,437 @@ impl App {
         if !open {
             self.show_help = false;
         }
+    }
+
+    // ---------------- Chave do servidor (TOFU) ----------------
+
+    /// Algum painel aguarda a confirmacao da chave do servidor?
+    /// Dica da barra de baixo na sessao. Ctrl+S so aparece com um painel SFTP
+    /// em foco: num terminal a tecla vai ao servidor (XOFF, que congela a
+    /// saida ate um Ctrl+Q).
+    fn session_hint(&self) -> &'static str {
+        let sftp = match (&self.root, &self.focused_path) {
+            (Some(root), Some(path)) => {
+                matches!(node_at(root, path), Some(Node::Leaf(p)) if p.sftp.is_some())
+            }
+            _ => false,
+        };
+        if sftp {
+            "Alt+setas troca de painel  \u{00b7}  F1 ajuda  \u{00b7}  F5 atualiza  \
+             \u{00b7}  Ctrl+S baixa a seleção"
+        } else {
+            "Alt+setas troca de painel  \u{00b7}  F1 ajuda  \u{00b7}  F5 atualiza SFTP"
+        }
+    }
+
+    fn host_key_pending(&self) -> bool {
+        let mut queue = Vec::new();
+        if let Some(root) = &self.root {
+            pending_host_keys(root, &mut Vec::new(), &mut queue);
+        }
+        !queue.is_empty()
+    }
+
+    /// Com uma pergunta de chave aberta, nenhuma tecla chega a terminais,
+    /// seletores, SFTP ou atalhos (nem Enter/Espaco num botao focado). Esc e
+    /// guardado para cancelar (o padrao seguro).
+    fn guard_host_key_keys(&mut self, ctx: &egui::Context) {
+        if !self.host_key_pending() {
+            return;
+        }
+        let esc = ctx.input_mut(|i| {
+            let esc = i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.is_none()
+                )
+            });
+            i.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::Key { .. }
+                        | egui::Event::Text(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::Copy
+                        | egui::Event::Cut
+                        | egui::Event::Ime(_)
+                )
+            });
+            esc
+        });
+        self.host_key_esc |= esc;
+    }
+
+    /// Responde sem perguntar o que o cofre ja decide: chave ja aceita (inclusive
+    /// por outro painel enquanto esta esperava), host excluido, endereco/porta
+    /// mudados. Roda a cada quadro, antes de desenhar a janela.
+    fn resolve_host_key_prompts(&mut self) {
+        let hosts = &self.vault.hosts;
+        let Some(root) = &mut self.root else {
+            return;
+        };
+        for_each_pane_mut(root, &mut |pane| {
+            let Some(pending) = &pane.host_key else {
+                return;
+            };
+            let p = &pending.prompt;
+            let answer = match hosts.iter().find(|h| h.id == p.host_id) {
+                None => HostKeyAnswer::Cancel(HOST_KEY_DELETED.into()),
+                Some(h) if !same_endpoint(&p.host, p.port, h) => {
+                    HostKeyAnswer::Cancel(HOST_KEY_MOVED.into())
+                }
+                Some(h)
+                    if hostkey::check(h.host_key.as_deref(), &p.presented) == KeyCheck::Match =>
+                {
+                    HostKeyAnswer::Accept
+                }
+                Some(_) => return,
+            };
+            if let Some(pending) = pane.host_key.take() {
+                let _ = pending.prompt.reply.send(answer);
+            }
+        });
+    }
+
+    /// Janela modal da chave do servidor, sempre para a pergunta mais antiga da
+    /// fila. "Servidor novo" na primeira conexao; alerta vermelho quando a
+    /// chave difere da guardada (Cancelar e o padrao). A classificacao e
+    /// refeita a cada quadro contra o cofre atual. Cliques e Esc so valem apos
+    /// `HOST_KEY_ARM`; Enter/Espaco/Tab nunca chegam aqui (`guard_host_key_keys`)
+    /// e clicar fora da janela nao faz nada.
+    fn ui_host_key_prompt(&mut self, ctx: &egui::Context) {
+        self.resolve_host_key_prompts();
+        let esc = std::mem::take(&mut self.host_key_esc);
+        let mut queue = Vec::new();
+        if let Some(root) = &self.root {
+            pending_host_keys(root, &mut Vec::new(), &mut queue);
+        }
+        let Some((seq, path)) = queue.iter().min_by_key(|(seq, _)| *seq).cloned() else {
+            return;
+        };
+        let waiting = queue.len() - 1;
+
+        let Some(Node::Leaf(pane)) = self.root.as_mut().and_then(|r| node_at_mut(r, &path)) else {
+            return;
+        };
+        let Some(pending) = &mut pane.host_key else {
+            return;
+        };
+        let now = Instant::now();
+        let shown_at = *pending.shown_at.get_or_insert(now);
+        let (host_id, addr, presented) = (
+            pending.prompt.host_id,
+            format!("{}:{}", pending.prompt.host, pending.prompt.port),
+            pending.prompt.presented.clone(),
+        );
+        // `resolve_host_key_prompts` garante que o host existe (mesmo endereco).
+        let Some(h) = self.vault.hosts.iter().find(|h| h.id == host_id) else {
+            return;
+        };
+        let kind = hostkey::check(h.host_key.as_deref(), &presented);
+        let changed = kind == KeyCheck::Changed;
+        let name = display_name(h);
+        let target = format!("{}@{addr}", h.username);
+        let new_info = hostkey::describe(&presented);
+        let old_info = h.host_key.as_deref().and_then(hostkey::describe);
+
+        let elapsed = now.saturating_duration_since(shown_at);
+        let armed = elapsed >= HOST_KEY_ARM;
+        if !armed {
+            ctx.request_repaint_after(HOST_KEY_ARM - elapsed);
+        }
+
+        let stroke = if changed {
+            egui::Stroke::new(1.5, ERROR_FG)
+        } else {
+            egui::Stroke::new(1.0, CARD_BORDER)
+        };
+        let frame = egui::Frame::window(&ctx.style())
+            .fill(CARD_BG)
+            .stroke(stroke)
+            .corner_radius(12.0)
+            .inner_margin(egui::Margin::same(20));
+        let mut accept = false;
+        let mut cancel = false;
+        let mut copy: Option<String> = None;
+
+        let resp = egui::Modal::new(egui::Id::new(("host_key_prompt", seq)))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.set_max_width(480.0);
+                ui.spacing_mut().item_spacing.y = 6.0;
+
+                if changed {
+                    ui.label(
+                        egui::RichText::new("Atenção: a chave do servidor mudou")
+                            .size(16.0)
+                            .strong()
+                            .color(ERROR_FG),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("Servidor novo")
+                            .size(16.0)
+                            .strong()
+                            .color(ACCENT),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Primeira conexão com").color(TEXT_WEAK));
+                }
+                ui.label(egui::RichText::new(&name).size(14.0).color(HIGHLIGHT));
+                ui.label(egui::RichText::new(&target).small().color(TEXT_WEAK));
+                ui.add_space(8.0);
+
+                if changed {
+                    ui.label(
+                        egui::RichText::new(
+                            "A chave que este servidor apresentou agora é diferente da que \
+                             está guardada no cofre.",
+                        )
+                        .color(CARD_TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Isso é esperado se o servidor foi reinstalado ou teve as chaves \
+                             trocadas. Mas também pode ser um ataque: alguém no meio do \
+                             caminho se passando pelo servidor para capturar sua senha e \
+                             tudo o que você digitar.",
+                        )
+                        .color(TEXT_WEAK),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Não aceite sem confirmar a troca com o responsável pelo servidor.",
+                        )
+                        .color(ERROR_FG),
+                    );
+                    ui.add_space(8.0);
+                    egui::Grid::new(("host_key_grid", seq))
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("Guardada:").color(TEXT_WEAK));
+                            ui.vertical(|ui| {
+                                key_lines(ui, old_info.as_ref(), "(chave guardada ilegível)", false)
+                            });
+                            ui.end_row();
+                            ui.label(egui::RichText::new("Nova:").color(TEXT_WEAK));
+                            ui.vertical(|ui| {
+                                if let Some(fp) =
+                                    key_lines(ui, new_info.as_ref(), "(chave ilegível)", true)
+                                {
+                                    copy = Some(fp);
+                                }
+                            });
+                            ui.end_row();
+                        });
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        // Cancelar primeiro, com o destaque: e o padrao.
+                        if fit_btn(ui, "Cancelar", &BTN_ACCENT, "") {
+                            cancel = true;
+                        }
+                        ui.add_space(6.0);
+                        if fit_btn(ui, "Aceitar a nova chave e conectar", &BTN_DANGER, "") {
+                            accept = true;
+                        }
+                    });
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "O SaguTerm ainda não conhece a chave deste servidor. Confira se a \
+                             impressão digital abaixo é a mesma do servidor antes de confiar.",
+                        )
+                        .color(CARD_TEXT),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Tipo da chave")
+                            .small()
+                            .color(TEXT_WEAK),
+                    );
+                    match &new_info {
+                        Some(info) => {
+                            ui.label(
+                                egui::RichText::new(&info.algorithm).monospace().color(CARD_TEXT),
+                            );
+                            ui.label(
+                                egui::RichText::new("Impressão digital (SHA256)")
+                                    .small()
+                                    .color(TEXT_WEAK),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(&info.fingerprint)
+                                        .monospace()
+                                        .color(CARD_TEXT),
+                                );
+                                if painted_btn(ui, egui::vec2(64.0, 22.0), "Copiar", 12.0, &BTN_GHOST) {
+                                    copy = Some(info.fingerprint.clone());
+                                }
+                            });
+                            if let Some(file) = hostkey::server_pub_file(&info.algorithm) {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "No servidor, confira com: ssh-keygen -lf /etc/ssh/{file}"
+                                    ))
+                                    .small()
+                                    .color(TEXT_WEAK),
+                                );
+                            }
+                        }
+                        None => {
+                            ui.label(egui::RichText::new("(chave ilegível)").color(ERROR_FG));
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Ao confiar, a chave fica guardada no cofre e as próximas conexões \
+                             só pedem confirmação se ela mudar.",
+                        )
+                        .color(TEXT_WEAK),
+                    );
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if fit_btn(ui, "Confiar e conectar", &BTN_ACCENT, "") {
+                            accept = true;
+                        }
+                        ui.add_space(6.0);
+                        if fit_btn(ui, "Cancelar", &BTN_GHOST, "") {
+                            cancel = true;
+                        }
+                    });
+                }
+
+                if waiting > 0 {
+                    ui.add_space(8.0);
+                    let text = if waiting == 1 {
+                        "Outra conexão aguarda confirmação.".to_string()
+                    } else {
+                        format!("Outras {waiting} conexões aguardam confirmação.")
+                    };
+                    ui.label(egui::RichText::new(text).small().color(TEXT_WEAK));
+                }
+            });
+        // Acima de tudo, inclusive da barra de destino do envio (tambem
+        // Foreground). Clicar no fundo escurecido nao responde nada.
+        ctx.move_to_top(resp.response.layer_id);
+
+        if let Some(fp) = copy {
+            ctx.copy_text(fp);
+        }
+        if !armed {
+            return;
+        }
+        // Na duvida (Esc junto com um clique), cancelar vence.
+        if cancel || esc {
+            self.answer_host_key(&path, false, kind);
+        } else if accept {
+            self.answer_host_key(&path, true, kind);
+        }
+    }
+
+    /// Responde a pergunta do painel em `path`. Aceitar grava a chave no host
+    /// do cofre (pelo id, com o mesmo endereco e porta) e salva o cofre na
+    /// hora; recusar nao grava nada e a sessao aborta com a mensagem.
+    fn answer_host_key(&mut self, path: &[usize], accept: bool, kind: KeyCheck) {
+        let Some(Node::Leaf(pane)) = self.root.as_mut().and_then(|r| node_at_mut(r, path)) else {
+            return;
+        };
+        let Some(pending) = pane.host_key.take() else {
+            return;
+        };
+        let prompt = pending.prompt;
+        if !accept {
+            let msg = if kind == KeyCheck::Changed {
+                "Conexão cancelada: a chave do servidor mudou e não foi aceita."
+            } else {
+                "Conexão cancelada: a chave do servidor não foi confirmada."
+            };
+            let _ = prompt.reply.send(HostKeyAnswer::Cancel(msg.into()));
+            return;
+        }
+        let Some(h) = self.vault.hosts.iter_mut().find(|h| h.id == prompt.host_id) else {
+            let _ = prompt
+                .reply
+                .send(HostKeyAnswer::Cancel(HOST_KEY_DELETED.into()));
+            return;
+        };
+        if !same_endpoint(&prompt.host, prompt.port, h) {
+            let _ = prompt
+                .reply
+                .send(HostKeyAnswer::Cancel(HOST_KEY_MOVED.into()));
+            return;
+        }
+        h.host_key = Some(prompt.presented.clone());
+        let saved = self.save_vault();
+        // A decisao do usuario vale mesmo se o cofre nao pode ser gravado
+        // (a chave fica so em memoria e sera pedida de novo depois).
+        let _ = prompt.reply.send(HostKeyAnswer::Accept);
+        if let Err(e) = saved {
+            self.hosts_error = Some(format!(
+                "A chave do servidor foi aceita, mas o cofre não pôde ser gravado: {e}"
+            ));
+            if let Some(Node::Leaf(pane)) = self.root.as_mut().and_then(|r| node_at_mut(r, path)) {
+                pane.upload = Some(UploadUi::notice(
+                    "Cofre não gravado: a chave do servidor será pedida de novo.",
+                ));
+            }
+        }
+        self.pending_focus = Some(path.to_vec());
+        // Outros paineis do mesmo host com a mesma chave seguem neste quadro.
+        self.resolve_host_key_prompts();
+    }
+
+    /// Comeca o download pedido em `req` para a pasta local `dest` (ja
+    /// escolhida). Confere se o painel ainda e o mesmo SFTP, na mesma pasta e
+    /// sem outro download; conflitos com o que ja existe em `dest` abrem o
+    /// dialogo de conflito antes de qualquer coisa ir para a sessao.
+    fn begin_download(&mut self, req: PendingDownload, dest: PathBuf) {
+        let Some(Node::Leaf(pane)) = self.root.as_mut().and_then(|r| node_at_mut(r, &req.path)) else {
+            return;
+        };
+        let same_dir = pane
+            .explorer
+            .as_ref()
+            .is_some_and(|e| e.cur_path == req.remote_dir);
+        if pane.sftp.is_none() || !same_dir || pane.download.as_ref().is_some_and(DownloadUi::busy) {
+            return;
+        }
+        let id = self.next_download_id;
+        self.next_download_id += 1;
+        let prepared = download::prepare(&dest, &req.picks);
+        if prepared.items.is_empty() {
+            let text = match prepared.invalid.first() {
+                Some((nome, motivo)) => format!("Nada a baixar: {}: {motivo}", show_path(nome)),
+                None => "Nada a baixar.".to_string(),
+            };
+            pane.download = Some(DownloadUi {
+                id,
+                dest,
+                pre_skipped: Vec::new(),
+                stage: DownloadStage::done(&text, Tone::Error),
+            });
+            return;
+        }
+        let pre_skipped = prepared.invalid.clone();
+        if !prepared.conflicts.is_empty() {
+            pane.download = Some(DownloadUi {
+                id,
+                dest,
+                pre_skipped,
+                stage: DownloadStage::Asking(prepared),
+            });
+            return;
+        }
+        start_download(pane, id, dest, prepared.items, pre_skipped);
     }
 
     /// Renderiza a arvore de paineis na area disponivel e aplica as acoes
@@ -3398,7 +4230,7 @@ impl App {
         let modal_open = self.editor.is_some()
             || self.pending_delete.is_some()
             || self.show_help
-            || self.show_update;
+            || self.host_key_pending();
         if pending.is_none() && !modal_open && ui.memory(|m| m.focused().is_none()) {
             pending = self.last_pane_focus.clone();
         }
@@ -3450,6 +4282,24 @@ impl App {
                         self.pending_delete = Some(self.vault.hosts[host].id);
                     }
                 }
+                PaneAction::Download {
+                    path,
+                    remote_dir,
+                    picks,
+                } => {
+                    // Um por vez por painel; a pasta e pedida no fim do quadro.
+                    let busy = match self.root.as_ref().and_then(|r| node_at(r, &path)) {
+                        Some(Node::Leaf(p)) => p.download.as_ref().is_some_and(DownloadUi::busy),
+                        _ => true,
+                    };
+                    if !busy && self.pending_download.is_none() {
+                        self.pending_download = Some(PendingDownload {
+                            path,
+                            remote_dir,
+                            picks,
+                        });
+                    }
+                }
             }
         }
 
@@ -3478,6 +4328,484 @@ fn disconnect_tree(node: &Node) {
             }
         }
     }
+}
+
+/// Envia o pedido de download a sessao e passa o painel a "baixando"; com a
+/// sessao ja encerrada, fica so o aviso (nada foi pedido).
+fn start_download(
+    pane: &mut Pane,
+    id: u64,
+    dest: PathBuf,
+    items: Vec<download::DownloadItem>,
+    pre_skipped: Vec<(String, String)>,
+) {
+    let cancel = pane
+        .sftp
+        .as_ref()
+        .and_then(|s| s.download(id, dest.clone(), items));
+    let stage = match cancel {
+        Some(cancel) => DownloadStage::Running {
+            cancel,
+            cancelling: false,
+            scanning: true,
+            found: 0,
+            index: 0,
+            count: 0,
+            name: String::new(),
+            done: 0,
+            total: 0,
+        },
+        None => DownloadStage::done("Sessão encerrada; nada foi baixado.", Tone::Error),
+    };
+    pane.download = Some(DownloadUi {
+        id,
+        dest,
+        pre_skipped,
+        stage,
+    });
+}
+
+/// Aplica a escolha do dialogo de conflito: comeca o download (Substituir /
+/// Pular existentes) ou descarta o pedido (Cancelar).
+fn answer_conflict(pane: &mut Pane, choice: ConflictChoice) {
+    let Some(DownloadUi {
+        id,
+        dest,
+        mut pre_skipped,
+        stage: DownloadStage::Asking(prepared),
+    }) = pane.download.take()
+    else {
+        return;
+    };
+    if choice == ConflictChoice::Cancel {
+        return;
+    }
+    let (items, skipped) = download::resolve(prepared, choice);
+    pre_skipped.extend(skipped);
+    if items.is_empty() {
+        pane.download = Some(DownloadUi {
+            id,
+            dest,
+            pre_skipped,
+            stage: DownloadStage::done(
+                "Nada a baixar: todos os itens já existem no destino.",
+                Tone::Neutral,
+            ),
+        });
+        return;
+    }
+    start_download(pane, id, dest, items, pre_skipped);
+}
+
+/// Aplica um evento de download ao painel (ignora lotes antigos e eventos
+/// que chegam depois de o painel ja ter um resultado).
+fn apply_download_event(pane: &mut Pane, ev: DownloadEvent) {
+    let Some(d) = &mut pane.download else {
+        return;
+    };
+    let id = match &ev {
+        DownloadEvent::Scanning { id, .. } | DownloadEvent::Progress { id, .. } => *id,
+        DownloadEvent::Finished(r) => r.id,
+    };
+    if d.id != id || !matches!(d.stage, DownloadStage::Running { .. }) {
+        return;
+    }
+    match ev {
+        DownloadEvent::Scanning { found: n, .. } => {
+            if let DownloadStage::Running { scanning, found, .. } = &mut d.stage {
+                *scanning = true;
+                *found = n;
+            }
+        }
+        DownloadEvent::Progress {
+            index: i,
+            count: c,
+            name: nm,
+            done: dn,
+            total: t,
+            ..
+        } => {
+            if let DownloadStage::Running {
+                scanning,
+                index,
+                count,
+                name,
+                done,
+                total,
+                ..
+            } = &mut d.stage
+            {
+                *scanning = false;
+                *index = i;
+                *count = c;
+                *name = nm;
+                *done = dn;
+                *total = t;
+            }
+        }
+        DownloadEvent::Finished(report) => {
+            let (text, detail, tone) = download_summary(&report, &d.pre_skipped);
+            d.stage = DownloadStage::Done {
+                text,
+                detail,
+                tone,
+                at: Instant::now(),
+            };
+        }
+    }
+}
+
+/// Acrescenta a `out` uma secao do detalhe (titulo e ate 10 linhas).
+fn detail_section(out: &mut String, title: &str, lines: impl ExactSizeIterator<Item = String>) {
+    let n = lines.len();
+    if n == 0 {
+        return;
+    }
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(title);
+    for l in lines.take(10) {
+        out.push('\n');
+        out.push_str(&l);
+    }
+    if n > 10 {
+        out.push_str(&format!("\n\u{2026} e mais {}", n - 10));
+    }
+}
+
+/// Resumo de um download concluido: texto do rodape, detalhe para a dica e
+/// tom. `pre_skipped` sao os itens tirados antes de comecar (nome invalido,
+/// "pular existentes"). Caminhos remotos passam por `show_path`.
+fn download_summary(
+    r: &download::DownloadReport,
+    pre_skipped: &[(String, String)],
+) -> (String, String, Tone) {
+    let pasta = elide_path(&r.dest.display().to_string(), 48);
+    let skipped: Vec<&(String, String)> = pre_skipped.iter().chain(&r.skipped).collect();
+    let mut suffix = String::new();
+    if !skipped.is_empty() {
+        suffix.push_str(&format!(" \u{00b7} {} ignorado(s)", skipped.len()));
+    }
+    if !r.renamed.is_empty() {
+        suffix.push_str(&format!(
+            " \u{00b7} {} nome(s) ajustado(s) para o Windows",
+            r.renamed.len()
+        ));
+    }
+    let (text, tone) = if r.cancelled {
+        if r.saved > 0 {
+            (
+                format!(
+                    "Download cancelado; {} de {} arquivos já estavam salvos em {pasta}.",
+                    r.saved, r.files
+                ),
+                Tone::Neutral,
+            )
+        } else {
+            ("Download cancelado; nada foi salvo.".to_string(), Tone::Neutral)
+        }
+    } else if let Some(motivo) = &r.fatal {
+        let text = if r.saved > 0 {
+            format!(
+                "Download interrompido ({motivo}); {} de {} arquivos salvos em {pasta}",
+                r.saved, r.files
+            )
+        } else {
+            format!("Download interrompido ({motivo}); nada foi salvo.")
+        };
+        (text, Tone::Error)
+    } else if let Some((nome, erro)) = r.failed.first() {
+        let (nome, erro) = (show_path(nome), show_path(erro));
+        let mut text = if r.saved == 0 {
+            format!("Nada foi baixado: {nome}: {erro}")
+        } else {
+            format!(
+                "{} de {} arquivos baixados em {pasta}; {nome}: {erro}",
+                r.saved, r.files
+            )
+        };
+        if r.failed.len() > 1 {
+            text.push_str(&format!(" (+{} com erro)", r.failed.len() - 1));
+        }
+        (text, Tone::Error)
+    } else if r.saved == 0 && r.dirs == 0 {
+        let text = match skipped.first() {
+            Some((nome, motivo)) => format!("Nada foi baixado: {}: {motivo}", show_path(nome)),
+            None => "Nada foi baixado.".to_string(),
+        };
+        (text, Tone::Error)
+    } else {
+        let text = match r.saved {
+            0 if r.dirs == 1 => format!("Pasta baixada em {pasta} (sem arquivos)"),
+            0 => format!("Pastas baixadas em {pasta} (sem arquivos)"),
+            1 => format!("{} baixado em {pasta}", r.last_saved),
+            n => format!("{n} arquivos baixados em {pasta}"),
+        };
+        (text + &suffix, Tone::Ok)
+    };
+
+    let mut detail = String::new();
+    let line = |(p, m): &(String, String)| format!("\u{2022} {}: {}", show_path(p), show_path(m));
+    detail_section(&mut detail, "Com erro:", r.failed.iter().map(line));
+    detail_section(&mut detail, "Ignorados:", skipped.iter().map(|&x| line(x)));
+    detail_section(
+        &mut detail,
+        "Nomes ajustados para o Windows:",
+        r.renamed
+            .iter()
+            .map(|(a, b)| format!("\u{2022} {} \u{2192} {}", show_path(a), show_path(b))),
+    );
+    (text, detail, tone)
+}
+
+/// Pasta Downloads do usuario (inicio sugerido do dialogo), se existir.
+fn default_download_dir() -> Option<PathBuf> {
+    let d = PathBuf::from(std::env::var_os("USERPROFILE")?).join("Downloads");
+    d.is_dir().then_some(d)
+}
+
+/// Abre a pasta no Explorer do Windows (caminho completo do explorer.exe:
+/// nunca um executavel homonimo de outra pasta).
+fn open_folder(dir: &std::path::Path) {
+    let exe = std::env::var_os("SystemRoot")
+        .map(|r| PathBuf::from(r).join("explorer.exe"))
+        .unwrap_or_else(|| PathBuf::from("explorer.exe"));
+    let _ = std::process::Command::new(exe).arg(dir).spawn();
+}
+
+/// Rodape do download no painel SFTP: andamento (barra, texto e "Cancelar")
+/// ou resultado (texto na cor do tom, "Abrir pasta" e "x" para dispensar).
+fn download_footer(ui: &mut egui::Ui, rect: egui::Rect, download: &mut Option<DownloadUi>) {
+    let Some(d) = download.as_mut() else {
+        return;
+    };
+    ui.painter().rect(
+        rect,
+        6.0,
+        CARD_BG,
+        egui::Stroke::new(1.0, CARD_BORDER),
+        egui::StrokeKind::Inside,
+    );
+    let mut dismiss = false;
+    let inner = rect.shrink2(egui::vec2(8.0, 2.0));
+    let layout = egui::Layout::right_to_left(egui::Align::Center);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(inner).layout(layout), |ui| {
+        let text = d.stage.running_text();
+        match &mut d.stage {
+            DownloadStage::Running {
+                cancel,
+                cancelling,
+                scanning,
+                index,
+                count,
+                done,
+                total,
+                ..
+            } => {
+                // Barra fina no topo do rodape.
+                let frac = if *scanning {
+                    0.0
+                } else {
+                    download_fraction(*index, *count, *done, *total)
+                };
+                let track = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 6.0, rect.top() + 1.0),
+                    egui::pos2(rect.right() - 6.0, rect.top() + 4.0),
+                );
+                let painter = ui.painter();
+                painter.rect_filled(track, 1.0, HIGHLIGHT.gamma_multiply(0.25));
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        track.min,
+                        egui::vec2(track.width() * frac, track.height()),
+                    ),
+                    1.0,
+                    HIGHLIGHT,
+                );
+                if !*cancelling
+                    && painted_btn(ui, egui::vec2(84.0, 22.0), "Cancelar", 13.0, &BTN_GHOST)
+                {
+                    cancel.cancel();
+                    *cancelling = true;
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(text).color(HIGHLIGHT)).truncate());
+                });
+            }
+            DownloadStage::Done {
+                text, detail, tone, ..
+            } => {
+                let x = egui::ImageButton::new(
+                    egui::Image::new(ICON_CLOSE)
+                        .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                        .tint(TEXT_WEAK),
+                )
+                .frame(false);
+                if ui.add(x).on_hover_text("Dispensar").clicked() {
+                    dismiss = true;
+                }
+                if painted_btn(ui, egui::vec2(96.0, 22.0), "Abrir pasta", 13.0, &BTN_GHOST) {
+                    open_folder(&d.dest);
+                }
+                let color = match tone {
+                    Tone::Ok => AUTH_KEY,
+                    Tone::Neutral => TEXT_WEAK,
+                    Tone::Error => ERROR_FG,
+                };
+                let hover = if detail.is_empty() {
+                    text.clone()
+                } else {
+                    format!("{text}\n\n{detail}")
+                };
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(text.as_str()).color(color))
+                            .truncate(),
+                    )
+                    .on_hover_text(hover);
+                });
+            }
+            DownloadStage::Asking(_) => {}
+        }
+    });
+    if dismiss {
+        *download = None;
+    }
+}
+
+/// Dialogo "Ja existe no destino" de um download. Cancelar (ou Esc, com o
+/// painel em foco) descarta o pedido; Enter nao faz nada: nao ha acao padrao
+/// destrutiva.
+fn download_conflict_dialog(
+    ctx: &egui::Context,
+    path: &[usize],
+    p: &download::Prepared,
+    esc: bool,
+) -> Option<ConflictChoice> {
+    if esc && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        return Some(ConflictChoice::Cancel);
+    }
+    let pasta = elide_path(&p.dest.display().to_string(), 48);
+    let nomes: Vec<&str> = p
+        .conflicts
+        .iter()
+        .filter_map(|&i| p.items.get(i))
+        .map(|it| it.local.as_str())
+        .collect();
+    let frame = egui::Frame::window(&ctx.style())
+        .fill(CARD_BG)
+        .stroke(egui::Stroke::new(1.0, CARD_BORDER))
+        .corner_radius(12.0)
+        .inner_margin(egui::Margin::same(18));
+    let mut choice = None;
+    egui::Window::new(egui::RichText::new("Já existe no destino").color(ACCENT).strong())
+        .id(egui::Id::new(("download_conflict", path.to_vec())))
+        .collapsible(false)
+        .resizable(false)
+        .movable(true)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .frame(frame)
+        .show(ctx, |ui| {
+            ui.set_min_width(340.0);
+            ui.set_max_width(460.0);
+            if let [nome] = nomes.as_slice() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "\u{201c}{}\u{201d} já existe em {pasta}.",
+                        show_path(nome)
+                    ))
+                    .color(CARD_TEXT),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(format!("{} itens já existem em {pasta}:", nomes.len()))
+                        .color(CARD_TEXT),
+                );
+                for n in nomes.iter().take(5) {
+                    ui.label(egui::RichText::new(show_path(n)).color(HIGHLIGHT));
+                }
+                if nomes.len() > 5 {
+                    ui.label(
+                        egui::RichText::new(format!("e mais {}.", nomes.len() - 5)).color(TEXT_WEAK),
+                    );
+                }
+            }
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "Substituir troca os arquivos com o mesmo nome pela versão do servidor. \
+                     Uma pasta que já existe recebe o conteúdo baixado; nada é apagado.",
+                )
+                .small()
+                .color(TEXT_WEAK),
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if fit_btn(ui, "Substituir", &BTN_DANGER, "") {
+                    choice = Some(ConflictChoice::Replace);
+                }
+                if p.items.len() > p.conflicts.len()
+                    && fit_btn(ui, "Pular existentes", &BTN_GHOST, "")
+                {
+                    choice = Some(ConflictChoice::Skip);
+                }
+                if fit_btn(ui, "Cancelar", &BTN_GHOST, "") {
+                    choice = Some(ConflictChoice::Cancel);
+                }
+            });
+        });
+    choice
+}
+
+/// Fracao do andamento na base do titulo do painel, com envio ou download
+/// em curso.
+fn title_fraction(pane: &Pane) -> Option<f32> {
+    if let Some(UploadUi {
+        stage: UploadStage::Sending { sent, size, .. },
+        ..
+    }) = &pane.upload
+    {
+        return Some(if *size == 0 {
+            0.0
+        } else {
+            (*sent as f32 / *size as f32).min(1.0)
+        });
+    }
+    match &pane.download {
+        Some(DownloadUi {
+            stage:
+                DownloadStage::Running {
+                    scanning,
+                    index,
+                    count,
+                    done,
+                    total,
+                    ..
+                },
+            ..
+        }) => Some(if *scanning {
+            0.0
+        } else {
+            download_fraction(*index, *count, *done, *total)
+        }),
+        _ => None,
+    }
+}
+
+/// Linha fina de progresso (2 px) na base do retangulo `bar` (titulo).
+fn title_progress(ui: &egui::Ui, bar: egui::Rect, frac: f32) {
+    let track = egui::Rect::from_min_max(
+        egui::pos2(bar.left(), bar.bottom() - 2.0),
+        bar.right_bottom(),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(track, 0.0, HIGHLIGHT.gamma_multiply(0.25));
+    painter.rect_filled(
+        egui::Rect::from_min_size(track.min, egui::vec2(track.width() * frac, track.height())),
+        0.0,
+        HIGHLIGHT,
+    );
 }
 
 /// Aplica um evento de envio ao estado do painel (ignora lotes antigos).
@@ -3897,6 +5225,57 @@ fn first_closeable(node: &Node, path: &mut Vec<usize>) -> Option<Vec<usize>> {
             None
         }
     }
+}
+
+/// Perguntas de chave pendentes na arvore: (ordem de chegada, caminho).
+fn pending_host_keys(node: &Node, path: &mut Vec<usize>, out: &mut Vec<(u64, Vec<usize>)>) {
+    match node {
+        Node::Leaf(pane) => {
+            if let Some(p) = &pane.host_key {
+                out.push((p.seq, path.clone()));
+            }
+        }
+        Node::Split { children, .. } => {
+            for (i, c) in children.iter().enumerate() {
+                path.push(i);
+                pending_host_keys(c, path, out);
+                path.pop();
+            }
+        }
+    }
+}
+
+/// Tipo e impressao digital (monoespacados) de uma chave na janela da chave do
+/// servidor; `ilegivel` quando nao ha como ler a chave. Com `copiar`, mostra o
+/// botao "Copiar" (Ctrl+C fica bloqueado com a janela aberta) e devolve a
+/// impressao digital quando ele e clicado.
+fn key_lines(
+    ui: &mut egui::Ui,
+    info: Option<&hostkey::KeyInfo>,
+    ilegivel: &str,
+    copiar: bool,
+) -> Option<String> {
+    let Some(info) = info else {
+        ui.label(egui::RichText::new(ilegivel).color(ERROR_FG));
+        return None;
+    };
+    ui.label(egui::RichText::new(&info.algorithm).monospace().color(CARD_TEXT));
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(&info.fingerprint).monospace().color(CARD_TEXT));
+        (copiar && painted_btn(ui, egui::vec2(64.0, 22.0), "Copiar", 12.0, &BTN_GHOST))
+            .then(|| info.fingerprint.clone())
+    })
+    .inner
+}
+
+/// Spinner com legenda no corpo de um painel que ainda nao conectou.
+fn pane_spinner(ui: &mut egui::Ui, text: &str) {
+    ui.add_space((ui.available_height() * 0.4).max(12.0));
+    ui.vertical_centered(|ui| {
+        ui.add(egui::Spinner::new().size(20.0));
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(text).color(TEXT_WEAK));
+    });
 }
 
 /// Aplica `f` a cada folha (painel) da arvore.
@@ -4570,6 +5949,9 @@ fn render_node(
             let take = pending.as_deref() == Some(path.as_slice());
 
             let status = match &pane.state {
+                SessionState::Connecting if pane.host_key.is_some() => {
+                    "aguardando confirmação da chave"
+                }
                 SessionState::Connecting => "conectando...",
                 SessionState::Connected => "conectado",
                 SessionState::Closed => "sessao encerrada",
@@ -4587,6 +5969,21 @@ fn render_node(
                     pane.upload = None;
                 } else {
                     ui.ctx().request_repaint_after(left);
+                }
+            }
+            // O resultado do download tambem (menos os de erro).
+            if let Some(DownloadUi {
+                stage: DownloadStage::Done { tone, at, .. },
+                ..
+            }) = &pane.download
+            {
+                if *tone != Tone::Error {
+                    let left = std::time::Duration::from_secs(8).saturating_sub(at.elapsed());
+                    if left.is_zero() {
+                        pane.download = None;
+                    } else {
+                        ui.ctx().request_repaint_after(left);
+                    }
                 }
             }
 
@@ -4674,28 +6071,10 @@ fn render_node(
                     });
                 });
 
-            // Barra de progresso fina na base do titulo durante um envio.
-            if let Some(UploadUi {
-                stage: UploadStage::Sending { sent, size, .. },
-                ..
-            }) = &pane.upload
-            {
-                let frac = if *size == 0 { 0.0 } else { (*sent as f32 / *size as f32).min(1.0) };
-                let bar = title_resp.response.rect;
-                let track = egui::Rect::from_min_max(
-                    egui::pos2(bar.left(), bar.bottom() - 2.0),
-                    bar.right_bottom(),
-                );
-                let painter = ui.painter();
-                painter.rect_filled(track, 0.0, HIGHLIGHT.gamma_multiply(0.25));
-                painter.rect_filled(
-                    egui::Rect::from_min_size(
-                        track.min,
-                        egui::vec2(track.width() * frac, track.height()),
-                    ),
-                    0.0,
-                    HIGHLIGHT,
-                );
+            // Barra de progresso fina na base do titulo durante um envio ou
+            // um download.
+            if let Some(frac) = title_fraction(pane) {
+                title_progress(ui, title_resp.response.rect, frac);
             }
 
             // Conteudo recuado das bordas: a borda do painel (mais grossa quando
@@ -4758,6 +6137,9 @@ fn render_node(
                         }
                         None => {}
                     }
+                } else if pane.sftp.is_some() && pane.host_key.is_some() {
+                    // SFTP aguardando a confirmacao da chave: sem navegador ainda.
+                    pane_spinner(ui, HOST_KEY_WAIT);
                 } else if pane.sftp.is_some() {
                     // Painel SFTP: navegador de arquivos remoto (apenas a pasta atual).
                     if let SessionState::Error(msg) = &pane.state {
@@ -4794,11 +6176,37 @@ fn render_node(
                     let active = has_focus || focus_resp.hovered();
                     let f5 = active && ui.input(|i| i.key_pressed(egui::Key::F5));
 
+                    // Download: com o dialogo de conflito aberto nenhuma tecla
+                    // age no navegador embaixo dele.
+                    let asking = matches!(
+                        pane.download.as_ref().map(|d| &d.stage),
+                        Some(DownloadStage::Asking(_))
+                    );
+                    let dl = if !matches!(pane.state, SessionState::Connected) {
+                        DlAvail::Offline
+                    } else if pane.download.as_ref().is_some_and(DownloadUi::busy) {
+                        DlAvail::Busy
+                    } else {
+                        DlAvail::Ready
+                    };
+                    // Rodape do download (andamento ou resultado) no fim do painel.
+                    let footer_h = if pane.download.is_some() && !asking { 30.0 } else { 0.0 };
+                    let list_rect = egui::Rect::from_min_max(
+                        content_rect.min,
+                        egui::pos2(content_rect.max.x, content_rect.max.y - footer_h),
+                    );
+
                     let mut to_list: Vec<String> = Vec::new();
                     let mut fs_op: Option<FsOp> = None;
                     let mut cur_dir = String::new();
                     if let Some(exp) = &mut pane.explorer {
-                        let out = exp.ui(ui, ("sftp_explorer", path.as_slice()), has_focus);
+                        // O ScrollArea ocupa toda a altura disponivel: o
+                        // navegador fica restrito a area acima do rodape.
+                        let out = ui
+                            .scope_builder(egui::UiBuilder::new().max_rect(list_rect), |ui| {
+                                exp.ui(ui, ("sftp_explorer", path.as_slice()), has_focus && !asking, dl)
+                            })
+                            .inner;
                         to_list = out.to_list;
                         fs_op = out.op;
                         cur_dir = exp.cur_path.clone();
@@ -4808,6 +6216,32 @@ fn render_node(
                         // Clicar numa linha da listagem tambem seleciona o painel.
                         if out.clicked_row {
                             focus_resp.request_focus();
+                        }
+                        if let Some(picks) = out.download {
+                            actions.push(PaneAction::Download {
+                                path: path.clone(),
+                                remote_dir: exp.cur_path.clone(),
+                                picks,
+                            });
+                        }
+                    }
+                    if footer_h > 0.0 {
+                        let footer = egui::Rect::from_min_max(
+                            egui::pos2(content_rect.min.x, list_rect.max.y + 2.0),
+                            content_rect.max,
+                        );
+                        download_footer(ui, footer, &mut pane.download);
+                    }
+                    if asking {
+                        let choice = match &pane.download {
+                            Some(DownloadUi {
+                                stage: DownloadStage::Asking(p),
+                                ..
+                            }) => download_conflict_dialog(ui.ctx(), path, p, has_focus),
+                            _ => None,
+                        };
+                        if let Some(c) = choice {
+                            answer_conflict(pane, c);
                         }
                     }
 
@@ -4838,18 +6272,11 @@ fn render_node(
                     // Enquanto conecta, mostra um spinner no corpo do painel em vez
                     // de uma area preta indistinguivel de um terminal ocioso.
                     if matches!(pane.state, SessionState::Connecting) {
-                        ui.add_space((ui.available_height() * 0.4).max(12.0));
-                        ui.vertical_centered(|ui| {
-                            ui.add(egui::Spinner::new().size(20.0));
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Conectando a {}...",
-                                    pane.host_name
-                                ))
-                                .color(TEXT_WEAK),
-                            );
-                        });
+                        if pane.host_key.is_some() {
+                            pane_spinner(ui, HOST_KEY_WAIT);
+                        } else {
+                            pane_spinner(ui, &format!("Conectando a {}...", pane.host_name));
+                        }
                     } else {
                         let mut output = None;
                         if let Some(term) = &mut pane.terminal {
@@ -4939,7 +6366,7 @@ impl eframe::App for App {
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.ctx_for_repaint = Some(ctx.clone());
 
         match self.screen {
@@ -4957,9 +6384,13 @@ impl eframe::App for App {
                 // Arquivos soltos primeiro: o painel sob o cursor e achado
                 // pelos retangulos do quadro anterior, antes que atalhos ou
                 // sessoes encerradas mudem a arvore de paineis.
+                // Pergunta de chave ja aberta: bloqueia o teclado antes dos
+                // atalhos; de novo apos drenar, para uma que chegou agora.
+                self.guard_host_key_keys(ctx);
                 self.handle_file_drop(ctx);
                 self.handle_session_keys(ctx);
                 self.drain_ssh_events();
+                self.guard_host_key_keys(ctx);
             }
             Screen::Gate => {
                 // Abertura/criacao do cofre em dois tempos: o quadro 1 desenha
@@ -4986,6 +6417,7 @@ impl eframe::App for App {
             Screen::Session | Screen::Hosts => {
                 let armed = self.chord_armed_at.is_some();
                 let in_session = matches!(self.screen, Screen::Session);
+                let host_key = in_session && self.host_key_pending();
                 egui::TopBottomPanel::bottom("hint_bar")
                     .frame(
                         egui::Frame::NONE
@@ -4995,7 +6427,16 @@ impl eframe::App for App {
                     .show_separator_line(false)
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
-                            if in_session && armed {
+                            if host_key {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Confirme a chave do servidor na janela aberta  \
+                                         \u{00b7}  Esc cancela",
+                                    )
+                                    .small()
+                                    .color(HIGHLIGHT),
+                                );
+                            } else if in_session && armed {
                                 // Prefixo armado: mostra as opcoes do chord.
                                 ui.label(
                                     egui::RichText::new("Ctrl+B \u{2026}")
@@ -5015,12 +6456,9 @@ impl eframe::App for App {
                                 );
                             } else if in_session {
                                 ui.label(
-                                    egui::RichText::new(
-                                        "Alt+setas troca de painel  \
-                                         \u{00b7}  F1 ajuda  \u{00b7}  F5 atualiza SFTP",
-                                    )
-                                    .small()
-                                    .color(TEXT_WEAK),
+                                    egui::RichText::new(self.session_hint())
+                                        .small()
+                                        .color(TEXT_WEAK),
                                 );
                             } else {
                                 ui.label(
@@ -5039,17 +6477,6 @@ impl eframe::App for App {
                     });
             }
             _ => {}
-        }
-
-        // Aviso de versao nova (acima da barra de dicas) e, com a atualizacao
-        // instalada, reinicio no executavel novo.
-        if !matches!(self.screen, Screen::Splash) {
-            self.ui_update_bar(ctx);
-        }
-        self.restart_after_update(ctx);
-        // O dialogo vem antes do conteudo para receber o Esc primeiro.
-        if self.show_update {
-            self.ui_update_dialog(ctx);
         }
 
         match self.screen {
@@ -5092,6 +6519,27 @@ impl eframe::App for App {
             self.ui_drop_overlay(ctx);
         }
 
+        // Download pedido neste quadro: escolhe a pasta de destino. O dialogo
+        // do Windows e modal sobre a janela do app (bloqueia cliques nela).
+        if let Some(req) = self.pending_download.take() {
+            if matches!(self.screen, Screen::Session) {
+                let path = req.path.clone();
+                let mut dlg = rfd::FileDialog::new()
+                    .set_title("Escolha a pasta onde salvar")
+                    .set_parent(&*frame);
+                if let Some(d) = self.download_dir.clone().or_else(default_download_dir) {
+                    dlg = dlg.set_directory(d);
+                }
+                if let Some(dest) = dlg.pick_folder() {
+                    self.download_dir = Some(dest.clone());
+                    self.begin_download(req, dest);
+                }
+                // Devolve o foco ao painel que pediu.
+                self.pending_focus = Some(path);
+                ctx.request_repaint();
+            }
+        }
+
         // Janela flutuante com a lista de atalhos (F1 / Ctrl+B, A).
         if self.show_help {
             self.ui_help(ctx);
@@ -5100,6 +6548,11 @@ impl eframe::App for App {
         // Confirmacao de exclusao de host (vale em Hosts e Session).
         if self.pending_delete.is_some() {
             self.ui_confirm_delete(ctx);
+        }
+
+        // Pergunta sobre a chave do servidor, por cima de tudo.
+        if matches!(self.screen, Screen::Session) {
+            self.ui_host_key_prompt(ctx);
         }
     }
 }
@@ -5144,11 +6597,12 @@ mod focus_tests {
             last_pane_focus: None,
             show_help: false,
             pending_delete: None,
-            updater: Updater::idle(),
-            show_update: false,
-            update_dismissed: false,
-            update_restarting: false,
             next_upload_id: 1,
+            next_host_key_seq: 1,
+            host_key_esc: false,
+            pending_download: None,
+            download_dir: None,
+            next_download_id: 1,
         }
     }
 
@@ -5633,5 +7087,1254 @@ mod focus_tests {
         frame(&ctx, &mut app, vec![key(egui::Key::F1, egui::Modifiers::NONE)]);
         assert!(!app.show_help);
         assert_eq!(sent_bytes(&mut to_rx), b"\x1bOP");
+    }
+
+    // --- Chave do servidor (TOFU) -----------------------------------------
+
+    use crate::ssh::{SshToUi, UiToSsh};
+    use tokio::sync::oneshot;
+
+    /// Vetores reais (ver `hostkey::tests`), sem comentario.
+    const KEY_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDx116/S6vbyAU3ZR1ebTYjMs187ZiPcltXd5Dg8Oapm";
+    const KEY_A_FP: &str = "SHA256:JEpzgJ+qq0bLVo5Bj81AUoT0IRMtv5HFvtIy+xM6K74";
+    const KEY_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOaHfvKbIEav1XH7DfTNlEHNkxTAES3oEFcajJtkuuIU";
+    const KEY_B_FP: &str = "SHA256:ZaMQkuNWz1gMHIFCAGlBWlXZuF4Wq8cp7cWUk/lN8vo";
+
+    fn test_host_id() -> uuid::Uuid {
+        uuid::Uuid::from_u128(0x5a6_u128)
+    }
+
+    /// Host do cofre usado nas perguntas (srv:22).
+    fn test_host() -> Host {
+        let mut h = Host::new();
+        h.id = test_host_id();
+        h.name = "Produção".into();
+        h.host = "srv".into();
+        h.port = 22;
+        h.username = "user".into();
+        h
+    }
+
+    fn key_prompt(
+        host_id: uuid::Uuid,
+        host: &str,
+        port: u16,
+        presented: &str,
+    ) -> (HostKeyPrompt, oneshot::Receiver<HostKeyAnswer>) {
+        let (tx, rx) = oneshot::channel();
+        let p = HostKeyPrompt {
+            host_id,
+            host: host.into(),
+            port,
+            presented: presented.into(),
+            reply: tx,
+        };
+        (p, rx)
+    }
+
+    /// Quadro completo da sessao, na mesma ordem de `update()`.
+    fn frame_session(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 700.0),
+            )),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        ctx.run(raw, |ctx| {
+            app.guard_host_key_keys(ctx);
+            app.handle_file_drop(ctx);
+            app.handle_session_keys(ctx);
+            app.drain_ssh_events();
+            app.guard_host_key_keys(ctx);
+            app.handle_help_keys(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| app.ui_session(ui));
+            app.ui_host_key_prompt(ctx);
+        })
+    }
+
+    /// Textos pintados em dois quadros seguidos (a janela nova e medida no
+    /// primeiro e so aparece no segundo).
+    fn session_texts(ctx: &egui::Context, app: &mut App) -> Vec<String> {
+        frame_session(ctx, app, vec![]);
+        let out = frame_session(ctx, app, vec![]);
+        painted_texts(&out).into_iter().map(|(t, _)| t).collect()
+    }
+
+    /// Todas as perguntas abertas como se estivessem na tela ha 1 s (armadas).
+    fn arm_prompts(app: &mut App) {
+        set_shown_at(app, Instant::now().checked_sub(std::time::Duration::from_secs(1)));
+    }
+
+    /// Todas as perguntas abertas como recem-mostradas (ainda nao armadas).
+    fn disarm_prompts(app: &mut App) {
+        set_shown_at(app, Some(Instant::now() + std::time::Duration::from_secs(60)));
+    }
+
+    fn set_shown_at(app: &mut App, at: Option<Instant>) {
+        if let Some(root) = &mut app.root {
+            for_each_pane_mut(root, &mut |p| {
+                if let Some(k) = &mut p.host_key {
+                    k.shown_at = at;
+                }
+            });
+        }
+    }
+
+    /// Clica no centro do texto pintado `text` (botao da janela).
+    fn click_text(ctx: &egui::Context, app: &mut App, text: &str) {
+        let out = frame_session(ctx, app, vec![]);
+        let r = painted_texts(&out)
+            .into_iter()
+            .find(|(t, _)| t == text)
+            .unwrap_or_else(|| panic!("texto nao pintado: {text}"))
+            .1;
+        let pos = r.center();
+        frame_session(ctx, app, vec![egui::Event::PointerMoved(pos), click(pos, true)]);
+        frame_session(ctx, app, vec![click(pos, false)]);
+    }
+
+    /// Transforma o painel em `path` num terminal SSH ainda conectando.
+    fn connecting_ssh_pane(
+        app: &mut App,
+        path: &[usize],
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<UiToSsh>,
+        std::sync::mpsc::Sender<SshToUi>,
+    ) {
+        let (handle, to_rx, from_tx) = crate::ssh::SshHandle::test_pair(true);
+        if let Some(Node::Leaf(p)) = app.root.as_mut().and_then(|r| node_at_mut(r, path)) {
+            p.picking = false;
+            p.ssh = Some(handle);
+            p.terminal = Some(Terminal::new(80, 24));
+            p.state = SessionState::Connecting;
+            p.host_name = "outro".into();
+        }
+        (to_rx, from_tx)
+    }
+
+    /// App com um unico terminal SSH conectando e o host de teste no cofre.
+    fn key_app() -> (
+        App,
+        tokio::sync::mpsc::UnboundedReceiver<UiToSsh>,
+        std::sync::mpsc::Sender<SshToUi>,
+    ) {
+        let mut app = app();
+        app.vault.hosts.push(test_host());
+        let (to_rx, from_tx) = connecting_ssh_pane(&mut app, &[]);
+        (app, to_rx, from_tx)
+    }
+
+    /// App com um unico painel SFTP conectando e o host de teste no cofre.
+    fn sftp_key_app() -> (
+        App,
+        tokio::sync::mpsc::UnboundedReceiver<crate::sftp::UiToSftp>,
+        std::sync::mpsc::Sender<SftpToUi>,
+    ) {
+        let mut app = app();
+        app.vault.hosts.push(test_host());
+        let (handle, to_rx, from_tx) = crate::sftp::SftpHandle::test_pair();
+        if let Some(Node::Leaf(p)) = &mut app.root {
+            p.terminal = None;
+            p.sftp = Some(handle);
+            p.explorer = Some(FileExplorer::new());
+            p.state = SessionState::Connecting;
+            p.host_name = "srv  (SFTP)".into();
+        }
+        (app, to_rx, from_tx)
+    }
+
+    fn test_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        ctx
+    }
+
+    fn has(texts: &[String], needle: &str) -> bool {
+        texts.iter().any(|t| t.contains(needle))
+    }
+
+    #[test]
+    fn host_key_new_prompt_blocks_keyboard_and_waits_for_click() {
+        let ctx = test_ctx();
+        // Terminal conectado e focado a esquerda; o da direita pergunta.
+        let (mut app, mut to_rx0, _tx0) = ssh_app(true);
+        app.vault.hosts.push(test_host());
+        app.split_pane(&[], SplitDir::SideBySide);
+        let (_to_rx1, tx1) = connecting_ssh_pane(&mut app, &[1]);
+        app.pending_focus = Some(vec![0]);
+        for _ in 0..3 {
+            frame_session(&ctx, &mut app, vec![]);
+        }
+        frame_session(&ctx, &mut app, vec![egui::Event::Text("x".into())]);
+        assert_eq!(sent_bytes(&mut to_rx0), b"x", "terminal deveria ter o foco");
+
+        // A pergunta chega junto com uma tecla: nem essa vaza.
+        let (p, mut rx) = key_prompt(test_host_id(), "srv", 22, KEY_A);
+        tx1.send(SshToUi::HostKey(p)).unwrap();
+        frame_session(&ctx, &mut app, vec![egui::Event::Text("y".into())]);
+        let texts = session_texts(&ctx, &mut app);
+        assert!(has(&texts, "Servidor novo"), "{texts:?}");
+        assert!(has(&texts, KEY_A_FP), "{texts:?}");
+        assert!(has(&texts, "Aguardando confirmação da chave do servidor..."), "{texts:?}");
+
+        // Teclado bloqueado: nada vai ao terminal, nada responde a pergunta.
+        let keys = vec![
+            egui::Event::Text("x".into()),
+            key(egui::Key::Enter, egui::Modifiers::NONE),
+            key(egui::Key::Space, egui::Modifiers::NONE),
+            egui::Event::Text(" ".into()),
+            key(egui::Key::Tab, egui::Modifiers::NONE),
+            key(egui::Key::F1, egui::Modifiers::NONE),
+            key(egui::Key::B, egui::Modifiers::CTRL),
+        ];
+        frame_session(&ctx, &mut app, keys);
+        frame_session(&ctx, &mut app, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        assert!(sent_bytes(&mut to_rx0).is_empty());
+        assert!(!app.show_help, "F1 nao pode abrir a ajuda por cima");
+        assert!(app.chord_armed_at.is_none());
+        assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+
+        // Clique antes de a janela armar: ignorado.
+        disarm_prompts(&mut app);
+        click_text(&ctx, &mut app, "Confiar e conectar");
+        assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+
+        arm_prompts(&mut app);
+        click_text(&ctx, &mut app, "Confiar e conectar");
+        assert_eq!(rx.try_recv(), Ok(HostKeyAnswer::Accept));
+        assert_eq!(app.vault.hosts[0].host_key.as_deref(), Some(KEY_A));
+        let texts = session_texts(&ctx, &mut app);
+        assert!(!has(&texts, "Servidor novo"), "{texts:?}");
+    }
+
+    #[test]
+    fn host_key_accept_saves_vault_and_frees_same_host_prompts() {
+        let ctx = test_ctx();
+        let (mut app, _to_rx0, tx0) = key_app();
+        let dir = std::env::temp_dir().join(format!("sagu-hostkey-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cofre.sagu");
+        app.vault_path = Some(path.clone());
+        app.master_password = "t".into();
+
+        // Dois paineis do mesmo host, com a mesma chave: um clique libera os dois.
+        app.split_pane(&[], SplitDir::SideBySide);
+        let (_to_rx1, tx1) = connecting_ssh_pane(&mut app, &[1]);
+        let (p0, mut rx0) = key_prompt(test_host_id(), "srv", 22, KEY_A);
+        let (p1, mut rx1) = key_prompt(test_host_id(), "srv", 22, KEY_A);
+        tx0.send(SshToUi::HostKey(p0)).unwrap();
+        tx1.send(SshToUi::HostKey(p1)).unwrap();
+        let texts = session_texts(&ctx, &mut app);
+        assert!(has(&texts, "Outra conexão aguarda confirmação."), "{texts:?}");
+
+        arm_prompts(&mut app);
+        click_text(&ctx, &mut app, "Confiar e conectar");
+        assert_eq!(rx0.try_recv(), Ok(HostKeyAnswer::Accept));
+        assert_eq!(rx1.try_recv(), Ok(HostKeyAnswer::Accept));
+        assert_eq!(app.vault.hosts[0].host_key.as_deref(), Some(KEY_A));
+        assert!(app.hosts_error.is_none(), "{:?}", app.hosts_error);
+
+        // Gravado na hora, cifrado, no arquivo do cofre.
+        let bytes = std::fs::read(&path).unwrap();
+        let back = vault::decrypt_vault(&bytes, "t").unwrap();
+        assert_eq!(back.hosts[0].host_key.as_deref(), Some(KEY_A));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_key_changed_alert_cancel_is_default() {
+        let ctx = test_ctx();
+        let (mut app, _to_rx, tx) = key_app();
+        app.vault.hosts[0].host_key = Some(KEY_A.into());
+        let (p, mut rx) = key_prompt(test_host_id(), "srv", 22, KEY_B);
+        tx.send(SshToUi::HostKey(p)).unwrap();
+        let texts = session_texts(&ctx, &mut app);
+        assert!(has(&texts, "Atenção: a chave do servidor mudou"), "{texts:?}");
+        assert!(has(&texts, KEY_A_FP) && has(&texts, KEY_B_FP), "{texts:?}");
+
+        // Esc antes de armar: ignorado.
+        disarm_prompts(&mut app);
+        frame_session(&ctx, &mut app, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
+        assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+
+        // Armada: Enter/Espaco nunca aceitam; Esc cancela.
+        arm_prompts(&mut app);
+        frame_session(
+            &ctx,
+            &mut app,
+            vec![
+                key(egui::Key::Enter, egui::Modifiers::NONE),
+                key(egui::Key::Space, egui::Modifiers::NONE),
+            ],
+        );
+        assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        frame_session(&ctx, &mut app, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
+        match rx.try_recv() {
+            Ok(HostKeyAnswer::Cancel(msg)) => assert!(msg.contains("mudou"), "{msg}"),
+            other => panic!("esperava cancelamento: {other:?}"),
+        }
+        assert_eq!(app.vault.hosts[0].host_key.as_deref(), Some(KEY_A));
+    }
+
+    #[test]
+    fn host_key_changed_accepts_only_by_explicit_click() {
+        let ctx = test_ctx();
+        let (mut app, _to_rx, tx) = key_app();
+        app.vault.hosts[0].host_key = Some(KEY_A.into());
+        let (p, mut rx) = key_prompt(test_host_id(), "srv", 22, KEY_B);
+        tx.send(SshToUi::HostKey(p)).unwrap();
+        session_texts(&ctx, &mut app);
+        arm_prompts(&mut app);
+        click_text(&ctx, &mut app, "Aceitar a nova chave e conectar");
+        assert_eq!(rx.try_recv(), Ok(HostKeyAnswer::Accept));
+        assert_eq!(app.vault.hosts[0].host_key.as_deref(), Some(KEY_B));
+    }
+
+    #[test]
+    fn second_pane_with_different_key_turns_into_alert() {
+        let ctx = test_ctx();
+        let (mut app, _to_rx0, tx0) = key_app();
+        app.split_pane(&[], SplitDir::SideBySide);
+        let (_to_rx1, tx1) = connecting_ssh_pane(&mut app, &[1]);
+        let (p0, mut rx0) = key_prompt(test_host_id(), "srv", 22, KEY_A);
+        let (p1, mut rx1) = key_prompt(test_host_id(), "srv", 22, KEY_B);
+        tx0.send(SshToUi::HostKey(p0)).unwrap();
+        frame_session(&ctx, &mut app, vec![]);
+        tx1.send(SshToUi::HostKey(p1)).unwrap();
+
+        // A mais antiga (A) aparece primeiro, como servidor novo.
+        let texts = session_texts(&ctx, &mut app);
+        assert!(has(&texts, "Servidor novo") && has(&texts, KEY_A_FP), "{texts:?}");
+        arm_prompts(&mut app);
+        click_text(&ctx, &mut app, "Confiar e conectar");
+        assert_eq!(rx0.try_recv(), Ok(HostKeyAnswer::Accept));
+
+        // A outra agora conflita com a chave guardada: alerta vermelho.
+        let texts = session_texts(&ctx, &mut app);
+        assert!(has(&texts, "Atenção: a chave do servidor mudou"), "{texts:?}");
+        assert!(has(&texts, "Guardada:") && has(&texts, KEY_A_FP), "{texts:?}");
+        assert!(has(&texts, "Nova:") && has(&texts, KEY_B_FP), "{texts:?}");
+        assert_eq!(rx1.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn host_key_prompt_aborts_when_pane_closes_or_session_ends() {
+        let ctx = test_ctx();
+
+        // Painel fechado com a pergunta aberta: a sessao ve a pergunta cair.
+        let (mut app, _to_rx0, _tx0) = key_app();
+        app.split_pane(&[], SplitDir::SideBySide);
+        let (_to_rx1, tx1) = connecting_ssh_pane(&mut app, &[1]);
+        let (p, mut rx) = key_prompt(test_host_id(), "srv", 22, KEY_A);
+        tx1.send(SshToUi::HostKey(p)).unwrap();
+        session_texts(&ctx, &mut app);
+        app.close_pane(&[1]);
+        assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+        assert_eq!(app.vault.hosts[0].host_key, None);
+
+        // Sessao SSH desistiu (ex.: servidor caiu): janela some, erro fica.
+        let (mut app, _to_rx, tx) = key_app();
+        let (p, mut rx) = key_prompt(test_host_id(), "srv", 22, KEY_A);
+        tx.send(SshToUi::HostKey(p)).unwrap();
+        assert!(has(&session_texts(&ctx, &mut app), "Servidor novo"));
+        tx.send(SshToUi::Error("servidor caiu".into())).unwrap();
+        tx.send(SshToUi::Closed).unwrap();
+        let texts = session_texts(&ctx, &mut app);
+        assert!(!has(&texts, "Servidor novo"), "{texts:?}");
+        assert!(pane0(&app).host_key.is_none());
+        assert!(matches!(pane0(&app).state, SessionState::Error(_)));
+        assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+
+        // O mesmo num painel SFTP.
+        let (mut app, _to_sftp, tx) = sftp_key_app();
+        let (p, mut rx) = key_prompt(test_host_id(), "srv", 22, KEY_A);
+        tx.send(SftpToUi::HostKey(p)).unwrap();
+        let texts = session_texts(&ctx, &mut app);
+        assert!(has(&texts, "Servidor novo"), "{texts:?}");
+        assert!(has(&texts, "Aguardando confirmação da chave do servidor..."), "{texts:?}");
+        tx.send(SftpToUi::Error("servidor caiu".into())).unwrap();
+        tx.send(SftpToUi::Closed).unwrap();
+        let texts = session_texts(&ctx, &mut app);
+        assert!(!has(&texts, "Servidor novo"), "{texts:?}");
+        assert!(pane0(&app).host_key.is_none());
+        assert!(matches!(pane0(&app).state, SessionState::Error(_)));
+        assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+    }
+
+    #[test]
+    fn host_key_prompt_cancelled_when_host_deleted_or_moved() {
+        let ctx = test_ctx();
+        let (mut app, _to_rx, tx) = key_app();
+        let (p, mut rx) = key_prompt(test_host_id(), "srv", 22, KEY_A);
+        tx.send(SshToUi::HostKey(p)).unwrap();
+        session_texts(&ctx, &mut app);
+        app.vault.hosts.clear();
+        frame_session(&ctx, &mut app, vec![]);
+        match rx.try_recv() {
+            Ok(HostKeyAnswer::Cancel(msg)) => assert!(msg.contains("excluída"), "{msg}"),
+            other => panic!("esperava cancelamento: {other:?}"),
+        }
+
+        let (mut app, _to_rx, tx) = key_app();
+        let (p, mut rx) = key_prompt(test_host_id(), "srv", 22, KEY_A);
+        tx.send(SshToUi::HostKey(p)).unwrap();
+        session_texts(&ctx, &mut app);
+        app.vault.hosts[0].port = 2222;
+        frame_session(&ctx, &mut app, vec![]);
+        match rx.try_recv() {
+            Ok(HostKeyAnswer::Cancel(msg)) => assert!(msg.contains("endereço"), "{msg}"),
+            other => panic!("esperava cancelamento: {other:?}"),
+        }
+        assert_eq!(app.vault.hosts[0].host_key, None);
+    }
+
+    #[test]
+    fn drop_ignored_while_host_key_prompt_open() {
+        let ctx = test_ctx();
+        let (mut app, mut to_rx, tx) = key_app();
+        let (p, _rx) = key_prompt(test_host_id(), "srv", 22, KEY_A);
+        tx.send(SshToUi::HostKey(p)).unwrap();
+        frame_session(&ctx, &mut app, vec![]);
+        assert!(pane0(&app).host_key.is_some());
+        drop_on_pane(&ctx, &mut app, vec![temp_file("e.txt")]);
+        assert!(upload_requests(&mut to_rx).is_empty());
+        // Sem a pergunta, o drop num painel conectando daria um aviso.
+        assert!(pane0(&app).upload.is_none());
+    }
+
+    #[test]
+    fn editor_keeps_or_clears_host_key() {
+        let mut stored = test_host();
+        stored.host_key = Some(KEY_A.into());
+        let editor = HostEditor::from_host(&stored);
+        // A chave foi trocada (aceita) com o editor aberto: vale a do cofre.
+        let mut current = stored.clone();
+        current.host_key = Some(KEY_B.into());
+        let id = stored.id;
+        assert_eq!(editor.to_host(id, Some(&current)).host_key.as_deref(), Some(KEY_B));
+
+        let mut moved = HostEditor::from_host(&stored);
+        moved.port_text = "2222".into();
+        assert_eq!(moved.to_host(id, Some(&current)).host_key, None);
+
+        let mut case = HostEditor::from_host(&stored);
+        case.host = " SRV ".into();
+        assert_eq!(case.to_host(id, Some(&current)).host_key.as_deref(), Some(KEY_B));
+
+        let mut forget = HostEditor::from_host(&stored);
+        forget.forget_key = true;
+        assert_eq!(forget.to_host(id, Some(&current)).host_key, None);
+
+        let mut novo = HostEditor::new();
+        novo.host = "srv".into();
+        assert_eq!(novo.to_host(uuid::Uuid::new_v4(), None).host_key, None);
+    }
+
+    // --- Download pelo navegador SFTP --------------------------------------
+
+    use crate::download::{DownloadItem, DownloadReport};
+    use crate::sftp::UiToSftp;
+
+    fn fs_node(name: &str) -> FsNode {
+        FsNode {
+            name: name.into(),
+            path: format!("/srv/{name}"),
+            is_dir: name.starts_with("pasta"),
+            size: 10,
+            mode: 0o644,
+            owner: "u".into(),
+            group: "g".into(),
+            date: String::new(),
+        }
+    }
+
+    /// Navegador ja listando /srv com as entradas dadas.
+    fn explorer_with(names: &[&str]) -> FileExplorer {
+        let mut e = FileExplorer::new();
+        e.cur_path = "/srv".into();
+        e.loading = false;
+        e.entries = names.iter().map(|n| fs_node(n)).collect();
+        e
+    }
+
+    fn remote_entry(name: &str) -> sftp::RemoteEntry {
+        sftp::RemoteEntry {
+            name: name.into(),
+            path: format!("/srv/{name}"),
+            is_dir: false,
+            size: 1,
+            mode: 0o644,
+            owner: "u".into(),
+            group: "g".into(),
+            mtime: 0,
+        }
+    }
+
+    fn pick_names(e: &FileExplorer) -> Vec<String> {
+        e.picks().into_iter().map(|p| p.name).collect()
+    }
+
+    /// Um quadro so com o navegador (em foco).
+    fn explorer_frame(ctx: &egui::Context, e: &mut FileExplorer, events: Vec<egui::Event>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            )),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                e.ui(ui, "exp", true, DlAvail::Ready);
+            });
+        });
+    }
+
+    /// App com um unico painel SFTP conectado (canais de teste) em /srv, com
+    /// o foco do teclado.
+    fn sftp_app(
+        names: &[&str],
+    ) -> (
+        App,
+        tokio::sync::mpsc::UnboundedReceiver<UiToSftp>,
+        std::sync::mpsc::Sender<SftpToUi>,
+    ) {
+        let mut app = app();
+        let (handle, to_rx, from_tx) = crate::sftp::SftpHandle::test_pair();
+        if let Some(Node::Leaf(p)) = &mut app.root {
+            p.terminal = None;
+            p.sftp = Some(handle);
+            p.explorer = Some(explorer_with(names));
+            p.state = SessionState::Connected;
+            p.host_name = "srv  (SFTP)".into();
+        }
+        app.pending_focus = Some(vec![]);
+        (app, to_rx, from_tx)
+    }
+
+    fn pane0_mut(app: &mut App) -> &mut Pane {
+        match &mut app.root {
+            Some(Node::Leaf(p)) => p,
+            _ => panic!("esperava um unico painel"),
+        }
+    }
+
+    fn explorer0_mut(app: &mut App) -> &mut FileExplorer {
+        pane0_mut(app).explorer.as_mut().unwrap()
+    }
+
+    /// Pedido com todas as entradas do painel (como se todas fossem marcadas).
+    fn request_all(app: &App) -> PendingDownload {
+        let exp = pane0(app).explorer.as_ref().unwrap();
+        PendingDownload {
+            path: vec![],
+            remote_dir: exp.cur_path.clone(),
+            picks: exp
+                .entries
+                .iter()
+                .map(|n| download::Pick {
+                    remote: n.path.clone(),
+                    name: n.name.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Pasta de destino vazia e exclusiva do teste (apagada no `Drop`,
+    /// inclusive quando o teste falha).
+    struct DlDest(PathBuf);
+
+    impl Drop for DlDest {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn dl_dest() -> DlDest {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("sagu-dl-app-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        DlDest(d)
+    }
+
+    type DlRequest = (u64, PathBuf, Vec<DownloadItem>, tokio::sync::watch::Receiver<bool>);
+
+    /// Pedidos de download que a UI mandou a sessao (ignora o resto).
+    fn download_requests(rx: &mut tokio::sync::mpsc::UnboundedReceiver<UiToSftp>) -> Vec<DlRequest> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let UiToSftp::Download {
+                id,
+                dest,
+                items,
+                cancel,
+            } = m
+            {
+                out.push((id, dest, items, cancel));
+            }
+        }
+        out
+    }
+
+    fn locals(items: &[DownloadItem]) -> Vec<(String, bool)> {
+        items.iter().map(|i| (i.local.clone(), i.replace)).collect()
+    }
+
+    fn footer_stage(app: &App) -> &DownloadStage {
+        &pane0(app).download.as_ref().expect("sem download no painel").stage
+    }
+
+    #[test]
+    fn explorer_selection_click_ctrl_shift_and_ctrl_a() {
+        let mut e = explorer_with(&["a", "b", "c", "d", "e"]);
+        // Clique simples: so ela.
+        e.click(1, false, false);
+        assert_eq!(pick_names(&e), ["b"]);
+        assert_eq!(e.sel, Some(1));
+        // Ctrl marca mais uma; Ctrl de novo desmarca.
+        e.click(3, true, false);
+        assert_eq!(pick_names(&e), ["b", "d"]);
+        e.click(1, true, false);
+        assert_eq!(pick_names(&e), ["d"]);
+        // Shift: intervalo desde a ancora, nas duas direcoes.
+        e.click(1, false, false);
+        e.click(3, false, true);
+        assert_eq!(pick_names(&e), ["b", "c", "d"]);
+        e.click(0, false, true);
+        assert_eq!(pick_names(&e), ["a", "b"]);
+        assert_eq!(e.sel, Some(0));
+        // Setas: sem Shift seleciona so o novo; com Shift estende e recolhe.
+        e.move_cursor(1, false);
+        assert_eq!(pick_names(&e), ["b"]);
+        e.move_cursor(1, true);
+        e.move_cursor(1, true);
+        assert_eq!(pick_names(&e), ["b", "c", "d"]);
+        e.move_cursor(-1, true);
+        assert_eq!(pick_names(&e), ["b", "c"]);
+        // Ctrl+A: tudo, na ordem da listagem.
+        e.select_all();
+        assert_eq!(pick_names(&e), ["a", "b", "c", "d", "e"]);
+        // So o cursor, sem nada marcado: nada a baixar, F2/Delete sem alvo.
+        e.marked.clear();
+        e.sel = Some(4);
+        assert!(pick_names(&e).is_empty());
+        assert_eq!(e.single_target(), None);
+        e.click(4, false, false);
+        assert_eq!(e.single_target(), Some(4));
+        e.click(0, false, false);
+        e.click(2, true, false);
+        assert_eq!(e.single_target(), None);
+        // Ctrl+clique desmarca "a": sobra "c" marcado, com o cursor em "a"
+        // (desmarcado). F2/Delete nao agem em "a"; o download e so de "c".
+        e.click(0, true, false);
+        assert_eq!(pick_names(&e), ["c"]);
+        assert_eq!(e.sel, Some(0));
+        assert_eq!(e.single_target(), None);
+        // Desmarcando o ultimo, nada fica selecionado para baixar.
+        e.click(2, true, false);
+        assert!(pick_names(&e).is_empty());
+        assert_eq!(e.single_target(), None);
+        // Navegar limpa a selecao.
+        let mut to_list = Vec::new();
+        e.navigate_to("/outra".into(), &mut to_list);
+        assert!(e.marked.is_empty() && e.sel.is_none() && e.anchor.is_none());
+
+        // Pelo teclado, num quadro real: Ctrl+A e Shift+setas.
+        let ctx = test_ctx();
+        let mut e = explorer_with(&["a", "b", "c"]);
+        explorer_frame(&ctx, &mut e, vec![key(egui::Key::A, egui::Modifiers::CTRL)]);
+        assert_eq!(pick_names(&e), ["a", "b", "c"]);
+        explorer_frame(&ctx, &mut e, vec![key(egui::Key::ArrowDown, egui::Modifiers::NONE)]);
+        assert_eq!(pick_names(&e), ["b"]);
+        explorer_frame(&ctx, &mut e, vec![key(egui::Key::ArrowDown, egui::Modifiers::SHIFT)]);
+        assert_eq!(pick_names(&e), ["b", "c"]);
+    }
+
+    #[test]
+    fn explorer_selection_survives_relisting() {
+        let mut e = explorer_with(&["a", "b", "c", "d"]);
+        e.click(0, false, false);
+        e.click(2, true, false);
+        e.click(3, true, false);
+        e.sel = Some(2); // cursor em "c"
+        // Nova listagem: "b" e "d" sumiram e entrou um item antes de todos.
+        let novos = ["0novo", "a", "c", "x"].iter().map(|n| remote_entry(n)).collect();
+        e.apply_listing("/srv", novos);
+        assert_eq!(e.sel, Some(2), "cursor reposicionado pelo nome");
+        assert_eq!(e.entries[2].name, "c");
+        assert_eq!(pick_names(&e), ["a", "c"]);
+        assert_eq!(e.anchor, Some(2));
+        // O item do cursor sumiu (ex.: excluido): sem cursor, nunca outro item.
+        e.apply_listing("/srv", vec![remote_entry("a"), remote_entry("x")]);
+        assert_eq!(e.sel, None);
+        assert_eq!(pick_names(&e), ["a"]);
+        // Listagem de outra pasta nao mexe em nada.
+        e.apply_listing("/outra", vec![remote_entry("z")]);
+        assert_eq!(e.entries.len(), 2);
+    }
+
+    #[test]
+    fn f2_and_delete_ignored_with_multiple_marked() {
+        let ctx = test_ctx();
+        let mut e = explorer_with(&["a", "b", "c"]);
+        e.click(0, false, false);
+        e.click(1, true, false);
+        explorer_frame(&ctx, &mut e, vec![key(egui::Key::F2, egui::Modifiers::NONE)]);
+        assert!(e.dialog.is_none(), "F2 com 2 marcados abriu dialogo");
+        explorer_frame(&ctx, &mut e, vec![key(egui::Key::Delete, egui::Modifiers::NONE)]);
+        assert!(e.dialog.is_none(), "Delete com 2 marcados abriu dialogo");
+        // Com um so, como antes.
+        e.click(1, false, false);
+        explorer_frame(&ctx, &mut e, vec![key(egui::Key::Delete, egui::Modifiers::NONE)]);
+        assert!(matches!(&e.dialog, Some(FsDialog::Delete { name, .. }) if name == "b"));
+        e.dialog = None;
+        explorer_frame(&ctx, &mut e, vec![key(egui::Key::F2, egui::Modifiers::NONE)]);
+        assert!(matches!(&e.dialog, Some(FsDialog::Rename { name, .. }) if name == "b"));
+    }
+
+    #[test]
+    fn ctrl_s_on_focused_sftp_pane_requests_download() {
+        let ctx = test_ctx();
+        let (mut app, mut to_rx, _tx) = sftp_app(&["a.txt", "b.txt", "c.txt"]);
+        for _ in 0..3 {
+            frame_session(&ctx, &mut app, vec![]);
+        }
+        assert_eq!(app.focused_path, Some(vec![]));
+        let e = explorer0_mut(&mut app);
+        e.click(2, false, false);
+        e.click(0, true, false);
+        frame_session(&ctx, &mut app, vec![key(egui::Key::S, egui::Modifiers::CTRL)]);
+        let req = app.pending_download.as_ref().expect("Ctrl+S nao pediu o download");
+        assert!(req.path.is_empty());
+        assert_eq!(req.remote_dir, "/srv");
+        let names: Vec<&str> = req.picks.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["a.txt", "c.txt"], "ordem da listagem");
+        assert_eq!(req.picks[0].remote, "/srv/a.txt");
+        // Nada vai para a sessao antes de a pasta ser escolhida.
+        assert!(download_requests(&mut to_rx).is_empty());
+    }
+
+    /// Um quadro do navegador (em foco), devolvendo a saida para achar textos.
+    fn explorer_frame_out(ctx: &egui::Context, e: &mut FileExplorer, events: Vec<egui::Event>) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            )),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                e.ui(ui, "exp", true, DlAvail::Ready);
+            });
+        })
+    }
+
+    /// Centro do texto `t` desenhado no quadro (o ultimo, se houver varios).
+    fn text_pos(out: &egui::FullOutput, t: &str) -> Option<egui::Pos2> {
+        painted_texts(out)
+            .into_iter()
+            .rev()
+            .find(|(s, _)| s == t)
+            .map(|(_, r)| r.center())
+    }
+
+    /// Botao direito numa linha e clique em `item` no menu que abre.
+    fn context_menu_click(ctx: &egui::Context, e: &mut FileExplorer, row: &str, item: &str) -> Vec<String> {
+        let out = explorer_frame_out(ctx, e, vec![]);
+        let pos = text_pos(&out, row).expect("linha nao desenhada");
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        explorer_frame_out(ctx, e, vec![egui::Event::PointerMoved(pos), button(true)]);
+        explorer_frame_out(ctx, e, vec![button(false)]);
+        let out = explorer_frame_out(ctx, e, vec![]);
+        let texts: Vec<String> = painted_texts(&out).into_iter().map(|(s, _)| s).collect();
+        let at = text_pos(&out, item).expect("item do menu nao desenhado");
+        explorer_frame_out(ctx, e, vec![egui::Event::PointerMoved(at), click(at, true)]);
+        explorer_frame_out(ctx, e, vec![click(at, false)]);
+        texts
+    }
+
+    #[test]
+    fn context_menu_single_item_actions_off_with_multiple_marked() {
+        let ctx = test_ctx();
+        let mut e = explorer_with(&["a.txt", "b.txt", "c.txt"]);
+        e.click(0, false, false);
+        e.click(1, true, false);
+        // Linha dentro da selecao de 2: o menu e da selecao, Excluir nao age.
+        let texts = context_menu_click(&ctx, &mut e, "b.txt", "Excluir");
+        assert!(texts.iter().any(|t| t == "2 itens selecionados"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Baixar 2 itens\u{2026}"), "{texts:?}");
+        assert!(e.dialog.is_none(), "Excluir agiu com 2 itens marcados");
+        let _ = context_menu_click(&ctx, &mut e, "b.txt", "Renomear");
+        assert!(e.dialog.is_none(), "Renomear agiu com 2 itens marcados");
+        assert_eq!(pick_names(&e), ["a.txt", "b.txt"]);
+        // Linha fora da selecao: vira a selecao e o menu age nela.
+        let texts = context_menu_click(&ctx, &mut e, "c.txt", "Excluir");
+        assert!(texts.iter().any(|t| t == "c.txt"), "{texts:?}");
+        assert!(matches!(&e.dialog, Some(FsDialog::Delete { name, .. }) if name == "c.txt"));
+        assert_eq!(pick_names(&e), ["c.txt"]);
+    }
+
+    #[test]
+    fn ctrl_s_hint_only_with_sftp_pane_focused() {
+        let ctx = test_ctx();
+        let (mut app, _to_rx, _tx) = sftp_app(&["a.txt"]);
+        for _ in 0..3 {
+            frame_session(&ctx, &mut app, vec![]);
+        }
+        assert_eq!(app.focused_path, Some(vec![]));
+        assert!(app.session_hint().contains("Ctrl+S"), "{}", app.session_hint());
+        // Terminal SSH em foco: Ctrl+S vai ao servidor, a dica nao o sugere.
+        let ctx = test_ctx();
+        let (mut app, _to_rx, _tx) = ssh_app(true);
+        app.pending_focus = Some(vec![]);
+        for _ in 0..3 {
+            frame_session(&ctx, &mut app, vec![]);
+        }
+        assert_eq!(app.focused_path, Some(vec![]));
+        assert!(!app.session_hint().contains("Ctrl+S"), "{}", app.session_hint());
+    }
+
+    #[test]
+    fn ctrl_s_ignored_without_selection_or_while_busy() {
+        let ctx = test_ctx();
+        let (mut app, _to_rx, _tx) = sftp_app(&["a.txt", "b.txt", "c.txt"]);
+        for _ in 0..3 {
+            frame_session(&ctx, &mut app, vec![]);
+        }
+        frame_session(&ctx, &mut app, vec![key(egui::Key::S, egui::Modifiers::CTRL)]);
+        assert!(app.pending_download.is_none(), "sem selecao nao pede");
+        // Shift+seta estende a selecao (nao vira seta simples).
+        frame_session(&ctx, &mut app, vec![key(egui::Key::ArrowDown, egui::Modifiers::NONE)]);
+        frame_session(&ctx, &mut app, vec![key(egui::Key::ArrowDown, egui::Modifiers::SHIFT)]);
+        assert_eq!(pick_names(pane0(&app).explorer.as_ref().unwrap()), ["a.txt", "b.txt"]);
+        // Download em andamento no painel: Ctrl+S nao pede outro.
+        let (cancel, _rx) = download::cancel_pair();
+        pane0_mut(&mut app).download = Some(DownloadUi {
+            id: 9,
+            dest: PathBuf::from("C:\\x"),
+            pre_skipped: Vec::new(),
+            stage: DownloadStage::Running {
+                cancel,
+                cancelling: false,
+                scanning: true,
+                found: 0,
+                index: 0,
+                count: 0,
+                name: String::new(),
+                done: 0,
+                total: 0,
+            },
+        });
+        frame_session(&ctx, &mut app, vec![key(egui::Key::S, egui::Modifiers::CTRL)]);
+        assert!(app.pending_download.is_none(), "pediu com download em andamento");
+        // Terminado, o mesmo Ctrl+S pede.
+        pane0_mut(&mut app).download = None;
+        frame_session(&ctx, &mut app, vec![key(egui::Key::S, egui::Modifiers::CTRL)]);
+        assert!(app.pending_download.is_some());
+    }
+
+    #[test]
+    fn begin_download_without_conflicts_sends_request() {
+        let (mut app, mut to_rx, _tx) = sftp_app(&["a:b.txt", "c.txt", "CON", ".."]);
+        let dest_dir = dl_dest();
+        let dest = dest_dir.0.clone();
+        app.begin_download(request_all(&app), dest.clone());
+        let mut reqs = download_requests(&mut to_rx);
+        assert_eq!(reqs.len(), 1);
+        let (id, d, items, _cancel) = reqs.remove(0);
+        assert_eq!(d, dest);
+        assert_eq!(
+            locals(&items),
+            [
+                ("a_b.txt".to_string(), false),
+                ("c.txt".to_string(), false),
+                ("_CON".to_string(), false)
+            ]
+        );
+        assert_eq!(items[0].remote, "/srv/a:b.txt");
+        let dl = pane0(&app).download.as_ref().unwrap();
+        assert_eq!(dl.id, id);
+        assert!(matches!(dl.stage, DownloadStage::Running { scanning: true, .. }));
+        assert_eq!(dl.pre_skipped.len(), 1, "\"..\" fica como ignorado");
+
+        // Outro pedido com este em andamento, ou de outra pasta: descartado.
+        app.begin_download(request_all(&app), dest.clone());
+        let mut other = request_all(&app);
+        other.remote_dir = "/outra".into();
+        pane0_mut(&mut app).download = None;
+        app.begin_download(other, dest.clone());
+        assert!(download_requests(&mut to_rx).is_empty());
+        assert!(pane0(&app).download.is_none());
+
+        // Sessao ja encerrada: aviso, nada pedido.
+        drop(to_rx);
+        app.begin_download(request_all(&app), dest.clone());
+        match footer_stage(&app) {
+            DownloadStage::Done { text, tone, .. } => {
+                assert_eq!(text, "Sessão encerrada; nada foi baixado.");
+                assert_eq!(*tone, Tone::Error);
+            }
+            _ => panic!("esperava aviso"),
+        }
+    }
+
+    #[test]
+    fn begin_download_with_conflicts_asks_then_resolves() {
+        let ctx = test_ctx();
+        let substituir = vec![("a.txt".to_string(), true), ("b.txt".to_string(), false)];
+        let pular = vec![("b.txt".to_string(), false)];
+        for (acao, esperado) in [
+            ("Substituir", Some(substituir)),
+            ("Pular existentes", Some(pular)),
+            ("Cancelar", None),
+            ("Esc", None),
+        ] {
+            let (mut app, mut to_rx, _tx) = sftp_app(&["a.txt", "b.txt"]);
+            let dest_dir = dl_dest();
+            let dest = dest_dir.0.clone();
+            std::fs::write(dest.join("a.txt"), "local").unwrap();
+            for _ in 0..3 {
+                frame_session(&ctx, &mut app, vec![]);
+            }
+            app.begin_download(request_all(&app), dest.clone());
+            assert!(download_requests(&mut to_rx).is_empty(), "{acao}: pediu antes de perguntar");
+            assert!(matches!(footer_stage(&app), DownloadStage::Asking(_)));
+            let texts = session_texts(&ctx, &mut app);
+            assert!(has(&texts, "Já existe no destino"), "{texts:?}");
+            assert!(has(&texts, "\u{201c}a.txt\u{201d} já existe em"), "{texts:?}");
+            // Enter e setas nao fazem nada com o dialogo aberto.
+            frame_session(
+                &ctx,
+                &mut app,
+                vec![
+                    key(egui::Key::Enter, egui::Modifiers::NONE),
+                    key(egui::Key::ArrowDown, egui::Modifiers::NONE),
+                ],
+            );
+            assert!(matches!(footer_stage(&app), DownloadStage::Asking(_)));
+            assert!(download_requests(&mut to_rx).is_empty());
+
+            if acao == "Esc" {
+                frame_session(&ctx, &mut app, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
+            } else {
+                click_text(&ctx, &mut app, acao);
+            }
+            let reqs = download_requests(&mut to_rx);
+            match esperado {
+                Some(v) => {
+                    assert_eq!(reqs.len(), 1, "{acao}");
+                    assert_eq!(locals(&reqs[0].2), v, "{acao}");
+                    let dl = pane0(&app).download.as_ref().unwrap();
+                    assert!(matches!(dl.stage, DownloadStage::Running { .. }));
+                    if acao == "Pular existentes" {
+                        assert_eq!(
+                            dl.pre_skipped,
+                            vec![("a.txt".to_string(), "já existia no destino (pulado)".to_string())]
+                        );
+                    }
+                }
+                None => {
+                    assert!(reqs.is_empty(), "{acao}");
+                    assert!(pane0(&app).download.is_none(), "{acao}");
+                }
+            }
+            assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "local");
+        }
+
+        // Tudo ja existe: "Pular existentes" nem aparece.
+        let (mut app, _to_rx, _tx) = sftp_app(&["a.txt"]);
+        let dest_dir = dl_dest();
+        let dest = dest_dir.0.clone();
+        std::fs::write(dest.join("a.txt"), "local").unwrap();
+        app.begin_download(request_all(&app), dest.clone());
+        let texts = session_texts(&ctx, &mut app);
+        assert!(has(&texts, "Substituir") && !has(&texts, "Pular existentes"), "{texts:?}");
+    }
+
+    #[test]
+    fn download_events_update_footer_and_finish_text() {
+        let ctx = test_ctx();
+        let (mut app, mut to_rx, tx) = sftp_app(&["a.txt", "b.txt"]);
+        let dest_dir = dl_dest();
+        let dest = dest_dir.0.clone();
+        app.begin_download(request_all(&app), dest.clone());
+        let id = download_requests(&mut to_rx)[0].0;
+        assert!(has(&session_texts(&ctx, &mut app), "Preparando o download\u{2026}"));
+
+        tx.send(SftpToUi::Download(DownloadEvent::Scanning { id, found: 7 }))
+            .unwrap();
+        let texts = session_texts(&ctx, &mut app);
+        assert!(has(&texts, "Preparando o download\u{2026} 7 itens encontrados"), "{texts:?}");
+
+        tx.send(SftpToUi::Download(DownloadEvent::Progress {
+            id,
+            index: 0,
+            count: 2,
+            name: "a.txt".into(),
+            done: 512,
+            total: 1024,
+        }))
+        .unwrap();
+        let texts = session_texts(&ctx, &mut app);
+        assert!(
+            has(&texts, "Baixando 1/2: a.txt \u{00b7} 50% \u{00b7} 512 B de 1.0 KB"),
+            "{texts:?}"
+        );
+        assert_eq!(title_fraction(pane0(&app)), Some(0.5));
+
+        // Evento de outro lote: ignorado.
+        tx.send(SftpToUi::Download(DownloadEvent::Progress {
+            id: id + 100,
+            index: 1,
+            count: 2,
+            name: "velho".into(),
+            done: 1,
+            total: 2,
+        }))
+        .unwrap();
+        let texts = session_texts(&ctx, &mut app);
+        assert!(!has(&texts, "velho"), "{texts:?}");
+
+        let report = DownloadReport {
+            id,
+            dest: dest.clone(),
+            saved: 2,
+            files: 2,
+            last_saved: "b.txt".into(),
+            ..Default::default()
+        };
+        tx.send(SftpToUi::Download(DownloadEvent::Finished(Box::new(report))))
+            .unwrap();
+        let texts = session_texts(&ctx, &mut app);
+        assert!(has(&texts, "2 arquivos baixados em"), "{texts:?}");
+        assert!(matches!(footer_stage(&app), DownloadStage::Done { tone: Tone::Ok, .. }));
+        assert_eq!(title_fraction(pane0(&app)), None);
+        // Resultado dispensado pelo "x" (aqui, direto) libera o painel.
+        assert!(!pane0(&app).download.as_ref().unwrap().busy());
+    }
+
+    #[test]
+    fn cancel_button_signals_session() {
+        let ctx = test_ctx();
+        let (mut app, mut to_rx, tx) = sftp_app(&["a.txt"]);
+        let dest_dir = dl_dest();
+        let dest = dest_dir.0.clone();
+        app.begin_download(request_all(&app), dest.clone());
+        let (id, _, _, cancel_rx) = download_requests(&mut to_rx).remove(0);
+        session_texts(&ctx, &mut app);
+        assert!(!*cancel_rx.borrow());
+        click_text(&ctx, &mut app, "Cancelar");
+        assert!(*cancel_rx.borrow(), "a tarefa nao viu o cancelamento");
+        assert!(has(&session_texts(&ctx, &mut app), "Cancelando\u{2026}"));
+        // A sessao responde com o relatorio do cancelamento.
+        let report = DownloadReport {
+            id,
+            dest: dest.clone(),
+            files: 1,
+            cancelled: true,
+            ..Default::default()
+        };
+        tx.send(SftpToUi::Download(DownloadEvent::Finished(Box::new(report))))
+            .unwrap();
+        assert!(has(&session_texts(&ctx, &mut app), "Download cancelado; nada foi salvo."));
+
+        // Fechar o painel com o download em andamento solta o `Cancel`.
+        let (mut app, mut to_rx, _tx) = sftp_app(&["a.txt"]);
+        app.begin_download(request_all(&app), dest.clone());
+        let (_, _, _, cancel_rx) = download_requests(&mut to_rx).remove(0);
+        assert!(cancel_rx.has_changed().is_ok());
+        app.close_pane(&[]);
+        assert!(cancel_rx.has_changed().is_err(), "a tarefa nao veria o fechamento");
+        assert!(matches!(to_rx.try_recv(), Ok(UiToSftp::Disconnect)));
+    }
+
+    #[test]
+    fn session_closed_during_download_keeps_pane_open() {
+        let ctx = test_ctx();
+        let (mut app, _to_rx, tx) = sftp_app(&["a.txt"]);
+        let dest_dir = dl_dest();
+        let dest = dest_dir.0.clone();
+        app.begin_download(request_all(&app), dest.clone());
+        tx.send(SftpToUi::Closed).unwrap();
+        let texts = session_texts(&ctx, &mut app);
+        let pane = pane0(&app);
+        assert!(!pane.should_close, "painel nao pode fechar no meio do download");
+        assert!(matches!(pane.state, SessionState::Error(_)));
+        assert!(has(&texts, "Download interrompido: a sessão foi encerrada."), "{texts:?}");
+        assert!(matches!(footer_stage(&app), DownloadStage::Done { tone: Tone::Error, .. }));
+
+        // Com o dialogo de conflito aberto: o pedido cai (aviso neutro).
+        let (mut app, _to_rx, tx) = sftp_app(&["a.txt"]);
+        std::fs::write(dest.join("a.txt"), "x").unwrap();
+        app.begin_download(request_all(&app), dest.clone());
+        assert!(matches!(footer_stage(&app), DownloadStage::Asking(_)));
+        tx.send(SftpToUi::Closed).unwrap();
+        app.drain_ssh_events();
+        assert!(app.root.is_none(), "sessao encerrada normalmente fecha o painel");
+    }
+
+    #[test]
+    fn download_summary_texts() {
+        let dest = PathBuf::from(r"C:\Users\x\Downloads");
+        let base = DownloadReport {
+            id: 1,
+            dest: dest.clone(),
+            ..Default::default()
+        };
+        let pasta = r"C:\Users\x\Downloads";
+
+        // Um arquivo.
+        let r = DownloadReport {
+            saved: 1,
+            files: 1,
+            last_saved: "a.txt".into(),
+            ..base.clone()
+        };
+        let (text, detail, tone) = download_summary(&r, &[]);
+        assert_eq!(text, format!("a.txt baixado em {pasta}"));
+        assert!(detail.is_empty());
+        assert_eq!(tone, Tone::Ok);
+
+        // Varios, com ignorados (antes e durante) e nomes ajustados.
+        let r = DownloadReport {
+            saved: 3,
+            files: 3,
+            dirs: 1,
+            skipped: vec![("pasta/fifo".into(), "arquivo especial (dispositivo, fifo ou socket)".into())],
+            renamed: vec![("pasta/a:b".into(), "pasta\\a_b".into())],
+            ..base.clone()
+        };
+        let pre = vec![("x.txt".to_string(), "já existia no destino (pulado)".to_string())];
+        let (text, detail, tone) = download_summary(&r, &pre);
+        assert_eq!(
+            text,
+            format!(
+                "3 arquivos baixados em {pasta} \u{00b7} 2 ignorado(s) \u{00b7} \
+                 1 nome(s) ajustado(s) para o Windows"
+            )
+        );
+        assert_eq!(tone, Tone::Ok);
+        assert_eq!(
+            detail,
+            "Ignorados:\n\u{2022} x.txt: já existia no destino (pulado)\n\
+             \u{2022} pasta/fifo: arquivo especial (dispositivo, fifo ou socket)\n\n\
+             Nomes ajustados para o Windows:\n\u{2022} pasta/a:b \u{2192} pasta\\a_b"
+        );
+
+        // So pastas vazias.
+        let r = DownloadReport { dirs: 1, ..base.clone() };
+        assert_eq!(
+            download_summary(&r, &[]).0,
+            format!("Pasta baixada em {pasta} (sem arquivos)")
+        );
+
+        // Cancelado com e sem arquivos (tom neutro).
+        let r = DownloadReport {
+            saved: 2,
+            files: 5,
+            cancelled: true,
+            ..base.clone()
+        };
+        assert_eq!(
+            download_summary(&r, &[]),
+            (
+                format!("Download cancelado; 2 de 5 arquivos já estavam salvos em {pasta}."),
+                String::new(),
+                Tone::Neutral
+            )
+        );
+        let r = DownloadReport { files: 5, cancelled: true, ..base.clone() };
+        assert_eq!(download_summary(&r, &[]).0, "Download cancelado; nada foi salvo.");
+
+        // Fatal.
+        let r = DownloadReport {
+            saved: 3,
+            files: 9,
+            fatal: Some("disco cheio".into()),
+            ..base.clone()
+        };
+        assert_eq!(
+            download_summary(&r, &[]),
+            (
+                format!("Download interrompido (disco cheio); 3 de 9 arquivos salvos em {pasta}"),
+                String::new(),
+                Tone::Error
+            )
+        );
+        let r = DownloadReport {
+            fatal: Some("conexão com o servidor perdida".into()),
+            ..base.clone()
+        };
+        assert_eq!(
+            download_summary(&r, &[]).0,
+            "Download interrompido (conexão com o servidor perdida); nada foi salvo."
+        );
+
+        // Com falhas: a primeira no texto, a contagem das demais e todas no detalhe.
+        let failed: Vec<(String, String)> = (0..12)
+            .map(|i| (format!("p/f{i}"), "Permission denied".to_string()))
+            .collect();
+        let r = DownloadReport {
+            saved: 1,
+            files: 13,
+            failed: failed.clone(),
+            ..base.clone()
+        };
+        let (text, detail, tone) = download_summary(&r, &[]);
+        assert_eq!(
+            text,
+            format!("1 de 13 arquivos baixados em {pasta}; p/f0: Permission denied (+11 com erro)")
+        );
+        assert_eq!(tone, Tone::Error);
+        assert!(detail.starts_with("Com erro:\n\u{2022} p/f0: Permission denied\n"), "{detail}");
+        assert!(detail.ends_with("\n\u{2026} e mais 2"), "{detail}");
+        assert_eq!(detail.lines().count(), 12);
+
+        // Nada baixado: por falha ou so ignorados.
+        let r = DownloadReport {
+            files: 1,
+            failed: vec![("a.txt".into(), "Permission denied".into())],
+            ..base.clone()
+        };
+        assert_eq!(download_summary(&r, &[]).0, "Nada foi baixado: a.txt: Permission denied");
+        let r = DownloadReport {
+            skipped: vec![("fifo".into(), "arquivo especial (dispositivo, fifo ou socket)".into())],
+            ..base.clone()
+        };
+        assert_eq!(
+            download_summary(&r, &[]),
+            (
+                "Nada foi baixado: fifo: arquivo especial (dispositivo, fifo ou socket)".to_string(),
+                "Ignorados:\n\u{2022} fifo: arquivo especial (dispositivo, fifo ou socket)"
+                    .to_string(),
+                Tone::Error
+            )
+        );
+
+        // Nome remoto com caractere de direcao: exibido com '?'.
+        let r = DownloadReport {
+            files: 1,
+            failed: vec![("foto\u{202E}gpj.exe".into(), "erro".into())],
+            ..base.clone()
+        };
+        assert_eq!(download_summary(&r, &[]).0, "Nada foi baixado: foto?gpj.exe: erro");
     }
 }

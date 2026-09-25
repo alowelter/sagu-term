@@ -1,6 +1,6 @@
 [package]
 name = "sagu-term"
-version = "0.1.7"
+version = "1.0.0"
 edition = "2021"
 description = "Cliente SSH desktop em Rust puro com cofre criptografado e terminal com auto-copia"
 license = "MIT"
@@ -28,6 +28,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "
 
 # Cofre criptografado
 aes-gcm = "0.10"
+# Mesmo aes que o aes-gcm ja usa, so para ligar o zeroize: as round keys do
+# AES-256 contem a propria chave e sao zeradas quando a cifra sai de escopo
+aes = { version = "0.8", features = ["zeroize"] }
 argon2 = "0.5"
 rand = "0.8"
 
@@ -52,8 +55,6 @@ arboard = "3"
 # Terminal local (cmd.exe) via PTY — ConPTY no Windows
 portable-pty = "0.8"
 russh-sftp = "2.3.0"
-ureq = "3.4.2"
-sha2 = "0.11.0"
 
 [build-dependencies]
 # Embute o icone (e metadados de versao) como recurso do executavel Windows

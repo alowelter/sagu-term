@@ -13,11 +13,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use russh::client;
-use russh::keys::{decode_secret_key, PrivateKeyWithHashAlg};
+use russh::keys::{decode_secret_key, PrivateKeyWithHashAlg, PublicKey};
 use russh::ChannelMsg;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
+use crate::hostkey::{self, HostKeyAnswer, HostKeyPrompt, KeyCheck};
 use crate::upload::{self, UploadEvent};
 use crate::vault::{AuthMethod, Host};
 
@@ -29,6 +31,9 @@ pub enum SshToUi {
     Closed,
     /// Andamento/resultado de um envio de arquivos soltos sobre o terminal.
     Upload(UploadEvent),
+    /// Chave do servidor nova ou diferente da guardada: a UI pergunta ao usuario
+    /// e responde pelo `reply` do prompt (descartar = cancelar).
+    HostKey(HostKeyPrompt),
 }
 
 /// Mensagens da UI para a sessao SSH.
@@ -49,17 +54,26 @@ pub enum UiToSsh {
     },
 }
 
-/// Handler do cliente russh. Aceita a chave do servidor automaticamente
-/// (TOFU desabilitado para simplicidade). Compartilhado com a sessao SFTP.
-pub(crate) struct Client;
+/// Handler do cliente russh. So captura a chave que o servidor apresentou; quem
+/// decide se ela e confiavel e `connect_and_auth`, logo apos a troca de chaves e
+/// ANTES de qualquer autenticacao. Aceitar aqui mantem o laco da sessao russh
+/// vivo durante a pergunta (esperar dentro deste metodo o congela: uma queda do
+/// servidor so seria notada depois da resposta). Compartilhado com o SFTP.
+///
+/// O campo privado garante que so este modulo cria o handler: toda conexao
+/// passa por `connect_and_auth` e, portanto, pela verificacao da chave.
+pub(crate) struct Client {
+    server_key: Option<oneshot::Sender<PublicKey>>,
+}
 
 impl client::Handler for Client {
     type Error = russh::Error;
 
-    async fn check_server_key(
-        &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
-    ) -> Result<bool, Self::Error> {
+    async fn check_server_key(&mut self, key: &PublicKey) -> Result<bool, Self::Error> {
+        // Chamado so na troca de chaves inicial (nao nas renegociacoes).
+        if let Some(tx) = self.server_key.take() {
+            let _ = tx.send(key.clone());
+        }
         Ok(true)
     }
 }
@@ -67,16 +81,38 @@ impl client::Handler for Client {
 /// Conecta e autentica uma sessao russh com os dados do host. Unico ponto de
 /// configuracao (timeouts, politica de chave do servidor, metodos de
 /// autenticacao), compartilhado entre as sessoes de terminal SSH e SFTP.
-pub(crate) async fn connect_and_auth(host: &Host) -> anyhow::Result<client::Handle<Client>> {
+///
+/// `ask` entrega a UI a pergunta sobre uma chave de servidor nova ou diferente
+/// da guardada em `host.host_key` (no maximo uma vez por conexao).
+///
+/// INVARIANTE DE SEGURANCA: ate `verify_host_key` aceitar a chave, so trafegam
+/// a troca de chaves e o pedido do servico de autenticacao (sem segredo algum).
+/// Nenhum `authenticate_*`, `best_supported_rsa_hash` ou abertura de canal pode
+/// vir antes dela: usuario, senha e assinatura da chave so saem depois.
+pub(crate) async fn connect_and_auth(
+    host: &Host,
+    ask: impl Fn(HostKeyPrompt),
+) -> anyhow::Result<client::Handle<Client>> {
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
         keepalive_interval: Some(Duration::from_secs(30)),
+        preferred: hostkey::preferred(host.host_key.as_deref()),
         ..Default::default()
     });
 
-    let mut session = client::connect(config, (host.host.as_str(), host.port), Client)
+    let (key_tx, mut key_rx) = oneshot::channel();
+    let handler = Client {
+        server_key: Some(key_tx),
+    };
+    let mut session = client::connect(config, (host.host.as_str(), host.port), handler)
         .await
         .map_err(|e| anyhow::anyhow!("nao foi possivel conectar: {e}"))?;
+
+    // A chave chega no oneshot antes do Handle existir (troca de chaves inicial).
+    let presented = key_rx
+        .try_recv()
+        .map_err(|_| anyhow::anyhow!("O servidor não apresentou a chave de host."))?;
+    verify_host_key(&mut session, host, &presented, &ask).await?;
 
     let authenticated = match &host.auth {
         AuthMethod::Password { password } => session
@@ -104,6 +140,49 @@ pub(crate) async fn connect_and_auth(host: &Host) -> anyhow::Result<client::Hand
         anyhow::bail!("falha na autenticacao (credenciais rejeitadas)");
     }
     Ok(session)
+}
+
+/// Confere a chave apresentada com a guardada no host; se for nova ou
+/// diferente, pergunta a UI e espera. Nenhuma credencial sai antes disso.
+async fn verify_host_key(
+    session: &mut client::Handle<Client>,
+    host: &Host,
+    presented: &PublicKey,
+    ask: &impl Fn(HostKeyPrompt),
+) -> anyhow::Result<()> {
+    let line = hostkey::openssh_line(presented)
+        .map_err(|e| anyhow::anyhow!("Chave do servidor inválida: {e}"))?;
+    if hostkey::check(host.host_key.as_deref(), &line) == KeyCheck::Match {
+        return Ok(());
+    }
+    let (tx, rx) = oneshot::channel();
+    ask(HostKeyPrompt {
+        host_id: host.id,
+        host: host.host.clone(),
+        port: host.port,
+        presented: line,
+        reply: tx,
+    });
+    // Espera a resposta sem travar a sessao russh: se o servidor derrubar a
+    // conexao (ex.: LoginGraceTime), o Handle termina e a pergunta cai. Depois
+    // que esse ramo fica pronto o Handle nunca mais e consultado (so abortar).
+    let answer = tokio::select! {
+        a = rx => a,
+        _ = &mut *session => anyhow::bail!(
+            "O servidor encerrou a conexão enquanto aguardava a confirmação da chave; conecte de novo."
+        ),
+    };
+    let msg = match answer {
+        Ok(HostKeyAnswer::Accept) => return Ok(()),
+        Ok(HostKeyAnswer::Cancel(msg)) => msg,
+        Err(_) => {
+            "Conexão cancelada: a confirmação da chave do servidor foi interrompida.".to_string()
+        }
+    };
+    let _ = session
+        .disconnect(russh::Disconnect::HostKeyNotVerifiable, "", "")
+        .await;
+    anyhow::bail!("{msg}")
 }
 
 /// Lado da UI: enviar comandos e receber eventos da sessao.
@@ -235,9 +314,14 @@ async fn run_session<F>(
 where
     F: Fn() + Send + 'static,
 {
+    // Pergunta sobre a chave do servidor vai para o painel (ver `hostkey`).
+    let ask = |p| {
+        let _ = from_ssh.send(SshToUi::HostKey(p));
+        repaint();
+    };
     // Compartilhada com as tarefas de envio de arquivos (canais extras na
     // mesma conexao; abrir canal so precisa de `&self`).
-    let session = Arc::new(connect_and_auth(&host).await?);
+    let session = Arc::new(connect_and_auth(&host, ask).await?);
 
     let mut channel = session.channel_open_session().await?;
     channel

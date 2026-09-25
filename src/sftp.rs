@@ -4,15 +4,23 @@
 //! sessao roda numa thread dedicada com runtime tokio e conversa por dois canais:
 //! - [`UiToSftp`]: a UI pede listagem de diretorio ou desconexao;
 //! - [`SftpToUi`]: a sessao devolve status, listagens e erros.
+//!
+//! Downloads rodam em tarefas proprias (ver [`crate::download`]), fora do loop
+//! de comandos: navegar, renomear etc. continuam respondendo durante a copia.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 
+use crate::download::{self, DownloadEvent, DownloadItem};
+use crate::hostkey::HostKeyPrompt;
 use crate::vault::Host;
 
 /// Uma entrada (arquivo ou pasta) de um diretorio remoto.
@@ -44,6 +52,11 @@ pub enum SftpToUi {
     Error(String),
     /// Sessao encerrada.
     Closed,
+    /// Chave do servidor nova ou diferente da guardada: a UI pergunta ao usuario
+    /// e responde pelo `reply` do prompt (descartar = cancelar).
+    HostKey(HostKeyPrompt),
+    /// Andamento/fim de um download.
+    Download(DownloadEvent),
 }
 
 /// Mensagens da UI para a sessao SFTP.
@@ -79,6 +92,13 @@ pub enum UiToSftp {
         is_dir: bool,
         refresh_dir: String,
     },
+    /// Baixa `items` para a pasta local `dest`.
+    Download {
+        id: u64,
+        dest: PathBuf,
+        items: Vec<DownloadItem>,
+        cancel: watch::Receiver<bool>,
+    },
     /// Encerra a sessao.
     Disconnect,
 }
@@ -90,6 +110,23 @@ pub struct SftpHandle {
 }
 
 impl SftpHandle {
+    /// Handle ligado a canais de teste: devolve tambem o lado "sessao" (o que
+    /// a UI mandou e por onde injetar eventos).
+    #[cfg(test)]
+    pub(crate) fn test_pair() -> (
+        Self,
+        UnboundedReceiver<UiToSftp>,
+        std::sync::mpsc::Sender<SftpToUi>,
+    ) {
+        let (to_tx, to_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (from_tx, from_rx) = std::sync::mpsc::channel();
+        let handle = SftpHandle {
+            to_sftp: to_tx,
+            from_sftp: from_rx,
+        };
+        (handle, to_rx, from_tx)
+    }
+
     pub fn list_dir(&self, path: impl Into<String>) {
         let _ = self.to_sftp.send(UiToSftp::ListDir(path.into()));
     }
@@ -150,6 +187,26 @@ impl SftpHandle {
         });
     }
 
+    /// Pede o download; `None` se a sessao ja terminou (nenhuma resposta viria).
+    /// Soltar o `Cancel` devolvido tambem cancela.
+    pub fn download(
+        &self,
+        id: u64,
+        dest: PathBuf,
+        items: Vec<DownloadItem>,
+    ) -> Option<download::Cancel> {
+        let (cancel, rx) = download::cancel_pair();
+        self.to_sftp
+            .send(UiToSftp::Download {
+                id,
+                dest,
+                items,
+                cancel: rx,
+            })
+            .ok()
+            .map(|_| cancel)
+    }
+
     pub fn disconnect(&self) {
         let _ = self.to_sftp.send(UiToSftp::Disconnect);
     }
@@ -204,13 +261,21 @@ where
 {
     // Conexao e autenticacao compartilhadas com a sessao SSH (mesma politica
     // de timeouts e de chave do servidor, num unico ponto de manutencao).
-    let session = crate::ssh::connect_and_auth(&host).await?;
+    let session = crate::ssh::connect_and_auth(&host, |p| {
+        let _ = from_sftp.send(SftpToUi::HostKey(p));
+        repaint();
+    })
+    .await?;
 
     let channel = session.channel_open_session().await?;
     channel.request_subsystem(true, "sftp").await?;
-    let sftp = SftpSession::new(channel.into_stream())
-        .await
-        .map_err(|e| anyhow::anyhow!("nao foi possivel iniciar o SFTP: {e}"))?;
+    // Compartilhada com as tarefas de download (pedidos concorrentes no mesmo
+    // canal; `&sftp` continua valendo nos comandos abaixo).
+    let sftp = Arc::new(
+        SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|e| anyhow::anyhow!("nao foi possivel iniciar o SFTP: {e}"))?,
+    );
 
     // Base de usuarios/grupos do servidor (para traduzir uid/gid <-> nome).
     // Lida uma vez de /etc/passwd e /etc/group; se indisponivel, usa numeros.
@@ -230,155 +295,224 @@ where
     let _ = from_sftp.send(SftpToUi::Connected { home: home.clone() });
     repaint();
 
-    while let Some(cmd) = to_sftp_rx.recv().await {
-        match cmd {
-            UiToSftp::ListDir(path) => {
-                send_listing(&sftp, from_sftp, &path, &uid_to_name, &gid_to_name).await;
+    // Downloads: cada lote roda numa tarefa propria (nunca dentro deste loop,
+    // que continua atendendo a navegacao) e reporta por `dl_rx`, repassado a
+    // UI aqui (mesmo padrao dos envios em `ssh::run_session`).
+    let mut downloads: JoinSet<()> = JoinSet::new();
+    let (dl_tx, mut dl_rx) = tokio::sync::mpsc::unbounded_channel::<DownloadEvent>();
+
+    loop {
+        let cmd = tokio::select! {
+            Some(ev) = dl_rx.recv() => {
+                let _ = from_sftp.send(SftpToUi::Download(ev));
                 repaint();
+                continue;
             }
-            UiToSftp::Upload { local, remote_dir } => {
-                match upload_file(&sftp, &local, &remote_dir).await {
-                    Ok(()) => {
-                        // Recarrega o diretorio para o arquivo recem-enviado aparecer.
-                        send_listing(&sftp, from_sftp, &remote_dir, &uid_to_name, &gid_to_name)
-                            .await;
-                    }
-                    Err(e) => {
-                        let nome = local
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let _ = from_sftp.send(SftpToUi::Error(format!(
-                            "falha ao enviar {nome}: {e}"
-                        )));
-                    }
-                }
-                repaint();
-            }
-            UiToSftp::Rename {
-                from,
-                to,
-                refresh_dir,
+            // Recolhe tarefas terminadas (o JoinSet as guarda ate serem lidas).
+            Some(_) = downloads.join_next(), if !downloads.is_empty() => continue,
+            cmd = to_sftp_rx.recv() => match cmd {
+                Some(cmd) => cmd,
+                None => break,
+            },
+        };
+        let cmd = match cmd {
+            UiToSftp::Download {
+                id,
+                dest,
+                items,
+                cancel,
             } => {
-                match sftp.rename(from, to).await {
-                    Ok(()) => {
-                        send_listing(&sftp, from_sftp, &refresh_dir, &uid_to_name, &gid_to_name)
-                            .await
-                    }
-                    Err(e) => {
-                        let _ = from_sftp.send(SftpToUi::Error(format!("falha ao renomear: {e}")));
-                    }
-                }
-                repaint();
-            }
-            UiToSftp::Chmod {
-                path,
-                mode,
-                refresh_dir,
-            } => {
-                let attrs = russh_sftp::protocol::FileAttributes {
-                    size: None,
-                    uid: None,
-                    user: None,
-                    gid: None,
-                    group: None,
-                    permissions: Some(mode),
-                    atime: None,
-                    mtime: None,
-                };
-                match sftp.set_metadata(path, attrs).await {
-                    Ok(()) => {
-                        send_listing(&sftp, from_sftp, &refresh_dir, &uid_to_name, &gid_to_name)
-                            .await
-                    }
-                    Err(e) => {
-                        let _ = from_sftp
-                            .send(SftpToUi::Error(format!("falha ao alterar permissoes: {e}")));
-                    }
-                }
-                repaint();
-            }
-            UiToSftp::Chown {
-                path,
-                owner,
-                group,
-                refresh_dir,
-            } => {
-                // Resolve nome -> id (ou aceita id numerico direto).
-                let uid = resolve_id(&owner, &name_to_uid);
-                let gid = resolve_id(&group, &name_to_gid);
-                match (uid, gid) {
-                    (Some(uid), Some(gid)) => {
-                        let attrs = russh_sftp::protocol::FileAttributes {
-                            size: None,
-                            uid: Some(uid),
-                            user: None,
-                            gid: Some(gid),
-                            group: None,
-                            permissions: None,
-                            atime: None,
-                            mtime: None,
-                        };
-                        match sftp.set_metadata(path, attrs).await {
-                            Ok(()) => {
-                                send_listing(
-                                    &sftp,
-                                    from_sftp,
-                                    &refresh_dir,
-                                    &uid_to_name,
-                                    &gid_to_name,
-                                )
-                                .await
-                            }
-                            Err(e) => {
-                                let _ = from_sftp.send(SftpToUi::Error(format!(
-                                    "falha ao alterar proprietario/grupo: {e}"
-                                )));
-                            }
-                        }
-                    }
-                    _ => {
-                        let mut faltando = Vec::new();
-                        if uid.is_none() {
-                            faltando.push(format!("usuario \"{owner}\""));
-                        }
-                        if gid.is_none() {
-                            faltando.push(format!("grupo \"{group}\""));
-                        }
-                        let _ = from_sftp.send(SftpToUi::Error(format!(
-                            "nao foi possivel resolver {}",
-                            faltando.join(" e ")
-                        )));
-                    }
-                }
-                repaint();
-            }
-            UiToSftp::Remove {
-                path,
-                is_dir,
-                refresh_dir,
-            } => {
-                let res = if is_dir {
-                    sftp.remove_dir(path).await
-                } else {
-                    sftp.remove_file(path).await
-                };
-                match res {
-                    Ok(()) => {
-                        send_listing(&sftp, from_sftp, &refresh_dir, &uid_to_name, &gid_to_name)
-                            .await
-                    }
-                    Err(e) => {
-                        let _ = from_sftp.send(SftpToUi::Error(format!("falha ao excluir: {e}")));
-                    }
-                }
-                repaint();
+                let (sftp, tx) = (Arc::clone(&sftp), dl_tx.clone());
+                downloads.spawn(download::run(sftp, id, dest, items, cancel, tx));
+                continue;
             }
             UiToSftp::Disconnect => break,
-        }
+            cmd => cmd,
+        };
+        // Os demais comandos esperam o servidor (um envio grande leva
+        // minutos); enquanto isso, o andamento dos downloads segue para a UI.
+        let work = async {
+            match cmd {
+                UiToSftp::ListDir(path) => {
+                    send_listing(&sftp, from_sftp, &path, &uid_to_name, &gid_to_name).await;
+                    repaint();
+                }
+                UiToSftp::Upload { local, remote_dir } => {
+                    match upload_file(&sftp, &local, &remote_dir).await {
+                        Ok(()) => {
+                            // Recarrega o diretorio para o arquivo recem-enviado aparecer.
+                            send_listing(&sftp, from_sftp, &remote_dir, &uid_to_name, &gid_to_name)
+                                .await;
+                        }
+                        Err(e) => {
+                            let nome = local
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let _ = from_sftp
+                                .send(SftpToUi::Error(format!("falha ao enviar {nome}: {e}")));
+                        }
+                    }
+                    repaint();
+                }
+                UiToSftp::Rename {
+                    from,
+                    to,
+                    refresh_dir,
+                } => {
+                    match sftp.rename(from, to).await {
+                        Ok(()) => {
+                            send_listing(&sftp, from_sftp, &refresh_dir, &uid_to_name, &gid_to_name)
+                                .await
+                        }
+                        Err(e) => {
+                            let _ =
+                                from_sftp.send(SftpToUi::Error(format!("falha ao renomear: {e}")));
+                        }
+                    }
+                    repaint();
+                }
+                UiToSftp::Chmod {
+                    path,
+                    mode,
+                    refresh_dir,
+                } => {
+                    let attrs = russh_sftp::protocol::FileAttributes {
+                        size: None,
+                        uid: None,
+                        user: None,
+                        gid: None,
+                        group: None,
+                        permissions: Some(mode),
+                        atime: None,
+                        mtime: None,
+                    };
+                    match sftp.set_metadata(path, attrs).await {
+                        Ok(()) => {
+                            send_listing(&sftp, from_sftp, &refresh_dir, &uid_to_name, &gid_to_name)
+                                .await
+                        }
+                        Err(e) => {
+                            let _ = from_sftp
+                                .send(SftpToUi::Error(format!("falha ao alterar permissoes: {e}")));
+                        }
+                    }
+                    repaint();
+                }
+                UiToSftp::Chown {
+                    path,
+                    owner,
+                    group,
+                    refresh_dir,
+                } => {
+                    // Resolve nome -> id (ou aceita id numerico direto).
+                    let uid = resolve_id(&owner, &name_to_uid);
+                    let gid = resolve_id(&group, &name_to_gid);
+                    match (uid, gid) {
+                        (Some(uid), Some(gid)) => {
+                            let attrs = russh_sftp::protocol::FileAttributes {
+                                size: None,
+                                uid: Some(uid),
+                                user: None,
+                                gid: Some(gid),
+                                group: None,
+                                permissions: None,
+                                atime: None,
+                                mtime: None,
+                            };
+                            match sftp.set_metadata(path, attrs).await {
+                                Ok(()) => {
+                                    send_listing(
+                                        &sftp,
+                                        from_sftp,
+                                        &refresh_dir,
+                                        &uid_to_name,
+                                        &gid_to_name,
+                                    )
+                                    .await
+                                }
+                                Err(e) => {
+                                    let _ = from_sftp.send(SftpToUi::Error(format!(
+                                        "falha ao alterar proprietario/grupo: {e}"
+                                    )));
+                                }
+                            }
+                        }
+                        _ => {
+                            let mut faltando = Vec::new();
+                            if uid.is_none() {
+                                faltando.push(format!("usuario \"{owner}\""));
+                            }
+                            if gid.is_none() {
+                                faltando.push(format!("grupo \"{group}\""));
+                            }
+                            let _ = from_sftp.send(SftpToUi::Error(format!(
+                                "nao foi possivel resolver {}",
+                                faltando.join(" e ")
+                            )));
+                        }
+                    }
+                    repaint();
+                }
+                UiToSftp::Remove {
+                    path,
+                    is_dir,
+                    refresh_dir,
+                } => {
+                    let res = if is_dir {
+                        sftp.remove_dir(path).await
+                    } else {
+                        sftp.remove_file(path).await
+                    };
+                    match res {
+                        Ok(()) => {
+                            send_listing(&sftp, from_sftp, &refresh_dir, &uid_to_name, &gid_to_name)
+                                .await
+                        }
+                        Err(e) => {
+                            let _ =
+                                from_sftp.send(SftpToUi::Error(format!("falha ao excluir: {e}")));
+                        }
+                    }
+                    repaint();
+                }
+                UiToSftp::Download { .. } | UiToSftp::Disconnect => {}
+            }
+        };
+        forward_downloads(work, &mut dl_rx, from_sftp, repaint).await;
     }
 
+    // Entrega o que ja estava na fila (ex.: um download que terminou junto) e
+    // aborta os que estao em andamento: as tarefas sao soltas e os guards
+    // apagam os temporarios (a UI avisa o usuario).
+    while let Ok(ev) = dl_rx.try_recv() {
+        let _ = from_sftp.send(SftpToUi::Download(ev));
+    }
+    repaint();
+    downloads.abort_all();
+
     Ok(())
+}
+
+/// Espera `work` repassando a UI, enquanto isso, os eventos dos downloads:
+/// sem isso o rodape do download congelaria durante um envio grande.
+async fn forward_downloads<F: Fn()>(
+    work: impl std::future::Future<Output = ()>,
+    dl_rx: &mut UnboundedReceiver<DownloadEvent>,
+    from_sftp: &std::sync::mpsc::Sender<SftpToUi>,
+    repaint: &F,
+) {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut work => return,
+            Some(ev) = dl_rx.recv() => {
+                let _ = from_sftp.send(SftpToUi::Download(ev));
+                repaint();
+            }
+        }
+    }
 }
 
 /// Le um arquivo local e o grava no diretorio remoto (sobrescrevendo).
@@ -511,4 +645,44 @@ fn resolve_id(text: &str, name_to_id: &HashMap<String, u32>) -> Option<u32> {
         return Some(n);
     }
     name_to_id.get(t).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn download_events_reach_ui_during_long_commands() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (dl_tx, mut dl_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (from_tx, from_rx) = std::sync::mpsc::channel();
+            // Comando longo (ex.: envio grande) que so termina depois de a UI
+            // ver o andamento do download que corre em paralelo.
+            let work = async {
+                dl_tx
+                    .send(DownloadEvent::Scanning { id: 1, found: 5 })
+                    .unwrap();
+                loop {
+                    if let Ok(SftpToUi::Download(DownloadEvent::Scanning { found, .. })) =
+                        from_rx.try_recv()
+                    {
+                        assert_eq!(found, 5);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            };
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                forward_downloads(work, &mut dl_rx, &from_tx, &|| {}),
+            )
+            .await
+            .expect("o andamento ficou preso ate o fim do comando");
+        });
+    }
 }

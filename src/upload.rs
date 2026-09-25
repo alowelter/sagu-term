@@ -620,6 +620,7 @@ mod tests {
     #[test]
     #[ignore]
     fn e2e_drop_on_real_sshd() {
+        use crate::hostkey::HostKeyAnswer;
         use crate::ssh::{self, SshToUi};
         use crate::vault::{AuthMethod, Host};
         use std::time::Instant;
@@ -643,6 +644,14 @@ mod tests {
             let t0 = Instant::now();
             while t0.elapsed() < Duration::from_secs(20) {
                 if let Ok(ev) = h.from_ssh.recv_timeout(Duration::from_millis(200)) {
+                    // sshd descartavel de teste: confia na chave (TOFU).
+                    let ev = match ev {
+                        SshToUi::HostKey(p) => {
+                            let _ = p.reply.send(HostKeyAnswer::Accept);
+                            continue;
+                        }
+                        ev => ev,
+                    };
                     if let SshToUi::Error(e) = &ev {
                         panic!("erro da sessao esperando {what}: {e}");
                     }
@@ -799,6 +808,7 @@ mod tests {
     #[test]
     #[ignore]
     fn e2e_login_tmux_asks() {
+        use crate::hostkey::HostKeyAnswer;
         use crate::ssh::{self, SshToUi};
         use crate::vault::{AuthMethod, Host};
         use std::time::Instant;
@@ -820,6 +830,10 @@ mod tests {
         while t0.elapsed() < Duration::from_secs(25) && plan.is_none() {
             if let Ok(ev) = h.from_ssh.recv_timeout(Duration::from_millis(200)) {
                 match ev {
+                    // sshd descartavel de teste: confia na chave (TOFU).
+                    SshToUi::HostKey(p) => {
+                        let _ = p.reply.send(HostKeyAnswer::Accept);
+                    }
                     SshToUi::Connected => connected = true,
                     SshToUi::Upload(UploadEvent::Plan(p)) => plan = Some(p),
                     SshToUi::Upload(other) => panic!("esperava pergunta: {other:?}"),
