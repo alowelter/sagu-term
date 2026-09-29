@@ -4,6 +4,7 @@
 mod app;
 mod download;
 mod hostkey;
+mod instance;
 mod pty;
 mod sftp;
 mod ssh;
@@ -26,6 +27,13 @@ fn load_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    // Ja aberto: traz a janela existente para a frente e sai sem abrir outra.
+    let _instancia = match instance::start() {
+        instance::Start::Activated => return Ok(()),
+        instance::Start::Primary(slot) => Some(slot),
+        instance::Start::Unchecked => None,
+    };
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1000.0, 680.0])
         .with_min_inner_size([640.0, 420.0])

@@ -112,6 +112,9 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
 - Na tela de conexões, `Ctrl+L` **bloqueia o cofre** na hora.
 - O cofre é salvo de forma atômica, então uma queda de energia no meio da gravação não
   corrompe o arquivo.
+- **Uma janela só:** abrir o SaguTerm com ele já aberto (atalho de teclado, menu Iniciar,
+  barra de tarefas) traz a janela existente para a frente, restaurando se estiver
+  minimizada. Assim duas janelas nunca gravam o mesmo cofre, uma por cima da outra.
 
 <a id="comecar"></a>
 

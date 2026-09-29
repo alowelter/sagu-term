@@ -149,8 +149,14 @@ Leve e rápido: escrito em Rust do começo ao fim, incluindo o SSH (sem OpenSSL)
 
 ### What's new in this version (Novidades desta versão)
 
+Limite: 1500 caracteres. Texto da 1.0.1:
+
+```text
+Abrir o SaguTerm com ele já aberto (atalho de teclado, menu Iniciar ou barra de tarefas) agora traz a janela existente para a frente, restaurando se estiver minimizada, em vez de abrir outra. Assim duas janelas nunca gravam o mesmo cofre, uma por cima da outra.
+```
+
 A Microsoft orienta **deixar este campo em branco na primeira submissão**. O texto abaixo
-fica só de referência para a 1.0.0. Limite: 1500 caracteres.
+ficou só de referência para a 1.0.0:
 
 ```text
 Primeira versão na Microsoft Store. Terminal SSH, navegador SFTP com envio de arquivos por arrastar e soltar, terminal local (Prompt de Comando e WSL), painéis divididos e cofre criptografado. Novo nesta versão: download de arquivos e pastas pelo SFTP (Ctrl+S), com andamento, cancelamento e aviso antes de substituir; e verificação da chave do servidor, com confirmação na primeira conexão, chave guardada no cofre e alerta se ela mudar. As atualizações chegam pela própria Store.
@@ -278,35 +284,23 @@ interface) é opcional e pode ficar para depois.
 Em **Submission options > Restricted capabilities** (Opções de envio > Capacidades
 restritas), o Partner Center pede uma justificativa para a `runFullTrust`, que todo app
 Win32 empacotado precisa declarar. Os testadores da Microsoft leem em inglês, então cole
-este texto:
+este texto. O campo é curto: uma versão de 1.365 caracteres não coube, e esta tem 475. Os
+detalhes estão nas [Notas para a certificação](#notas-para-a-certificação).
 
 ```text
-SaguTerm is a classic Win32 desktop application (written in Rust, with an egui/eframe user interface) packaged as MSIX with the Windows.FullTrustApplication entry point. It is not a UWP app and cannot run inside an AppContainer, so the package needs runFullTrust to launch its full-trust executable (SaguTerm.exe). Full trust is used only for the app's core features as an SSH/SFTP client and terminal:
-1. Outbound TCP connections to the SSH/SFTP servers that the user registers (any host name or IP address, any port).
-2. Local terminal panes through the Windows pseudo console (ConPTY), launching cmd.exe and, when installed, wsl.exe.
-3. Reading files that the user drags from File Explorer or picks in the standard file dialog (to upload them via SFTP or to import an SSH private key), and reading and writing the user's encrypted vault file (*.sagu) at a location the user chooses.
-4. Writing files that the user downloads via SFTP into a folder the user picks in the standard folder dialog, and opening that folder in File Explorer (explorer.exe) when the user asks.
-The app does not install services or drivers, does not run elevated, does not change system settings, and collects no telemetry. It has no self-updater (updates come only from the Microsoft Store) and opens no network connections of its own: it only connects to the servers the user registers.
+SaguTerm is a classic Win32 desktop app (Rust, egui) packaged as MSIX with the Windows.FullTrustApplication entry point; it cannot run in an AppContainer. Full trust is used only for its core SSH/SFTP client features: outbound TCP connections to servers the user registers, local terminal panes via ConPTY (cmd.exe, wsl.exe), and reading/writing files the user picks (uploads, downloads, SSH keys, encrypted vault). No services, drivers, elevation, telemetry or self-updater.
 ```
 
 <details>
 <summary>Tradução (só para você conferir; não cole)</summary>
 
-O SaguTerm é um app desktop Win32 clássico (em Rust, com interface egui/eframe),
-empacotado como MSIX com o ponto de entrada Windows.FullTrustApplication. Ele não é um app
-UWP e não roda dentro de um AppContainer, por isso o pacote precisa da runFullTrust para
-abrir o executável (SaguTerm.exe). A confiança total é usada só para as funções principais
-do app: (1) conexões TCP de saída para os servidores SSH/SFTP que o usuário cadastra, com
-qualquer nome, IP e porta; (2) terminais locais pelo pseudoconsole do Windows (ConPTY),
-abrindo o cmd.exe e, se instalado, o wsl.exe; (3) leitura dos arquivos que o usuário
-arrasta ou escolhe no diálogo (para enviar por SFTP ou importar uma chave privada), e
-leitura e gravação do cofre criptografado no local escolhido pelo usuário; (4) gravação
-dos arquivos baixados por SFTP na pasta que o usuário escolhe no diálogo de pastas, e
-abertura dessa pasta no Explorador de Arquivos (explorer.exe) quando o usuário pede. O
-app não instala serviços nem drivers, não roda como administrador, não altera
-configurações do sistema e não tem telemetria. Ele não tem atualizador próprio (as
-atualizações vêm só da Microsoft Store) e não abre conexões de rede por conta própria: só
-se conecta aos servidores que o usuário cadastra.
+O SaguTerm é um app desktop Win32 clássico (Rust, egui), empacotado como MSIX com o ponto
+de entrada Windows.FullTrustApplication; ele não roda dentro de um AppContainer. A
+confiança total é usada só para as funções principais de cliente SSH/SFTP: conexões TCP de
+saída para os servidores que o usuário cadastra, terminais locais pelo ConPTY (cmd.exe,
+wsl.exe) e leitura e gravação dos arquivos que o usuário escolhe (envios, downloads, chaves
+SSH, cofre criptografado). Sem serviços, drivers, execução como administrador, telemetria
+nem atualizador próprio.
 
 </details>
 
