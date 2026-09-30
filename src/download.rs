@@ -28,54 +28,54 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch;
 
 /// Niveis de pasta abaixo de cada item escolhido (barra ciclos de bind mount).
-const MAX_DEPTH: usize = 64;
+pub(crate) const MAX_DEPTH: usize = 64;
 /// Entradas vistas na varredura antes de desistir (arvores enormes ou sem
 /// fim). Conta entrada por entrada, depois que a listagem de cada pasta chega
 /// (o russh-sftp so a devolve inteira); a memoria e barrada por `MAX_SCAN_BYTES`.
-const MAX_ENTRIES: usize = 200_000;
+pub(crate) const MAX_ENTRIES: usize = 200_000;
 /// Teto da memoria que a varredura guarda (plano, pastas por listar e listas
 /// do relatorio), somada por `text_cost`. Cada entrada guarda caminhos
 /// inteiros: sem isso, um servidor hostil com nomes longos em pastas fundas
 /// faria poucos MB de listagem virarem GB na memoria.
-const MAX_SCAN_BYTES: usize = 512 * 1024 * 1024;
+pub(crate) const MAX_SCAN_BYTES: usize = 512 * 1024 * 1024;
 /// Maior nome remoto aceito, em bytes: o Linux limita a 255 e o OpenSSH no
 /// Windows fica abaixo de 765. Nome maior e ignorado sem entrar em caminhos.
-const MAX_REMOTE_NAME: usize = 1024;
+pub(crate) const MAX_REMOTE_NAME: usize = 1024;
 /// Maior trecho de uma mensagem de erro vinda do servidor.
-const MAX_REMOTE_MSG: usize = 300;
+pub(crate) const MAX_REMOTE_MSG: usize = 300;
 /// Bloco pedido por leitura (o OpenSSH devolve no maximo 64 KiB por vez).
-const CHUNK: usize = 256 * 1024;
+pub(crate) const CHUNK: usize = 256 * 1024;
 /// Intervalo minimo entre eventos de andamento (nao inunda a UI).
-const PROGRESS_EVERY: Duration = Duration::from_millis(100);
+pub(crate) const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 /// Sufixo dos temporarios: `.<nome>.<hex8>.sagu-part` na pasta final.
-const TEMP_SUFFIX: &str = ".sagu-part";
+pub(crate) const TEMP_SUFFIX: &str = ".sagu-part";
 /// Tempo da sonda que separa o erro de um arquivo de uma conexao perdida.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Tamanho maximo de um nome no Windows (unidades UTF-16).
 const MAX_NAME: usize = 255;
 
 // Motivos por item (textos para o usuario).
-const R_BAD_ENCODING: &str = "nome com codificação não suportada";
-const R_INVALID: &str = "nome inválido enviado pelo servidor";
+pub(crate) const R_BAD_ENCODING: &str = "nome com codificação não suportada";
+pub(crate) const R_INVALID: &str = "nome inválido enviado pelo servidor";
 const R_DIR_LINK: &str = "link simbólico para pasta (não seguido)";
 const R_BROKEN_LINK: &str = "link simbólico quebrado";
-const R_SPECIAL: &str = "arquivo especial (dispositivo, fifo ou socket)";
-const R_TOO_DEEP: &str = "pasta profunda demais (mais de 64 níveis)";
-const R_EXISTS: &str = "já existe no destino; nada foi substituído";
-const R_DIR_EXISTS: &str = "já existe uma pasta com esse nome";
-const R_FILE_EXISTS: &str = "já existe um arquivo com esse nome";
+pub(crate) const R_SPECIAL: &str = "arquivo especial (dispositivo, fifo ou socket)";
+pub(crate) const R_TOO_DEEP: &str = "pasta profunda demais (mais de 64 níveis)";
+pub(crate) const R_EXISTS: &str = "já existe no destino; nada foi substituído";
+pub(crate) const R_DIR_EXISTS: &str = "já existe uma pasta com esse nome";
+pub(crate) const R_FILE_EXISTS: &str = "já existe um arquivo com esse nome";
 const R_DIR_IS_LINK: &str = "o destino é um atalho de pasta (link ou junção); nada foi alterado";
 const R_TARGET_IS_LINK: &str = "o destino é um link; nada foi substituído";
 const R_IN_USE: &str = "o arquivo existente está somente leitura ou em uso";
 const R_APPEARED: &str = "apareceu no destino durante o download; nada foi substituído";
-const R_SKIPPED_EXISTING: &str = "já existia no destino (pulado)";
-const R_NO_TEMP: &str = "não foi possível criar o arquivo temporário";
-const R_TOO_LONG: &str = "nome longo demais enviado pelo servidor";
+pub(crate) const R_SKIPPED_EXISTING: &str = "já existia no destino (pulado)";
+pub(crate) const R_NO_TEMP: &str = "não foi possível criar o arquivo temporário";
+pub(crate) const R_TOO_LONG: &str = "nome longo demais enviado pelo servidor";
 
 // Motivos que interrompem o lote inteiro.
 const F_DISK_FULL: &str = "disco cheio";
-const F_DEST_GONE: &str = "a pasta de destino não está mais acessível";
-const F_CONNECTION: &str = "conexão com o servidor perdida";
+pub(crate) const F_DEST_GONE: &str = "a pasta de destino não está mais acessível";
+pub(crate) const F_CONNECTION: &str = "conexão com o servidor perdida";
 const F_TOO_MANY: &str = "a seleção tem mais de 200.000 itens; baixe partes menores";
 const F_TOO_BIG: &str = "a seleção é grande demais; baixe partes menores";
 const F_INTERNAL: &str = "erro interno no download";
@@ -184,11 +184,99 @@ pub struct DownloadReport {
 
 /// Caractere de direcao de texto: disfarcaria a extensao ("foto\u{202E}gpj.exe"
 /// aparece como "fotoexe.jpg").
-fn is_bidi(c: char) -> bool {
+pub(crate) fn is_bidi(c: char) -> bool {
     matches!(
         c,
-        '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
     )
+}
+
+/// Caractere invisivel (largura zero, preenchimento, tags): dois nomes
+/// iguais na tela poderiam ser diferentes.
+pub(crate) fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{17B4}'
+            | '\u{17B5}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200D}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{206A}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// Forma visivel (so ASCII, que a fonte cobre) de um caractere que nao pode
+/// aparecer cru na tela: controles C0 em notacao de circunflexo ("^[", TAB
+/// e "^I"), DEL "^?", C1, bidi e invisiveis como "<U+202E>". `None` para os
+/// demais.
+pub(crate) fn char_notation(c: char) -> Option<String> {
+    let n = c as u32;
+    if n < 0x20 {
+        return Some(format!("^{}", char::from(n as u8 + 0x40)));
+    }
+    if n == 0x7F {
+        return Some("^?".into());
+    }
+    if (0x80..=0x9F).contains(&n) || is_bidi(c) || is_invisible(c) {
+        return Some(format!("<U+{n:04X}>"));
+    }
+    None
+}
+
+/// Texto vindo do servidor pronto para a tela: controles, bidi e invisiveis
+/// em forma visivel (`char_notation`), no maximo `max` caracteres exibidos
+/// (com "…" se cortou).
+pub(crate) fn safe_text(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for c in s.chars() {
+        match char_notation(c) {
+            Some(n) => {
+                out.push_str(&n);
+                shown += n.chars().count();
+            }
+            None => {
+                out.push(c);
+                shown += 1;
+            }
+        }
+        // Um pouco alem do corte basta para o clip decidir o "…".
+        if shown > max {
+            break;
+        }
+    }
+    clip(&out, max)
+}
+
+/// Chave de comparacao de nomes remotos: minusculas e sem acentos. Usada na
+/// ordem da listagem e na busca por letras, para as duas concordarem
+/// ("Ábaco" fica junto de "abacate", e "a" repetido passa por ambos).
+pub(crate) fn fold_name(s: &str) -> String {
+    s.chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| match c {
+            'á' | 'à' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+            'ç' => 'c',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ñ' => 'n',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ý' | 'ÿ' => 'y',
+            c => c,
+        })
+        .collect()
 }
 
 /// Caractere que nao pode ficar num nome local: controles (C0, DEL, C1), os
@@ -581,7 +669,7 @@ fn is_disk_full(e: &io::Error) -> bool {
 
 /// Memoria aproximada de um texto guardado: conteudo, cabecalho da `String` e
 /// o que o alocador gasta por bloco.
-fn text_cost(s: &str) -> usize {
+pub(crate) fn text_cost(s: &str) -> usize {
     s.len() + std::mem::size_of::<String>() + 16
 }
 
@@ -591,7 +679,7 @@ fn rel_cost(rel: &[String]) -> usize {
 }
 
 /// No maximo `max` caracteres de `s` (texto vindo do servidor), com "…" se cortou.
-fn clip(s: &str, max: usize) -> String {
+pub(crate) fn clip(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((i, _)) => format!("{}\u{2026}", &s[..i]),
         None => s.to_string(),
@@ -600,7 +688,8 @@ fn clip(s: &str, max: usize) -> String {
 
 /// Espera `fut`, a menos que o usuario cancele antes ou o painel feche
 /// (remetente solto): `None`. Vale com um pedido em voo, que e abandonado.
-async fn unless_cancelled<T>(
+/// Tambem usada pelo visualizador (ver `viewer::load`).
+pub(crate) async fn unless_cancelled<T>(
     cancel: &mut watch::Receiver<bool>,
     fut: impl std::future::Future<Output = T>,
 ) -> Option<T> {
@@ -1292,7 +1381,7 @@ impl Job<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1858,6 +1947,34 @@ mod tests {
         assert_eq!(clip(&long, MAX_REMOTE_MSG).chars().count(), MAX_REMOTE_MSG + 1);
     }
 
+    /// Nada de controle, bidi ou invisivel chega cru a tela.
+    #[test]
+    fn safe_text_neutralizes_controls_bidi_invisibles() {
+        assert_eq!(safe_text("a\u{1b}[31mb", 50), "a^[[31mb");
+        assert_eq!(safe_text("x\u{7f}y", 50), "x^?y");
+        assert_eq!(safe_text("\u{0}\t\n\u{1f}", 50), "^@^I^J^_");
+        assert_eq!(safe_text("n\u{85}l", 50), "n<U+0085>l");
+        assert_eq!(safe_text("foto\u{202E}gpj.exe", 50), "foto<U+202E>gpj.exe");
+        assert!(is_bidi('\u{061C}'));
+        assert_eq!(safe_text("a\u{061C}b", 50), "a<U+061C>b");
+        assert_eq!(safe_text("a\u{200B}b\u{FEFF}", 50), "a<U+200B>b<U+FEFF>");
+        assert_eq!(safe_text("tag\u{E0041}", 50), "tag<U+E0041>");
+        // Texto comum (acentos, U+FFFD) fica igual.
+        assert_eq!(safe_text("ação \u{FFFD}.txt", 50), "ação \u{FFFD}.txt");
+        // Corte pelos caracteres exibidos, com "…".
+        assert_eq!(safe_text("abcdef", 4), "abcd\u{2026}");
+        assert_eq!(safe_text("abcd", 4), "abcd");
+        assert_eq!(safe_text("\u{1b}\u{1b}\u{1b}", 4), "^[^[\u{2026}");
+        let long = "\u{202E}".repeat(10_000);
+        assert_eq!(safe_text(&long, 200).chars().count(), 201);
+        for c in ['\u{0}', '\u{9}', '\u{a}', '\u{1b}', '\u{7f}', '\u{9b}', '\u{202e}', '\u{2066}', '\u{200d}'] {
+            let n = char_notation(c).unwrap();
+            assert!(n.is_ascii(), "{n:?}");
+        }
+        assert_eq!(char_notation('a'), None);
+        assert_eq!(char_notation('ç'), None);
+    }
+
     // --- Ponta a ponta contra um sshd real (ignorados) ---------------------
     //
     // Mesmas variaveis dos testes de `upload` e `hostkey`: SAGU_E2E_PORT (o
@@ -1875,7 +1992,7 @@ mod tests {
         std::env::var(k).unwrap_or_else(|_| panic!("defina {k}"))
     }
 
-    fn e2e_host() -> Host {
+    pub(crate) fn e2e_host() -> Host {
         let mut host = Host::new();
         host.host = "127.0.0.1".into();
         host.port = env("SAGU_E2E_PORT").parse().expect("SAGU_E2E_PORT invalida");
@@ -1888,7 +2005,7 @@ mod tests {
     }
 
     /// Roda `script` no servidor com `sh -s` (script no stdin) e exige saida 0.
-    fn remote_sh(host: &Host, script: &str) -> Result<(), String> {
+    pub(crate) fn remote_sh(host: &Host, script: &str) -> Result<(), String> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1896,7 +2013,7 @@ mod tests {
         rt.block_on(async {
             let err = |e: &dyn std::fmt::Display| e.to_string();
             // sshd descartavel de teste: confia na chave (TOFU).
-            let session = crate::ssh::connect_and_auth(host, |p| {
+            let (session, _) = crate::ssh::connect_and_auth(host, |p| {
                 let _ = p.reply.send(HostKeyAnswer::Accept);
             })
             .await
@@ -1977,8 +2094,8 @@ head -c 67108864 /dev/zero > "$R/grande.bin"
     }
 
     /// Sessao SFTP pelo caminho normal do app (aceitando a chave do servidor).
-    fn sftp_session(host: &Host) -> SftpHandle {
-        let h = sftp::connect(host.clone(), || {});
+    pub(crate) fn sftp_session(host: &Host) -> SftpHandle {
+        let h = sftp::connect(host.clone(), false, || {});
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(20) {
             match h.from_sftp.recv_timeout(Duration::from_millis(200)) {
@@ -1994,7 +2111,7 @@ head -c 67108864 /dev/zero > "$R/grande.bin"
         panic!("SFTP nao conectou");
     }
 
-    fn close(h: SftpHandle) {
+    pub(crate) fn close(h: SftpHandle) {
         h.disconnect();
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(10) {

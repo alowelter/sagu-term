@@ -6,7 +6,8 @@
 //! - `SshToUi`: a sessao envia status e bytes recebidos do servidor.
 //!
 //! Arquivos soltos sobre o terminal sao enviados por tarefas paralelas na
-//! mesma conexao (ver [`crate::upload`]).
+//! mesma conexao (ver [`crate::upload`]); o sistema do servidor e detectado
+//! do mesmo jeito, em segundo plano (ver [`crate::osinfo`]).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 use crate::hostkey::{self, HostKeyAnswer, HostKeyPrompt, KeyCheck};
+use crate::osinfo::{self, Banner, OsProbe, OsReport};
 use crate::upload::{self, UploadEvent};
 use crate::vault::{AuthMethod, Host};
 
@@ -34,6 +36,8 @@ pub enum SshToUi {
     /// Chave do servidor nova ou diferente da guardada: a UI pergunta ao usuario
     /// e responde pelo `reply` do prompt (descartar = cancelar).
     HostKey(HostKeyPrompt),
+    /// SO do servidor detectado em segundo plano (ver osinfo); nunca vem da saida do terminal.
+    Os(OsReport),
 }
 
 /// Mensagens da UI para a sessao SSH.
@@ -60,10 +64,12 @@ pub enum UiToSsh {
 /// vivo durante a pergunta (esperar dentro deste metodo o congela: uma queda do
 /// servidor so seria notada depois da resposta). Compartilhado com o SFTP.
 ///
-/// O campo privado garante que so este modulo cria o handler: toda conexao
+/// Os campos privados garantem que so este modulo cria o handler: toda conexao
 /// passa por `connect_and_auth` e, portanto, pela verificacao da chave.
 pub(crate) struct Client {
     server_key: Option<oneshot::Sender<PublicKey>>,
+    /// Decisao sobre a sonda do SO, pela identificacao do servidor.
+    banner: Option<oneshot::Sender<Banner>>,
 }
 
 impl client::Handler for Client {
@@ -76,6 +82,21 @@ impl client::Handler for Client {
         }
         Ok(true)
     }
+
+    async fn kex_done(
+        &mut self,
+        _shared_secret: Option<&[u8]>,
+        _names: &russh::Names,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        // Troca inicial: vem antes de check_server_key; renegociacoes caem no
+        // take(). So a decisao sobre a sonda sai daqui; o segredo da troca e a
+        // identificacao do servidor nao sao guardados.
+        if let Some(tx) = self.banner.take() {
+            let _ = tx.send(osinfo::banner(session.remote_sshid()));
+        }
+        Ok(())
+    }
 }
 
 /// Conecta e autentica uma sessao russh com os dados do host. Unico ponto de
@@ -85,6 +106,9 @@ impl client::Handler for Client {
 /// `ask` entrega a UI a pergunta sobre uma chave de servidor nova ou diferente
 /// da guardada em `host.host_key` (no maximo uma vez por conexao).
 ///
+/// Devolve tambem o `Banner`: o que a identificacao do servidor diz sobre a
+/// sonda do SO (ver `osinfo`), que so pode rodar depois da autenticacao.
+///
 /// INVARIANTE DE SEGURANCA: ate `verify_host_key` aceitar a chave, so trafegam
 /// a troca de chaves e o pedido do servico de autenticacao (sem segredo algum).
 /// Nenhum `authenticate_*`, `best_supported_rsa_hash` ou abertura de canal pode
@@ -92,7 +116,7 @@ impl client::Handler for Client {
 pub(crate) async fn connect_and_auth(
     host: &Host,
     ask: impl Fn(HostKeyPrompt),
-) -> anyhow::Result<client::Handle<Client>> {
+) -> anyhow::Result<(client::Handle<Client>, Banner)> {
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
         keepalive_interval: Some(Duration::from_secs(30)),
@@ -101,12 +125,19 @@ pub(crate) async fn connect_and_auth(
     });
 
     let (key_tx, mut key_rx) = oneshot::channel();
+    let (banner_tx, mut banner_rx) = oneshot::channel();
     let handler = Client {
         server_key: Some(key_tx),
+        banner: Some(banner_tx),
     };
     let mut session = client::connect(config, (host.host.as_str(), host.port), handler)
         .await
-        .map_err(|e| anyhow::anyhow!("nao foi possivel conectar: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("não foi possível conectar: {e}"))?;
+    // O kex_done vem antes do fim do `connect` (como o check_server_key). Se
+    // um dia nao vier, a sonda nao roda: na duvida, nenhum comando extra (e
+    // os e2e de deteccao passam a falhar, em vez de a sonda rodar calada em
+    // servidores Windows e equipamentos de rede).
+    let banner = banner_rx.try_recv().unwrap_or(Banner::Skip);
 
     // A chave chega no oneshot antes do Handle existir (troca de chaves inicial).
     let presented = key_rx
@@ -124,7 +155,7 @@ pub(crate) async fn connect_and_auth(
             passphrase,
         } => {
             let key = decode_secret_key(private_key, passphrase.as_deref())
-                .map_err(|e| anyhow::anyhow!("chave privada invalida: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("chave privada inválida: {e}"))?;
             let hash = session.best_supported_rsa_hash().await?.flatten();
             session
                 .authenticate_publickey(
@@ -137,9 +168,9 @@ pub(crate) async fn connect_and_auth(
     };
 
     if !authenticated {
-        anyhow::bail!("falha na autenticacao (credenciais rejeitadas)");
+        anyhow::bail!("falha na autenticação (credenciais rejeitadas)");
     }
-    Ok(session)
+    Ok((session, banner))
 }
 
 /// Confere a chave apresentada com a guardada no host; se for nova ou
@@ -265,8 +296,9 @@ impl SshHandle {
 }
 
 /// Inicia uma sessao SSH em segundo plano. `repaint` e chamado sempre que houver
-/// novidade, para acordar o loop de renderizacao do egui.
-pub fn connect<F>(host: Host, cols: u16, rows: u16, repaint: F) -> SshHandle
+/// novidade, para acordar o loop de renderizacao do egui. `detect_os` liga a
+/// deteccao do SO do servidor (resultado em `SshToUi::Os`).
+pub fn connect<F>(host: Host, cols: u16, rows: u16, detect_os: bool, repaint: F) -> SshHandle
 where
     F: Fn() + Send + 'static,
 {
@@ -287,7 +319,16 @@ where
         };
 
         rt.block_on(async move {
-            if let Err(e) = run_session(host, cols, rows, to_ssh_rx, &from_ssh_tx, &repaint).await {
+            let r = run_session(
+                host,
+                cols,
+                rows,
+                detect_os,
+                to_ssh_rx,
+                &from_ssh_tx,
+                &repaint,
+            );
+            if let Err(e) = r.await {
                 let _ = from_ssh_tx.send(SshToUi::Error(format!("{e}")));
                 repaint();
             }
@@ -307,6 +348,7 @@ async fn run_session<F>(
     host: Host,
     cols: u16,
     rows: u16,
+    detect_os: bool,
     mut to_ssh_rx: UnboundedReceiver<UiToSsh>,
     from_ssh: &std::sync::mpsc::Sender<SshToUi>,
     repaint: &F,
@@ -319,9 +361,10 @@ where
         let _ = from_ssh.send(SshToUi::HostKey(p));
         repaint();
     };
-    // Compartilhada com as tarefas de envio de arquivos (canais extras na
-    // mesma conexao; abrir canal so precisa de `&self`).
-    let session = Arc::new(connect_and_auth(&host, ask).await?);
+    // Compartilhada com as tarefas de envio de arquivos e com a sonda do SO
+    // (canais extras na mesma conexao; abrir canal so precisa de `&self`).
+    let (session, banner) = connect_and_auth(&host, ask).await?;
+    let session = Arc::new(session);
 
     let mut channel = session.channel_open_session().await?;
     channel
@@ -331,6 +374,16 @@ where
 
     let _ = from_ssh.send(SshToUi::Connected);
     repaint();
+
+    // SO do servidor em segundo plano (ver osinfo): canal proprio, tarefa
+    // propria; nada passa pelo terminal. No fim da sessao (qualquer caminho),
+    // o drop do OsProbe entrega o que faltar e aborta a sonda.
+    let mut os_probe = OsProbe::new(&host, |r| {
+        let _ = from_ssh.send(SshToUi::Os(r));
+    });
+    if detect_os {
+        os_probe.spawn(&session, banner);
+    }
 
     // Distingue o encerramento esperado (usuario desconectou ou o shell saiu
     // com `exit`) da queda de conexao: nesse ultimo caso devolve erro para a UI
@@ -356,6 +409,7 @@ where
             }
             // Recolhe tarefas terminadas (o JoinSet as guarda ate serem lidas).
             Some(_) = uploads.join_next(), if !uploads.is_empty() => {}
+            () = os_probe.wait(), if os_probe.running() => repaint(),
             cmd = to_ssh_rx.recv() => {
                 match cmd {
                     Some(UiToSsh::Data(data)) => {
@@ -426,7 +480,7 @@ where
     uploads.abort_all();
 
     if !clean_exit {
-        anyhow::bail!("conexao perdida (a sessao caiu sem encerramento normal)");
+        anyhow::bail!("conexão perdida (a sessão caiu sem encerramento normal)");
     }
     Ok(())
 }

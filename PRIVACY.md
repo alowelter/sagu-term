@@ -1,6 +1,6 @@
 # Política de Privacidade do SaguTerm
 
-**Vigência:** 25 de setembro de 2026 · [English version below](#english)
+**Vigência:** 30 de setembro de 2026 · [English version below](#english)
 
 Esta política vale para o SaguTerm distribuído pela **Microsoft Store** e também para um
 executável que você mesmo compile a partir do código-fonte, que é público no GitHub. O
@@ -12,9 +12,18 @@ MIT), mantido por Marcelo Welter ("o desenvolvedor").
 - **O SaguTerm não envia nenhum dado ao desenvolvedor.** Não há conta, cadastro, anúncios,
   telemetria, estatísticas de uso nem relatórios de erro próprios, e o app não grava
   registros (logs) em disco.
-- Suas conexões, senhas e chaves, e também as chaves públicas dos servidores que você
-  aceitou, ficam num **cofre criptografado**, num arquivo guardado onde você escolher.
+- Suas conexões, senhas e chaves, as chaves públicas dos servidores que você aceitou e o
+  sistema operacional detectado em cada servidor ficam num **cofre criptografado**, num
+  arquivo guardado onde você escolher.
 - Os arquivos que você baixa dos seus servidores vão só para a pasta que você escolhe.
+- O visualizador de arquivos do navegador SFTP lê do servidor só o arquivo que você abre,
+  para mostrá-lo na tela. O conteúdo fica na memória e não é gravado em disco.
+- Copiar e mover arquivos no navegador SFTP (`Ctrl+C`/`Ctrl+X` e `Ctrl+V`) acontece no
+  próprio servidor: os dados de uma cópia passam pela memória do app, sem serem gravados no
+  seu computador.
+- Ao conectar a um servidor, o app pode executar nele, com o seu usuário, um comando fixo
+  que só lê a identificação do sistema operacional, para mostrar o ícone do sistema no
+  cartão da conexão. Isso pode ser desligado em cada conexão (seções 2 e 4).
 - O app só se conecta aos **servidores que você cadastra**. Ele não acessa a internet por
   conta própria: não procura atualizações e não consulta o GitHub nem nenhum outro servidor
   do desenvolvedor.
@@ -33,6 +42,17 @@ apresentou (a *host key*), para conferir as próximas conexões (seção 2). Ela
 quando você usa **Esquecer chave** no editor da conexão, troca o endereço ou a porta da
 conexão, ou a exclui.
 
+A partir da versão 1.1.0, o cofre guarda também o **sistema operacional** detectado em cada
+servidor (seção 2), em três campos: o identificador, o nome e a versão informados pelo
+próprio servidor (por exemplo, `almalinux`, "AlmaLinux" e "8.10"; a versão pode faltar).
+Eles servem para mostrar o ícone da distribuição no cartão da conexão e o nome e a versão
+do sistema na dica do cartão. Esses dados são substituídos quando o servidor informa outro
+sistema ou outra versão, e uma detecção sem resultado não apaga o que já estava guardado.
+Eles são apagados quando você troca o endereço ou a porta da conexão, desliga a detecção
+no editor dela ou a exclui, e também quando você aceita uma chave nova do servidor (o
+sistema é detectado de novo). O **Esquecer chave** não os apaga. O cofre guarda ainda,
+para cada conexão, se a detecção está ligada.
+
 - Todo o conteúdo é criptografado com **AES-256-GCM**. A chave de 256 bits é derivada da
   sua senha mestra com **Argon2id**, e um *salt* e um *nonce* aleatórios novos são gerados a
   cada gravação.
@@ -48,6 +68,11 @@ conexão, ou a exclui.
   o cofre numa delas e salvar alguma alteração (editar ou excluir uma conexão), as chaves
   guardadas são apagadas, e esta versão volta a perguntar por elas como se cada servidor
   fosse novo. Por isso, não use o cofre nas versões 0.1.x.
+- As versões 1.0.0 e 1.0.1 não conhecem o sistema detectado. Se você salvar alguma
+  alteração no cofre numa delas, essa informação é descartada e volta a ser detectada na
+  próxima conexão feita a partir da versão 1.1.0, inclusive nas conexões em que você tinha
+  desligado a detecção (ela volta a ficar ligada). As chaves dos servidores não são
+  afetadas.
 
 ### Na memória, enquanto o cofre está aberto
 
@@ -55,6 +80,14 @@ Para poder salvar as suas alterações, o app mantém a senha mestra e o conteú
 memória enquanto o cofre está aberto. Ao bloquear o cofre, o app descarta esses dados, mas
 não sobrescreve a memória que eles ocupavam. Só a chave derivada da senha é apagada da
 memória ativamente, logo após cada uso.
+
+### Histórico do terminal
+
+O que passa pela tela de cada terminal (até as últimas 5.000 linhas por painel) fica só na
+memória, para você poder rolar para cima; nunca é gravado em disco. O comando `clear` (ou
+`cls`, no Prompt de Comando) tira essas linhas da rolagem, mas elas continuam na memória
+até serem substituídas por saída nova, até o comando `reset` ou até o painel ser fechado.
+Ao descartá-las, o app não sobrescreve a memória que elas ocupavam.
 
 ### Preferências
 
@@ -70,9 +103,9 @@ arquivo, e ele então não é removido na desinstalação.
 
 ### Área de transferência
 
-- Ao terminar de selecionar texto no terminal com o mouse, o texto selecionado é
-  **copiado automaticamente** para a área de transferência do Windows. Cuidado ao
-  selecionar senhas ou outros dados sensíveis.
+- Ao terminar de selecionar texto com o mouse no terminal ou no visualizador de arquivos do
+  navegador SFTP, o texto selecionado é **copiado automaticamente** para a área de
+  transferência do Windows. Cuidado ao selecionar senhas ou outros dados sensíveis.
 - O app só lê a área de transferência quando você manda colar (botão direito sobre o
   terminal, ou `Ctrl+V`). O texto colado vai para o terminal em foco, seja um servidor
   remoto ou um shell local.
@@ -129,10 +162,59 @@ Do servidor, o app lê apenas o necessário para as funções que você usa:
   no cofre;
 - a saída do terminal;
 - no navegador SFTP, a lista de pastas e arquivos (nome, data de modificação, tamanho,
-  dono, grupo e permissões) e os arquivos `/etc/passwd` e `/etc/group`, para mostrar nomes
-  de usuários e grupos em vez de números. Tudo isso fica só na memória;
+  dono, grupo e permissões; num link simbólico, também o destino dele e esses mesmos dados
+  do destino, para mostrar se ele aponta para uma pasta ou para um arquivo) e os arquivos
+  `/etc/passwd` e `/etc/group`, para mostrar nomes de usuários e grupos em vez de números.
+  Tudo isso fica só na memória;
 - os arquivos e pastas que você manda baixar (conteúdo, tamanho e data de modificação),
   gravados na pasta que você escolheu (seção 1);
+- a partir da versão 1.1.0, **os arquivos e pastas que você copia ou move** no navegador
+  SFTP (`Ctrl+C`/`Ctrl+X` e `Ctrl+V`), no mesmo servidor. Mover é um pedido de renomear ao
+  servidor. Copiar lê cada arquivo e grava a cópia na pasta de destino do mesmo servidor,
+  com as permissões e as datas do original (e, conectado como `root`, o dono e o grupo); os
+  dados passam só pela memória do app, em blocos, e não são gravados no seu computador.
+  Mover para outro disco do servidor só copia e apaga os originais depois de você
+  confirmar;
+- a partir da versão 1.1.0, **o arquivo que você abre no visualizador** do navegador SFTP
+  (Enter ou duplo clique sobre ele), só para mostrá-lo na tela: o tipo, o tamanho e a data
+  de modificação dele (num link simbólico, também o destino; num arquivo de tamanho 0,
+  também o caminho real, sem links) e o começo do conteúdo, até cerca de 4 MiB. Antes de
+  ler o conteúdo, o app confere o tipo e não abre pastas, arquivos especiais (fifo, socket
+  ou dispositivo) nem interfaces do kernel cuja leitura bloqueia ou consome os dados (como
+  o `/proc/kmsg`); se o começo do arquivo parecer binário, ele para de ler e não mostra
+  nada. O conteúdo fica só na memória do app e nunca é gravado em disco; ele é descartado
+  quando você fecha o visualizador ou o painel;
+- a partir da versão 1.1.0, **o sistema operacional do servidor**, para mostrar o ícone da
+  distribuição no cartão da conexão. Cerca de 2 segundos depois de a sessão SSH ou SFTP
+  abrir, o app executa nesse servidor, com o seu usuário e num canal separado da mesma
+  conexão, sempre este mesmo comando:
+
+  ```text
+  echo SAGUOS.uname; uname -s -r; echo SAGUOS.etc; cat /etc/os-release; echo SAGUOS.lib; cat /usr/lib/os-release; echo SAGUOS.rh; cat /etc/redhat-release; echo SAGUOS.sw; sw_vers; echo SAGUOS.end
+  ```
+
+  Esse comando só lê informações do sistema: o nome e a versão do kernel (`uname -s -r`),
+  os arquivos `/etc/os-release`, `/usr/lib/os-release` e `/etc/redhat-release` e, no
+  macOS, a versão do sistema (`sw_vers`). Os `echo SAGUOS...` só marcam onde começa cada
+  parte da resposta. O que não existe no servidor (como o `sw_vers` fora do macOS) gera apenas uma
+  mensagem de erro, que o app ignora. A resposta não aparece no terminal; o app lê no
+  máximo 64 KiB dela, guarda no cofre só o identificador, o nome e a versão do sistema
+  (seção 1), com tamanho limitado e sem caracteres de controle, e descarta o resto. Em
+  geral, isso acontece uma vez por conexão cadastrada a cada abertura do cofre, e de novo
+  se você trocar o endereço ou a porta dela ou aceitar uma chave nova do servidor (duas
+  sessões abertas ao mesmo tempo no mesmo servidor podem repeti-lo). Como qualquer comando
+  executado por SSH, ele pode ficar registrado nos logs do servidor, e o servidor pode
+  carregar antes os arquivos de inicialização do seu shell (como o `.bashrc`). **Se o
+  servidor força um comando** (`ForceCommand` no `sshd_config` ou `command="..."` no
+  `authorized_keys`), é esse comando do servidor que roda no lugar do comando acima, sem
+  terminal e com a entrada fechada, uma vez a mais a cada detecção; os scripts `~/.ssh/rc`
+  e `/etc/ssh/sshrc`, se existirem, também rodam de novo, como em qualquer sessão SSH. Para
+  evitar isso, desligue a detecção dessa conexão (seção 4). Se o servidor recusar o
+  comando, levar mais de 10 segundos para abrir o canal ou para responder, ou mandar mais
+  de 64 KiB, o app desiste sem avisar e o cartão continua com o ícone que já tinha;
+- a identificação que todo servidor SSH envia no início da conexão (por exemplo,
+  `SSH-2.0-OpenSSH_for_Windows_9.5`). O app a usa só na memória, para reconhecer servidores
+  Windows e alguns equipamentos de rede, nos quais o comando acima não é executado;
 - ao soltar arquivos num terminal SSH, o app executa nesse servidor, com o seu usuário, um
   pequeno script embutido no app. O script descobre a pasta atual do shell lendo
   informações dos processos em `/proc` (e do tmux, se houver). O resultado fica só na
@@ -179,6 +261,12 @@ você pede, para os servidores que você cadastra.
 - **Esquecer a chave de um servidor:** clique com o botão direito no cartão da conexão,
   escolha **Editar**, clique em **Esquecer chave** e em **Salvar**. A chave será pedida de
   novo na próxima conexão.
+- **Sistema detectado de um servidor:** sai do cofre junto com a conexão, quando você troca
+  o endereço ou a porta dela no editor ou quando aceita uma chave nova do servidor (seção 1).
+  Para não executar o comando de detecção num servidor, clique com o botão direito no cartão
+  da conexão, escolha **Editar**, desmarque **Detectar o sistema do servidor** e clique em
+  **Salvar**. O sistema já detectado dessa conexão é apagado, e o cartão volta ao ícone de
+  servidor.
 - **Bloquear o cofre:** `Ctrl+L` na tela de conexões ou o botão **Bloquear cofre**.
 - **Apagar o cofre:** apague o arquivo `.sagu` (e um `.sagu.tmp` que tenha sobrado ao lado
   dele). Isso apaga todas as conexões guardadas.
@@ -235,7 +323,7 @@ públicas: não inclua senhas, chaves, endereços de servidores nem outros dados
 
 # SaguTerm Privacy Policy
 
-**Effective date:** September 25, 2026
+**Effective date:** September 30, 2026
 
 This policy applies to SaguTerm distributed through the **Microsoft Store** and also to an
 executable you build yourself from the source code, which is public on GitHub. SaguTerm is
@@ -248,9 +336,18 @@ Portuguese version prevails.
 - **SaguTerm sends no data to the developer.** There is no account, sign-up, ads,
   telemetry, usage statistics or crash reporting of its own, and the app writes no logs to
   disk.
-- Your connections, passwords and keys, as well as the public keys of the servers you
-  accepted, are kept in an **encrypted vault**, in a file stored wherever you choose.
+- Your connections, passwords and keys, the public keys of the servers you accepted, and
+  the operating system detected on each server are kept in an **encrypted vault**, in a
+  file stored wherever you choose.
 - Files you download from your servers go only to the folder you choose.
+- The file viewer in the SFTP browser reads from the server only the file you open, to show
+  it on screen. Its content stays in memory and is not written to disk.
+- Copying and moving files in the SFTP browser (`Ctrl+C`/`Ctrl+X` and `Ctrl+V`) happens on
+  the server itself: the data of a copy passes through the app's memory without being
+  written to your computer.
+- When connecting to a server, the app may run on it, as your user, a fixed command that
+  only reads the operating system's identification, to show the system's icon on the
+  connection card. This can be turned off for each connection (sections 2 and 4).
 - The app only connects to the **servers you register**. It does not access the internet
   on its own: it does not check for updates and does not contact GitHub or any other server
   of the developer.
@@ -269,6 +366,17 @@ key*), to check later connections (section 2). It is deleted when you use **Esqu
 chave** (Forget key) in the connection editor, change the connection's address or port, or
 delete the connection.
 
+Starting with version 1.1.0, the vault also stores the **operating system** detected on
+each server (section 2), in three fields: the identifier, name and version reported by the
+server itself (for example, `almalinux`, "AlmaLinux" and "8.10"; the version may be
+missing). They are used to show the distribution's icon on the connection card and the
+system's name and version in the card's tooltip. This data is replaced when the server
+reports another system or version, and a detection with no result does not erase what was
+already stored. It is deleted when you change the connection's address or port, turn
+detection off in the connection editor, or delete the connection, and also when you accept
+a new key from the server (the system is detected again). **Esquecer chave** (Forget key)
+does not delete it. The vault also stores, for each connection, whether detection is on.
+
 - All of its content is encrypted with **AES-256-GCM**. The 256-bit key is derived from
   your master password with **Argon2id**, and a new random salt and nonce are generated on
   every save.
@@ -284,6 +392,10 @@ delete the connection.
   of them and save any change (editing or deleting a connection), the stored keys are
   deleted, and this version asks for them again as if each server were new. For this
   reason, do not use the vault with versions 0.1.x.
+- Versions 1.0.0 and 1.0.1 do not know about the detected operating system. If you save
+  any change to the vault in one of them, this information is discarded and detected again
+  on the next connection made with version 1.1.0 or later, including on connections where
+  you had turned detection off (it is turned back on). Server keys are not affected.
 
 ### In memory, while the vault is open
 
@@ -291,6 +403,14 @@ To be able to save your changes, the app keeps the master password and the vault
 in memory while the vault is open. When you lock the vault, the app discards this data but
 does not overwrite the memory it used. Only the key derived from the password is actively
 wiped from memory, right after each use.
+
+### Terminal history
+
+What scrolls through each terminal (up to the last 5,000 lines per pane) is kept only in
+memory, so you can scroll back; it is never written to disk. The `clear` command (or `cls`,
+in Command Prompt) removes those lines from scrollback, but they stay in memory until newer
+output replaces them, until you run `reset`, or until the pane is closed. When discarding
+them, the app does not overwrite the memory they used.
 
 ### Settings
 
@@ -306,9 +426,9 @@ file, which is then not removed on uninstall.
 
 ### Clipboard
 
-- When you finish selecting text in the terminal with the mouse, the selected text is
-  **automatically copied** to the Windows clipboard. Be careful when selecting passwords or
-  other sensitive data.
+- When you finish selecting text with the mouse in the terminal or in the SFTP browser's
+  file viewer, the selected text is **automatically copied** to the Windows clipboard. Be
+  careful when selecting passwords or other sensitive data.
 - The app only reads the clipboard when you paste (right-click on the terminal, or
   `Ctrl+V`). Pasted text goes to the focused terminal, either a remote server or a local
   shell.
@@ -365,10 +485,60 @@ From the server, the app reads only what the features you use need:
   in the vault;
 - the terminal output;
 - in the SFTP browser, the list of folders and files (name, modification date, size, owner,
-  group and permissions) and the `/etc/passwd` and `/etc/group` files, to show user and
-  group names instead of numbers. All of this stays in memory only;
+  group and permissions; for a symbolic link, also its target and the same data about the
+  target, to show whether it points to a folder or to a file) and the `/etc/passwd` and
+  `/etc/group` files, to show user and group names instead of numbers. All of this stays in
+  memory only;
 - the files and folders you choose to download (content, size and modification date),
   written to the folder you picked (section 1);
+- starting with version 1.1.0, **the files and folders you copy or move** in the SFTP
+  browser (`Ctrl+C`/`Ctrl+X` and `Ctrl+V`), on the same server. Moving is a rename request
+  to the server. Copying reads each file and writes the copy to the destination folder on
+  the same server, with the original's permissions and dates (and, when connected as
+  `root`, its owner and group); the data only passes through the app's memory, in blocks,
+  and is not written to your computer. Moving to another disk of the server only copies and
+  deletes the originals after you confirm;
+- starting with version 1.1.0, **the file you open in the viewer** of the SFTP browser
+  (Enter or double-click on it), only to show it on screen: its type, size and modification
+  date (for a symbolic link, also its target; for a zero-size file, also its real path,
+  without links) and the beginning of its content, up to about 4 MiB. Before reading the
+  content, the app checks the type and does not open folders, special files (FIFO, socket
+  or device) or kernel interfaces whose reading blocks or consumes the data (such as
+  `/proc/kmsg`); if the beginning of the file looks binary, it stops reading and shows
+  nothing. The content stays only in the app's memory and is never written to disk; it is
+  discarded when you close the viewer or the pane;
+- starting with version 1.1.0, **the server's operating system**, to show the
+  distribution's icon on the connection card. About 2 seconds after the SSH or SFTP session
+  opens, the app runs on that server, as your user and on a separate channel of the same
+  connection, always this same command:
+
+  ```text
+  echo SAGUOS.uname; uname -s -r; echo SAGUOS.etc; cat /etc/os-release; echo SAGUOS.lib; cat /usr/lib/os-release; echo SAGUOS.rh; cat /etc/redhat-release; echo SAGUOS.sw; sw_vers; echo SAGUOS.end
+  ```
+
+  This command only reads system information: the kernel name and version (`uname -s -r`),
+  the files `/etc/os-release`, `/usr/lib/os-release` and `/etc/redhat-release` and, on
+  macOS, the system version (`sw_vers`). The `echo SAGUOS...` parts only mark where each
+  part of the answer begins. Whatever does not exist on the server (such as `sw_vers` outside macOS)
+  only produces an error message, which the app ignores. The answer is not shown in the
+  terminal; the app reads at most 64 KiB of it, keeps only the system's identifier, name
+  and version in the vault (section 1), with limited length and no control characters, and
+  discards the rest. This usually happens once per registered connection each time the
+  vault is opened, and again if you change the connection's address or port or accept a
+  new key from the server (two sessions opened at the same time on the same server may
+  repeat it). Like any command run over SSH, it may be recorded in the server's logs, and
+  the server may first load your shell's startup files (such as `.bashrc`). **If the server
+  forces a command** (`ForceCommand` in `sshd_config` or `command="..."` in
+  `authorized_keys`), it is that server command that runs instead of the command above,
+  without a terminal and with its input closed, one extra time on each detection; the
+  `~/.ssh/rc` and `/etc/ssh/sshrc` scripts, if present, also run again, as in any SSH
+  session. To avoid this, turn detection off for that connection (section 4). If the
+  server refuses the command, takes more than 10 seconds to open the channel or to answer,
+  or sends more than 64 KiB, the app silently gives up and the card keeps the icon it
+  already had;
+- the identification every SSH server sends at the start of the connection (for example,
+  `SSH-2.0-OpenSSH_for_Windows_9.5`). The app uses it, in memory only, to recognize Windows
+  servers and some network devices, on which the command above is not run;
 - when you drop files onto an SSH terminal, the app runs on that server, as your user, a
   small script embedded in the app. The script finds the shell's current folder by reading
   process information under `/proc` (and from tmux, if present). The result stays in memory
@@ -414,6 +584,12 @@ ones you ask for, to the servers you register.
 - **Forget a server's key:** right-click the connection card, choose **Editar** (Edit),
   click **Esquecer chave** (Forget key) and then **Salvar** (Save). The key will be asked
   for again on the next connection.
+- **Detected operating system of a server:** it leaves the vault together with the
+  connection, when you change the connection's address or port in the editor, or when you
+  accept a new key from the server (section 1). To stop running the detection command on a
+  server, right-click the connection card, choose **Editar** (Edit), uncheck **Detectar o
+  sistema do servidor** (Detect the server's system) and click **Salvar** (Save). The system
+  already detected for that connection is deleted, and the card goes back to the server icon.
 - **Lock the vault:** `Ctrl+L` on the connections screen, or the **Bloquear cofre** (Lock
   vault) button.
 - **Delete the vault:** delete the `.sagu` file (and any `.sagu.tmp` file left next to

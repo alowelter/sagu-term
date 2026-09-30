@@ -114,7 +114,10 @@ TERMINAL SSH
 • Keepalive automático, para a sessão não cair quando fica parada.
 
 NAVEGADOR SFTP
-• Navegue pelas pastas do servidor com o teclado ou o mouse, ou digite o caminho direto.
+• Navegue pelas pastas do servidor com o teclado ou o mouse. Setas, PageUp, PageDown, Home e End movem na lista, a linha ".." sobe para a pasta acima com Enter (o Backspace também sobe), e digitar as primeiras letras de um nome leva direto ao item.
+• Clique na barra do caminho para digitar outro: absoluto, relativo à pasta atual ou com ~ para a sua pasta inicial.
+• Pastas e arquivos inconfundíveis: pastas em âmbar, com "/" no fim do nome e sempre no topo da lista. Links simbólicos têm seta no ícone e mostram o destino ao passar o mouse; um link para pasta abre como pasta, e um link quebrado aparece em vermelho.
+• Visualizador somente leitura: Enter ou duplo clique num arquivo mostra o conteúdo no próprio painel, com números de linha, busca, seleção e cópia, sem gravar nada no computador. A codificação (UTF-8, UTF-16 com BOM ou Windows-1252) é reconhecida sozinha. Arquivos binários não abrem: aparece um aviso.
 • Arraste arquivos do Windows para enviá-los à pasta aberta. Soltos sobre um terminal SSH, eles vão para a pasta atual do shell ou para a pasta que você escolher.
 • Baixe arquivos e pastas para o computador: selecione os itens, aperte Ctrl+S ou use o botão de download e escolha a pasta de destino. Pastas vêm com todo o conteúdo.
 • O andamento aparece no painel, com botão para cancelar. Se algo já existe no destino, você escolhe entre substituir, pular os existentes ou cancelar.
@@ -131,16 +134,19 @@ PAINÉIS DIVIDIDOS
 COFRE E CONEXÕES
 • Busca instantânea pelo nome da conexão.
 • Cadastre, edite e exclua conexões em qualquer seletor.
+• Ao conectar, o SaguTerm identifica em segundo plano o sistema do servidor e mostra no cartão o ícone da distribuição (Ubuntu, Debian, Red Hat, AlmaLinux, Rocky Linux, Fedora, openSUSE, FreeBSD e outras). Nada aparece no terminal.
+• Ao passar o mouse sobre um cartão, a dica mostra o nome completo da conexão, o endereço, o tipo de autenticação e, quando identificado, o sistema do servidor.
 • Ao editar uma conexão, veja a impressão digital da chave do servidor guardada ou esqueça a chave para confirmá-la de novo.
 • Bloqueie o cofre na hora com Ctrl+L.
 • O cofre é gravado de forma atômica: uma queda de energia no meio da gravação não corrompe o arquivo.
 
 PRIVACIDADE
-Sem conta, sem anúncios e sem telemetria. O SaguTerm não envia nenhum dado ao desenvolvedor e não acessa a internet por conta própria: ele se conecta apenas aos servidores que você cadastra. As atualizações chegam pela Microsoft Store.
+Sem conta, sem anúncios e sem telemetria. O SaguTerm não envia nenhum dado ao desenvolvedor e não acessa a internet por conta própria: ele se conecta apenas aos servidores que você cadastra. Para mostrar o ícone do sistema, ele executa no servidor, com o seu usuário, um comando que só lê a identificação do sistema; isso pode ser desligado em cada conexão, e os detalhes estão na política de privacidade. As atualizações chegam pela Microsoft Store.
 
 LIMITAÇÕES ATUAIS
 • A interface está em português (Brasil).
 • O envio por arrastar e soltar aceita arquivos, mas ainda não pastas.
+• O visualizador do SFTP é somente leitura e mostra no máximo os primeiros 4 MiB (e 200 mil linhas) de cada arquivo; para ver o resto, baixe o arquivo.
 • No Windows em modo S, o terminal local (Prompt de Comando e WSL) não está disponível, porque o Windows bloqueia esses programas nesse modo. O SSH, o SFTP e o cofre funcionam normalmente.
 • Requer Windows 10 ou 11 de 64 bits (x64).
 
@@ -149,7 +155,17 @@ Leve e rápido: escrito em Rust do começo ao fim, incluindo o SSH (sem OpenSSL)
 
 ### What's new in this version (Novidades desta versão)
 
-Limite: 1500 caracteres. Texto da 1.0.1:
+Limite: 1500 caracteres. Texto da 1.1.0 (975 caracteres), com as melhorias do navegador SFTP
+(inclusive copiar e mover), do terminal, do ícone do sistema, dos cartões e da ajuda:
+
+```text
+Navegador SFTP: copie e mova arquivos e pastas no servidor com Ctrl+C, Ctrl+X e Ctrl+V. Enter num arquivo abre um visualizador somente leitura, com busca e cópia; arquivos binários mostram um aviso. A linha ".." sobe com Enter, PageUp, PageDown, Home, End e as primeiras letras do nome movem na lista, e a barra do caminho aceita digitar outro caminho. Pastas em âmbar com "/" e links simbólicos com seta, com o destino na dica.
+Terminal: histórico de rolagem com a roda do mouse ou Shift+PgUp, com seleção e cópia do que já saiu da tela. O btop aparece certo, inclusive os gráficos, as setas funcionam no less e no man, e deixou de sumir a letra depois de um caractere acentuado.
+Ao conectar, o app identifica o sistema do servidor e mostra no cartão o ícone da distribuição (Ubuntu, Debian, AlmaLinux e outras), lendo só a identificação do sistema; isso pode ser desligado em cada conexão.
+Cartões mais largos, com o nome completo na dica, e a versão no topo da ajuda (F1).
+```
+
+Texto da 1.0.1, só de referência:
 
 ```text
 Abrir o SaguTerm com ele já aberto (atalho de teclado, menu Iniciar ou barra de tarefas) agora traz a janela existente para a frente, restaurando se estiver minimizada, em vez de abrir outra. Assim duas janelas nunca gravam o mesmo cofre, uma por cima da outra.
@@ -168,7 +184,7 @@ Um recurso por campo, sem marcadores (a Store já coloca). Até 20 itens, com no
 caracteres cada.
 
 ```text
-Terminal SSH com emulação xterm de 256 cores, que se ajusta sozinho ao tamanho do painel
+Terminal SSH com emulação xterm de 256 cores, que se ajusta ao painel, e keepalive para a sessão não cair
 Selecionou, copiou: o texto selecionado vai para a área de transferência, e o botão direito cola
 Autenticação por senha ou chave privada (OpenSSH ou PEM, com passphrase opcional)
 Verificação da chave do servidor: confira a impressão digital na primeira conexão e receba um alerta se ela mudar
@@ -176,11 +192,15 @@ Cofre criptografado com AES-256-GCM e chave derivada da senha mestra por Argon2i
 Painéis divididos lado a lado ou empilhados, misturando sessões SSH, SFTP e terminais locais
 Prompt de Comando e WSL nos mesmos painéis dos servidores remotos
 Navegador SFTP: navegue pelas pastas, renomeie, altere permissões e proprietário e exclua arquivos
+Visualizador somente leitura no SFTP: Enter num arquivo mostra o conteúdo, com números de linha, busca e cópia; arquivos binários não abrem
+SFTP pelo teclado: PageUp/PageDown, Home/End, busca por letras e caminho digitado, com pastas, arquivos e links simbólicos inconfundíveis
 Arraste arquivos do Windows para um painel SFTP ou um terminal SSH para enviá-los ao servidor
 Baixe arquivos e pastas pelo SFTP com Ctrl+S, com andamento, cancelamento e aviso antes de substituir
+Copie e mova arquivos e pastas no servidor com Ctrl+C, Ctrl+X e Ctrl+V no navegador SFTP
+Histórico de rolagem: role com a roda do mouse ou Shift+PgUp e copie texto que já saiu da tela
 Busca instantânea: digite parte do nome da conexão e aperte Enter
+Ícone do sistema de cada servidor (Ubuntu, Debian, Red Hat, AlmaLinux e outros), identificado em segundo plano ao conectar
 Feito para o teclado: Alt+setas troca de painel, Ctrl+N cadastra um host, Ctrl+S baixa arquivos, Ctrl+L bloqueia o cofre, F1 mostra os atalhos
-Keepalive automático para a sessão não cair quando fica parada
 Cofre gravado de forma atômica: uma queda de energia durante a gravação não corrompe o arquivo
 Escrito em Rust, sem OpenSSL, com interface acelerada pela placa de vídeo
 Sem conta, sem anúncios e sem telemetria: suas credenciais ficam no seu computador e só vão para os seus servidores
@@ -213,7 +233,7 @@ acesso remoto
 ### Campos adicionais
 
 - **Copyright and trademark info** (Copyright e marca, até 200 caracteres):
-  `© 2026 Marcelo Welter. Licença MIT.`
+  `© 2026 Marcelo Welter. Licença MIT. Ícones de sistemas: Simple Icons (licenças no README). Marcas e logotipos pertencem aos seus donos.`
 - **Additional license terms** (Termos de licença adicionais): deixe em branco para usar os
   termos padrão da Store. Se quiser citar a MIT, use a URL
   `https://github.com/alowelter/sagu-term/blob/master/LICENSE`.
@@ -243,6 +263,9 @@ Obrigatória 1, recomendadas 4 ou mais, no máximo 10.
     reais nem notificações da área de trabalho.
 - **Sem enfeites:** não sobreponha logos nem textos de marketing. Deixe o essencial nos
   2/3 de cima da imagem.
+- **Sem logotipos de terceiros:** a partir da 1.1.0, o cartão de uma conexão já usada mostra
+  o ícone da distribuição do servidor (Ubuntu, Debian...). Nas capturas, prefira cartões
+  com o ícone padrão de servidor, como os de conexões fictícias que nunca conectaram.
 
 Sugestões de capturas e legendas:
 
@@ -252,6 +275,7 @@ Sugestões de capturas e legendas:
 | Tela de conexões com os cartões fictícios | Tela de conexões: digite parte do nome e aperte Enter para conectar. |
 | Navegador SFTP recebendo arquivos arrastados | Navegador SFTP: arraste arquivos do Windows para enviá-los ao servidor. |
 | Navegador SFTP com itens selecionados e o download em andamento no rodapé | Baixe arquivos e pastas do servidor com Ctrl+S, com andamento e cancelamento. |
+| Visualizador do SFTP com um arquivo de configuração de teste e a busca aberta | Leia arquivos de texto do servidor sem sair do SaguTerm, com números de linha e busca. |
 | Janela "Servidor novo" com a impressão digital da chave de um servidor de teste | Confira a chave do servidor na primeira conexão; ela fica guardada no cofre. |
 | Tela do cofre, na aba "Criar cofre" | Cofre criptografado com AES-256-GCM e Argon2id, protegido pela sua senha mestra. |
 | Janela de atalhos (F1) | Atalhos de teclado sempre à mão com F1. |
@@ -307,17 +331,20 @@ nem atualizador próprio.
 ### Notas para a certificação
 
 Em **Submission options > Notes for certification** (Notas para a certificação). Os
-testadores são pessoas e precisam conseguir usar o app, então explique o caminho em inglês:
+testadores são pessoas e precisam conseguir usar o app, então explique o caminho em inglês.
+Limite: 2000 caracteres. O texto abaixo tem 1759 (1874 com a linha do servidor de teste,
+ainda com os `<...>`), o que deixa folga para os dados reais do servidor; confira a
+contagem se mudar alguma coisa:
 
 ```text
-No account or sign-in is required. The app has no backend service, ads, telemetry or in-app purchases. The user interface is in Brazilian Portuguese; labels are quoted below as they appear in the app.
-1. Launch SaguTerm. The splash screen closes by itself after about 2 seconds (or click anywhere).
-2. On the vault screen ("Cofre SaguTerm"), select the "Criar cofre" (Create vault) tab. Click "Salvar como..." (Save as) and choose any location, for example Documents\test.sagu. Type any master password in "Senha mestra" and again in "Confirmar senha", then click "Criar cofre".
-3. Testing without a server: on the "Conexões" (Connections) screen, press Enter or double-click the "Terminal local" card to open a Windows Command Prompt inside the app. If WSL is installed, a "WSL" card is also shown. Ctrl+B then H (side by side) or Ctrl+B then V (stacked) splits the pane. F1 lists all keyboard shortcuts. In S mode Windows blocks cmd.exe and wsl.exe, so these two cards show an error ("Local: ..." or "WSL: ...") instead of a prompt; the vault, split panes and SSH/SFTP work normally.
-4. Testing SSH/SFTP: press Ctrl+N ("Novo host"), fill in "Host" (address), "Usuario" (user name) and "Senha" (password), or choose "Chave" to paste or load a private key, then click "Salvar". Select the new card and press Enter for an SSH terminal, or Ctrl+Enter for the SFTP file browser. On the first connection, the "Servidor novo" (New server) window shows the server key fingerprint: click "Confiar e conectar" (Trust and connect).
-5. SFTP: files dragged from File Explorer are uploaded to the open folder. To download, select items (Ctrl+click for several), press Ctrl+S and pick a local folder.
+No account or sign-in is required; there is no backend service, ads, telemetry or in-app purchases. The interface is in Brazilian Portuguese; labels are quoted as they appear in the app.
+1. Launch SaguTerm; the splash screen closes after about 2 seconds (or click anywhere).
+2. On the vault screen ("Cofre SaguTerm"), select the "Criar cofre" (Create vault) tab, click "Salvar como..." (Save as) and pick any file, e.g. Documents\test.sagu. Type any master password in "Senha mestra" and "Confirmar senha", then click "Criar cofre".
+3. Testing without a server: on the "Conexões" (Connections) screen, press Enter or double-click the "Terminal local" card to open a Command Prompt inside the app (a "WSL" card appears if WSL is installed). Ctrl+B then H (side by side) or V (stacked) splits the pane; F1 lists all shortcuts. In S mode Windows blocks cmd.exe and wsl.exe, so these cards show an error instead of a prompt; the vault, split panes and SSH/SFTP work normally.
+4. Testing SSH/SFTP: press Ctrl+N ("Novo host"), fill in "Host" (address), "Usuário" (user) and "Senha" (password), or choose "Chave" to paste or load a private key, then click "Salvar". Select the new card and press Enter for an SSH terminal or Ctrl+Enter for the SFTP browser. On the first connection, "Servidor novo" (New server) shows the key fingerprint: click "Confiar e conectar" (Trust and connect).
+5. SFTP: files dragged from File Explorer are uploaded to the open folder. To download, select items (Ctrl+click for several), press Ctrl+S and pick a local folder. Enter opens folders, the ".." row goes up, and text files open read-only (Esc returns).
 6. Ctrl+L on the Connections screen locks the vault.
-The app has no self-updater and opens no network connections of its own; it only connects to the servers the user registers.
+No self-updater; the app only connects to the servers the user registers.
 ```
 
 **Servidor de teste (recomendado).** A política 10.3 pede que o app possa ser testado. Sem
@@ -352,11 +379,50 @@ Add-AppxPackage -Register target\msix\layout\AppxManifest.xml
 
 Abra o **SaguTerm** pelo menu Iniciar e confira:
 
-- no F1, a linha de versão mostra `SaguTerm v<versão>`, a mesma do `Cargo.toml`;
+- no F1, o topo da ajuda mostra `SaguTerm` e `versão <versão>`, a mesma do `Cargo.toml`, e o
+  título da janela é só `SaguTerm`;
+- com o app de teste aberto, abri-lo de novo pelo menu Iniciar traz a mesma janela para a
+  frente, sem abrir outra (a janela é achada pelo título, que mudou na 1.1.0). Se a 1.0.1
+  da Store estiver aberta (título `SaguTerm v1.0.1`), abrir o app de teste traz a janela
+  dela para a frente, como na troca de versão pela Store; feche-a antes de seguir. O
+  inverso não vale: com o app de teste aberto, a 1.0.1 não reconhece o título novo e,
+  depois de uns 3 segundos, abre outra janela. Isso só acontece nesse teste, porque a Store
+  não volta a abrir uma versão anterior depois de atualizar. A 1.0.0 não tem essa função;
 - o cofre, o terminal local e uma conexão SSH funcionam como no executável avulso
   (`target\release\SaguTerm.exe`), inclusive a janela "Servidor novo" na primeira conexão;
+- deixe uma sessão SSH ou SFTP aberta por uns 5 segundos num servidor de teste (por
+  exemplo, uma distribuição do WSL com o `sshd` ligado). Depois disso, o cartão dessa
+  conexão (na tela de conexões ou no seletor de um painel novo) mostra o ícone da
+  distribuição, e a dica mostra o nome completo, o endereço, o tipo de autenticação e a
+  linha `Sistema: <nome> <versão>`. Nada da detecção aparece no terminal. Um servidor sem
+  ícone no SaguTerm (como Oracle Linux ou Kali) mantém o ícone padrão de servidor;
+- no editor dessa conexão, desmarcar **Detectar o sistema do servidor** e salvar volta o
+  cartão ao ícone de servidor, e a dica deixa de mostrar a linha `Sistema:`. Marcar de novo
+  e reconectar traz o ícone de volta;
+- o ícone de chave ou senha aparece à esquerda do endereço, no cartão;
+- num painel SFTP do servidor de teste, as setas, `PageUp`/`PageDown` e `Home`/`End` movem
+  o cursor, inclusive até a linha `..`, que sobe para a pasta acima com `Enter` ou duplo
+  clique. O `Backspace` também sobe, e a pasta de onde se saiu fica selecionada. Digitar as
+  primeiras letras de um nome leva ao item, com o indicador no canto da lista;
+- clicar em qualquer ponto da barra do caminho abre a edição com o texto selecionado. `~` e
+  `Enter` vão à pasta inicial; um caminho que não existe mostra `Caminho não encontrado`
+  embaixo da barra, sem fechar a edição; `Esc` cancela;
+- `Enter` num arquivo de texto abre o visualizador, com números de linha e a codificação no
+  cabeçalho; `Ctrl+F` busca, e `Esc` volta à listagem no mesmo item. `Enter` num binário
+  (por exemplo, `/usr/bin/ls`) mostra o aviso de arquivo binário e não abre nada;
+- no servidor de teste, crie na pasta inicial `ln -s /etc link-pasta` e
+  `ln -s /nao/existe link-quebrado` e atualize o SFTP (`F5`): `link-pasta/` aparece junto
+  das pastas, em âmbar e com seta no ícone, e abre com `Enter`; `link-quebrado` aparece em
+  vermelho, e `Enter` sobre ele mostra um aviso. Depois, apague os dois com
+  `rm link-pasta link-quebrado`;
 - um download pelo SFTP (`Ctrl+S`) para a pasta Downloads aparece nessa pasta quando você
   a abre pelo Explorador de Arquivos, fora do SaguTerm;
+- no SFTP, `Ctrl+C` num arquivo mostra a faixa `Copiando` no topo do painel; `Ctrl+V` em
+  outra pasta cria a cópia, e na mesma pasta cria `nome (cópia)`. `Ctrl+X` e `Ctrl+V` em
+  outra pasta movem o arquivo (a faixa some); um nome que já existe abre a janela `Já
+  existe no destino`. `Esc` desiste antes de colar;
+- num terminal SSH, `seq 1 20000` e depois a roda do mouse, `Shift+PgUp` e `Shift+End`
+  rolam o histórico; digitar volta ao fim. O `man ls` rola com as setas;
 - os programas abertos no terminal local gravam no registro e nas pastas normais do
   Windows, e não na pasta privada do app. No **Terminal local** do SaguTerm, rode:
 

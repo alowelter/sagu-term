@@ -168,7 +168,7 @@ where
                 UiToSsh::DropFiles { id, .. } | UiToSsh::Upload { id, .. } => {
                     let _ = from_pty_tx.send(SshToUi::Upload(UploadEvent::Failed {
                         id,
-                        error: "terminais locais nao recebem arquivos".into(),
+                        error: "terminais locais não recebem arquivos".into(),
                     }));
                     (*repaint)();
                 }

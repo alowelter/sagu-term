@@ -60,6 +60,21 @@ pub struct Host {
     /// proxima conexao pergunta. Cofres antigos nao tem o campo (serde default).
     #[serde(default)]
     pub host_key: Option<String>,
+    /// Sistema detectado no servidor (ver osinfo), para o icone e a dica do
+    /// cartao. `None` = nao identificado. Apagado quando endereco ou porta mudam no
+    /// editor. Cofres antigos nao tem o campo (serde default).
+    #[serde(default)]
+    pub os: Option<crate::osinfo::OsInfo>,
+    /// Detectar o sistema do servidor ao conectar (ver osinfo). Desligavel no
+    /// editor: num servidor que forca um comando (ForceCommand, command= no
+    /// authorized_keys), e ele que rodaria no lugar da sonda. Cofres antigos
+    /// nao tem o campo: ligado.
+    #[serde(default = "detect_os_default")]
+    pub detect_os: bool,
+}
+
+fn detect_os_default() -> bool {
+    true
 }
 
 impl Host {
@@ -72,6 +87,8 @@ impl Host {
             username: String::new(),
             auth: AuthMethod::default(),
             host_key: None,
+            os: None,
+            detect_os: true,
         }
     }
 }
@@ -94,7 +111,7 @@ pub struct Vault {
 fn derive_key(password: &str, salt: &[u8], key: &mut [u8; 32]) -> anyhow::Result<()> {
     Argon2::default()
         .hash_password_into(password.as_bytes(), salt, key)
-        .map_err(|e| anyhow::anyhow!("falha na derivacao da chave: {e}"))
+        .map_err(|e| anyhow::anyhow!("falha na derivação da chave: {e}"))
 }
 
 /// Criptografa o cofre com a senha mestra, retornando os bytes do arquivo.
@@ -123,7 +140,7 @@ pub fn encrypt_vault(vault: &Vault, password: &str) -> anyhow::Result<Vec<u8>> {
 /// Descriptografa os bytes de um arquivo de cofre com a senha mestra.
 pub fn decrypt_vault(data: &[u8], password: &str) -> anyhow::Result<Vault> {
     if data.len() < HEADER_LEN || &data[..8] != MAGIC {
-        anyhow::bail!("arquivo de cofre invalido");
+        anyhow::bail!("arquivo de cofre inválido");
     }
     let salt = &data[8..8 + SALT_LEN];
     let nonce_bytes = &data[8 + SALT_LEN..HEADER_LEN];
@@ -166,20 +183,45 @@ mod tests {
 
     #[test]
     fn old_vault_without_host_key_opens() {
-        // JSON de um cofre gravado antes do campo existir.
+        // JSON de um cofre gravado antes dos campos existirem.
         let json = r#"{"hosts":[{"id":"6f1c2a0e-8a4b-4c1d-9e2f-3a4b5c6d7e8f","name":"a",
             "host":"h","port":22,"username":"u","auth":{"Password":{"password":"p"}}}]}"#;
         let vault: Vault = serde_json::from_str(json).unwrap();
         assert_eq!(vault.hosts.len(), 1);
         assert_eq!(vault.hosts[0].host_key, None);
+        assert_eq!(vault.hosts[0].os, None);
+        assert!(vault.hosts[0].detect_os, "cofre antigo: deteccao ligada");
 
-        // A chave aceita sobrevive a gravacao cifrada.
+        // A chave aceita e o SO detectado sobrevivem a gravacao cifrada.
         let key =
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDx116/S6vbyAU3ZR1ebTYjMs187ZiPcltXd5Dg8Oapm";
+        let os = crate::osinfo::OsInfo {
+            id: "almalinux".into(),
+            name: "AlmaLinux".into(),
+            version: Some("8.10".into()),
+        };
         let mut vault = vault;
         vault.hosts[0].host_key = Some(key.to_string());
+        vault.hosts[0].os = Some(os.clone());
         let bytes = encrypt_vault(&vault, "master").unwrap();
         let back = decrypt_vault(&bytes, "master").unwrap();
         assert_eq!(back.hosts[0].host_key.as_deref(), Some(key));
+        assert_eq!(back.hosts[0].os.as_ref(), Some(&os));
+        assert!(back.hosts[0].detect_os);
+
+        // Deteccao desligada no editor sobrevive a gravacao.
+        let mut vault = back;
+        vault.hosts[0].detect_os = false;
+        let bytes = encrypt_vault(&vault, "master").unwrap();
+        assert!(!decrypt_vault(&bytes, "master").unwrap().hosts[0].detect_os);
+
+        // Campo desconhecido (versao futura) nao impede de abrir; SO sem a
+        // versao (distribuicao continua) tambem abre.
+        let json = r#"{"hosts":[{"id":"6f1c2a0e-8a4b-4c1d-9e2f-3a4b5c6d7e8f","name":"a",
+            "host":"h","port":22,"username":"u","auth":{"Password":{"password":"p"}},
+            "os":{"id":"arch","name":"Arch Linux"},"campo_novo":[1,2]}]}"#;
+        let vault: Vault = serde_json::from_str(json).unwrap();
+        let os = vault.hosts[0].os.as_ref().unwrap();
+        assert_eq!((os.id.as_str(), os.version.as_deref()), ("arch", None));
     }
 }

@@ -295,11 +295,12 @@ fn valid_dir(s: &str) -> Option<String> {
     (s.starts_with('/') && !s.chars().any(char::is_control)).then(|| s.to_string())
 }
 
-/// Abre o subsistema SFTP num canal novo da conexao do terminal.
-async fn open_sftp(session: &client::Handle<Client>) -> anyhow::Result<SftpSession> {
+/// Abre o subsistema SFTP num canal novo da conexao (a do terminal, para os
+/// envios; a do painel SFTP, para o canal auxiliar de `sftp::AuxSftp`).
+pub(crate) async fn open_sftp(session: &client::Handle<Client>) -> anyhow::Result<SftpSession> {
     let mut ch = timeout(OPEN_TIMEOUT, session.channel_open_session())
         .await
-        .map_err(|_| anyhow::anyhow!("o servidor nao respondeu ao abrir o canal"))??;
+        .map_err(|_| anyhow::anyhow!("o servidor não respondeu ao abrir o canal"))??;
     ch.request_subsystem(true, "sftp").await?;
     // Espera a resposta ANTES de `into_stream()`: depois dele o aceite/recusa
     // do subsistema nao seria mais visivel.
@@ -316,9 +317,9 @@ async fn open_sftp(session: &client::Handle<Client>) -> anyhow::Result<SftpSessi
     .unwrap_or(false);
     if !accepted {
         let _ = ch.close().await;
-        anyhow::bail!("o servidor nao oferece SFTP nesta conexao");
+        anyhow::bail!("o servidor não oferece SFTP nesta conexão");
     }
-    SftpSession::new(ch.into_stream())
+    crate::sftp::start_session(ch.into_stream())
         .await
         .map_err(|e| anyhow::anyhow!("falha ao iniciar o SFTP: {e}"))
 }
@@ -378,7 +379,7 @@ async fn upload_files(
             .unwrap_or_default();
         let result = async {
             let name = remote_name(local)
-                .ok_or_else(|| anyhow::anyhow!("nome de arquivo nao suportado"))?;
+                .ok_or_else(|| anyhow::anyhow!("nome de arquivo não suportado"))?;
             let size = tokio::fs::metadata(local).await?.len();
             let progress = |bytes: u64| {
                 let _ = tx.send(UploadEvent::Progress {
@@ -432,18 +433,18 @@ async fn copy_file(
     if !replace {
         let r = write_new(sftp, local, &target, None, buf, &progress).await;
         if r.is_err() && sftp.symlink_metadata(target).await.is_ok() {
-            anyhow::bail!("ja existe no servidor");
+            anyhow::bail!("já existe no servidor");
         }
         return r;
     }
     let mode = match sftp.symlink_metadata(target.clone()).await {
         Ok(m) if m.file_type().is_file() => m.permissions.map(|p| p & 0o7777),
-        Ok(_) => anyhow::bail!("o destino nao e um arquivo comum; nada foi substituido"),
+        Ok(_) => anyhow::bail!("o destino não é um arquivo comum; nada foi substituído"),
         // Sumiu desde a pergunta: vira um envio comum de arquivo novo.
         Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => {
             return write_new(sftp, local, &target, None, buf, &progress).await;
         }
-        Err(e) => anyhow::bail!("nao foi possivel conferir o destino: {e}"),
+        Err(e) => anyhow::bail!("não foi possível conferir o destino: {e}"),
     };
     let tmp = join_remote(dir, &format!(".{name}.sagu-{:08x}.part", rand::random::<u32>()));
     if let Err(e) = write_new(sftp, local, &tmp, mode, buf, &progress).await {
@@ -452,11 +453,11 @@ async fn copy_file(
     }
     if let Err(e) = sftp.remove_file(target.clone()).await {
         let _ = sftp.remove_file(tmp).await;
-        anyhow::bail!("nao foi possivel substituir o original: {e}");
+        anyhow::bail!("não foi possível substituir o original: {e}");
     }
     sftp.rename(tmp.clone(), target)
         .await
-        .map_err(|e| anyhow::anyhow!("o novo conteudo ficou em {tmp}: {e}"))
+        .map_err(|e| anyhow::anyhow!("o novo conteúdo ficou em {tmp}: {e}"))
 }
 
 /// Cria `remote` (EXCLUDE) e grava o arquivo local em blocos. `mode`:
@@ -482,7 +483,7 @@ async fn write_new(
         attrs.permissions = Some(mode);
         dst.set_metadata(attrs)
             .await
-            .map_err(|e| anyhow::anyhow!("nao foi possivel aplicar as permissoes: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("não foi possível aplicar as permissões: {e}"))?;
     }
     let mut done: u64 = 0;
     let mut last = Instant::now();
@@ -493,7 +494,7 @@ async fn write_new(
         }
         timeout(STALL_TIMEOUT, dst.write_all(&buf[..n]))
             .await
-            .map_err(|_| anyhow::anyhow!("envio parado ha {}s", STALL_TIMEOUT.as_secs()))??;
+            .map_err(|_| anyhow::anyhow!("envio parado há {}s", STALL_TIMEOUT.as_secs()))??;
         done += n as u64;
         if last.elapsed() >= PROGRESS_EVERY {
             last = Instant::now();
@@ -638,7 +639,7 @@ mod tests {
         // Caminho UNC do Windows para o arquivo remoto (so '\' como separador).
         let remote = |p: &str| root.join(p.trim_start_matches('/').replace('/', "\\"));
 
-        let h = ssh::connect(host, 120, 30, || {});
+        let h = ssh::connect(host, 120, 30, false, || {});
         // Espera um evento que satisfaca `f`, ignorando a saida do terminal.
         let wait = |what: &str, f: &mut dyn FnMut(&SshToUi) -> bool| -> SshToUi {
             let t0 = Instant::now();
@@ -793,7 +794,11 @@ mod tests {
             }
             other => panic!("esperava plano (tmux): {other:?}"),
         }
+        // So o servidor isolado do teste (nunca o do usuario). O socket dele
+        // fica na pasta de sockets do tmux: apagado pelo shell de fora (o de
+        // dentro morre com o servidor).
         run("tmux -L sagu-e2e kill-server");
+        run("rm -f \"${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/sagu-e2e\"");
 
         // Encerramento normal.
         run("exit");
@@ -822,11 +827,19 @@ mod tests {
             private_key: std::fs::read_to_string(env("SAGU_E2E_KEY")).unwrap(),
             passphrase: None,
         };
-        let h = ssh::connect(host, 120, 30, || {});
+        let h = ssh::connect(host, 120, 30, false, || {});
         let t0 = Instant::now();
         let mut plan = None;
         let mut connected = false;
         let mut dropped = false;
+        // Arquivo local solto no terminal; apagado no fim (ou se falhar).
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let f = Temp(std::env::temp_dir().join(format!("sagu-e2e-login-{}.txt", std::process::id())));
         while t0.elapsed() < Duration::from_secs(25) && plan.is_none() {
             if let Ok(ev) = h.from_ssh.recv_timeout(Duration::from_millis(200)) {
                 match ev {
@@ -845,9 +858,8 @@ mod tests {
             if connected && !dropped && t0.elapsed() > Duration::from_secs(3) {
                 h.send_data(b"cd /tmp/sagu-e2e-tmux\n".to_vec());
                 std::thread::sleep(Duration::from_millis(900));
-                let f = std::env::temp_dir().join(format!("sagu-e2e-login-{}.txt", std::process::id()));
-                std::fs::write(&f, "x").unwrap();
-                h.drop_files(9, vec![f]);
+                std::fs::write(&f.0, "x").unwrap();
+                h.drop_files(9, vec![f.0.clone()]);
                 dropped = true;
             }
         }

@@ -264,12 +264,12 @@ mod tests {
         host
     }
 
-    /// Proximo evento da sessao SSH (ignora a saida do terminal).
+    /// Proximo evento da sessao SSH (ignora a saida do terminal e o SO).
     fn next_ev(h: &SshHandle, secs: u64) -> Option<SshToUi> {
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(secs) {
             match h.from_ssh.recv_timeout(Duration::from_millis(100)) {
-                Ok(SshToUi::Data(_)) => {}
+                Ok(SshToUi::Data(_) | SshToUi::Os(_)) => {}
                 Ok(ev) => return Some(ev),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => return None,
@@ -285,7 +285,7 @@ mod tests {
             Some(SshToUi::Error(e)) => panic!("erro antes da pergunta: {e}"),
             Some(SshToUi::Closed) => panic!("sessao fechou antes da pergunta"),
             Some(SshToUi::Upload(u)) => panic!("evento inesperado: {u:?}"),
-            Some(SshToUi::Data(_)) => unreachable!(),
+            Some(SshToUi::Data(_) | SshToUi::Os(_)) => unreachable!(),
             None => panic!("tempo esgotado esperando a pergunta da chave"),
         }
     }
@@ -297,7 +297,7 @@ mod tests {
             Some(SshToUi::Error(e)) => panic!("erro ao conectar: {e}"),
             Some(SshToUi::Closed) => panic!("sessao fechou sem conectar"),
             Some(SshToUi::Upload(u)) => panic!("evento inesperado: {u:?}"),
-            Some(SshToUi::Data(_)) => unreachable!(),
+            Some(SshToUi::Data(_) | SshToUi::Os(_)) => unreachable!(),
             None => panic!("tempo esgotado esperando a conexao"),
         }
     }
@@ -310,7 +310,7 @@ mod tests {
             Some(SshToUi::HostKey(_)) => panic!("perguntou de novo"),
             Some(SshToUi::Closed) => panic!("fechou sem erro"),
             Some(SshToUi::Upload(u)) => panic!("evento inesperado: {u:?}"),
-            Some(SshToUi::Data(_)) => unreachable!(),
+            Some(SshToUi::Data(_) | SshToUi::Os(_)) => unreachable!(),
             None => panic!("tempo esgotado esperando o erro"),
         };
         assert!(
@@ -331,7 +331,7 @@ mod tests {
     }
 
     fn ssh_connect(host: &Host) -> SshHandle {
-        ssh::connect(host.clone(), 80, 24, || {})
+        ssh::connect(host.clone(), 80, 24, false, || {})
     }
 
     #[test]
@@ -418,7 +418,7 @@ mod tests {
     }
 
     fn sftp_connect(host: &Host) -> SftpHandle {
-        sftp::connect(host.clone(), || {})
+        sftp::connect(host.clone(), false, || {})
     }
 
     fn expect_sftp_connected(h: &SftpHandle) {

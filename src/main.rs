@@ -5,12 +5,16 @@ mod app;
 mod download;
 mod hostkey;
 mod instance;
+mod osinfo;
+mod paste;
 mod pty;
 mod sftp;
 mod ssh;
 mod terminal;
 mod upload;
 mod vault;
+mod viewer;
+mod vtfix;
 
 use app::App;
 
@@ -37,8 +41,8 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1000.0, 680.0])
         .with_min_inner_size([640.0, 420.0])
-        // Versao vem do Cargo.toml (em tempo de compilacao).
-        .with_title(concat!("SaguTerm v", env!("CARGO_PKG_VERSION")));
+        // Titulo sem a versao (ela aparece no topo da ajuda); instance.rs procura a janela por ele.
+        .with_title(instance::WINDOW_TITLE);
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);
     }

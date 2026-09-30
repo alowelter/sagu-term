@@ -23,6 +23,10 @@ pub enum Start {
     Unchecked,
 }
 
+/// Titulo da janela principal. Sem a versao desde a 1.1.0 (ela fica no topo
+/// da ajuda, F1); `imp` procura a janela por ele.
+pub const WINDOW_TITLE: &str = "SaguTerm";
+
 #[cfg(windows)]
 pub use imp::{start, Slot};
 
@@ -54,8 +58,18 @@ mod imp {
     /// abrindo agora mesmo).
     const WAIT: Duration = Duration::from_secs(3);
 
-    /// Comeco do titulo da janela principal (definido em main.rs).
-    const TITLE_PREFIX: &str = "SaguTerm v";
+    /// Titulo ate a 1.0.1 ("SaguTerm v1.0.1"). Na troca de versao pela Store a
+    /// janela da versao anterior pode seguir aberta: a nova ainda a reconhece.
+    const OLD_TITLE_PREFIX: &str = "SaguTerm v";
+
+    /// Titulo da janela principal: exatamente "SaguTerm", ou o antigo "SaguTerm v"
+    /// seguido de um digito. Dialogos e janelas auxiliares do processo nao contam.
+    fn is_main_title(title: &str) -> bool {
+        title == super::WINDOW_TITLE
+            || title
+                .strip_prefix(OLD_TITLE_PREFIX)
+                .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()))
+    }
 
     type Handle = *mut c_void;
     type Hwnd = *mut c_void;
@@ -182,7 +196,8 @@ mod imp {
     }
 
     /// Janela principal do processo `pid`: de nivel superior, sem dono,
-    /// visivel (inclusive minimizada) e com o titulo do SaguTerm.
+    /// visivel (inclusive minimizada) e com o titulo do SaguTerm (o atual ou
+    /// o antigo com a versao, ver `is_main_title`).
     fn main_window(pid: u32) -> Option<Hwnd> {
         struct Search {
             pid: u32,
@@ -200,7 +215,7 @@ mod imp {
                 }
                 let mut text = [0u16; 64];
                 let n = GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32).max(0) as usize;
-                if String::from_utf16_lossy(&text[..n]).starts_with(TITLE_PREFIX) {
+                if is_main_title(&String::from_utf16_lossy(&text[..n])) {
                     search.found = hwnd;
                     return 0;
                 }
@@ -258,6 +273,36 @@ mod imp {
             let (slot, _) = Slot::open(&name).expect("criar o objeto");
             assert_eq!(slot.pid().load(Ordering::Acquire), 0);
             assert!(!activate(&slot, Duration::from_millis(100)));
+        }
+
+        #[test]
+        fn main_title_accepts_new_and_old() {
+            // Titulo atual e o antigo com versao (janela da versao anterior
+            // ainda aberta durante a troca pela Store).
+            for t in ["SaguTerm", "SaguTerm v1.0.1", "SaguTerm v0.1.7"] {
+                assert!(is_main_title(t), "{t:?}");
+            }
+            // Dialogos e outras janelas do processo nao sao a principal.
+            for t in [
+                "SaguTerm v",
+                "SaguTerm vX",
+                "SaguTerm - Abrir",
+                "SaguTerm ",
+                "saguterm",
+                "Abrir",
+                "Salvar como",
+                "",
+            ] {
+                assert!(!is_main_title(t), "{t:?}");
+            }
+        }
+
+        #[test]
+        fn window_title_is_plain_name() {
+            // Sem criar janela: gives_up_when_no_window_shows_up roda em
+            // paralelo e conta com o processo de teste sem janelas.
+            assert_eq!(super::super::WINDOW_TITLE, "SaguTerm");
+            assert!(is_main_title(super::super::WINDOW_TITLE));
         }
     }
 }
