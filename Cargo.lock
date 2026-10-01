@@ -4206,6 +4206,7 @@ dependencies = [
  "tokio",
  "uuid",
  "vt100",
+ "windows 0.62.2",
  "winresource",
  "zeroize",
 ]

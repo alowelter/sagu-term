@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Vec2};
 
+use crate::emoji;
 use crate::vtfix::{Piece, VtFix};
 
 /// Cor de fundo padrao do terminal (compartilhada por render e resolucao de
@@ -974,6 +975,8 @@ impl Terminal {
         // fundos: ja alinhados aos pixels, dispensam o anti-serrilhado de um
         // retangulo por ponto, que custa muito mais para tesselar.
         let mut dots = egui::Mesh::default();
+        // Emojis e caracteres desenhados pelo sistema: (textura, retangulo).
+        let mut images: Vec<(egui::TextureId, Rect)> = Vec::new();
 
         for row in 0..self.rows {
             let y = rect.min.y + row as f32 * cell_h;
@@ -1080,7 +1083,29 @@ impl Terminal {
                             dots.add_colored_rect(dot, fg);
                         }
                     } else if !s.is_empty() {
-                        painter.text(cell_rect.min, Align2::LEFT_TOP, s, font_id.clone(), fg);
+                        // Emoji, ou caractere que a fonte nao tem: imagem do
+                        // sistema (pintada no fim, por cima dos fundos, pois
+                        // pode ocupar a celula vazia seguinte). Senao, fonte.
+                        let next_blank = !cell.is_wide()
+                            && col + 1 < self.cols
+                            && screen
+                                .cell(row, col + 1)
+                                .is_some_and(|n| n.contents().trim().is_empty());
+                        let sistema = system_glyph(
+                            painter,
+                            s,
+                            cell.is_wide(),
+                            cell_rect,
+                            next_blank,
+                            font_id,
+                            fg,
+                        );
+                        match sistema {
+                            Some(img) => images.push(img),
+                            None => {
+                                painter.text(cell_rect.min, Align2::LEFT_TOP, s, font_id.clone(), fg);
+                            }
+                        }
                     }
                     col += span;
                 }
@@ -1089,6 +1114,10 @@ impl Terminal {
         }
         if !dots.is_empty() {
             painter.add(egui::Shape::mesh(dots));
+        }
+        let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+        for (tex, r) in images {
+            painter.image(tex, r, uv, Color32::WHITE);
         }
 
         // Selecao: overlay translucido no aco claro do tema, nas fileiras da
@@ -1216,6 +1245,51 @@ fn cell_size(fonts: &egui::text::Fonts, font_id: &FontId, ppp: f32) -> (f32, f32
         snap(fonts.glyph_width(font_id, 'M')),
         snap(fonts.row_height(font_id)),
     )
+}
+
+/// Imagem do sistema para a celula `s`, se ela precisar: textura e retangulo
+/// (alinhado aos pixels) onde pinta-la. `None`: a fonte do terminal desenha.
+/// - emoji (🟢, ❤️): colorido, na caixa da celula;
+/// - pictograma que falta na fonte (🛢, 🗂): colorido tambem; numa coluna so
+///   ficaria minusculo, entao usa a celula seguinte se ela estiver vazia;
+/// - outro caractere que falta na fonte (✓, ✗, CJK): da fonte do sistema que
+///   o tiver, na cor do texto e no tamanho da fonte do terminal.
+///
+/// O retangulo e o da caixa aumentado pela folga transparente da imagem, para
+/// a sombra e as bordas do emoji nao serem cortadas.
+fn system_glyph(
+    painter: &egui::Painter,
+    s: &str,
+    wide: bool,
+    cell: Rect,
+    next_blank: bool,
+    font_id: &FontId,
+    fg: Color32,
+) -> Option<(egui::TextureId, Rect)> {
+    let first = s.chars().next()?;
+    let emoji = emoji::is_emoji(s, wide);
+    if !emoji && painter.fonts(|f| f.has_glyph(font_id, first)) {
+        return None;
+    }
+    let pictograma = emoji || emoji::is_pictographic(first);
+    let mut caixa = cell;
+    if pictograma && !wide && next_blank {
+        caixa.max.x += cell.width();
+    }
+    let ppp = painter.pixels_per_point();
+    let px = |v: f32| (v * ppp).round().max(1.0);
+    let (w, h) = (px(caixa.width()) as u32, px(caixa.height()) as u32);
+    let font_px = if pictograma {
+        emoji::emoji_font_px(w, h)
+    } else {
+        font_id.size * ppp
+    };
+    let tex = emoji::texture(painter.ctx(), s, w, h, font_px, fg)?;
+    let pad = emoji::pad_px(w, h) as f32;
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let min = Pos2::new(snap(caixa.min.x) - pad / ppp, snap(caixa.min.y) - pad / ppp);
+    let size = Vec2::new((w as f32 + 2.0 * pad) / ppp, (h as f32 + 2.0 * pad) / ppp);
+    Some((tex, Rect::from_min_size(min, size)))
 }
 
 /// Bits dos pontos, se a celula for um unico caractere braille
@@ -1860,6 +1934,85 @@ mod tests {
             shapes = out.shapes.into_iter().map(|c| c.shape).collect();
         }
         shapes
+    }
+
+    /// Emojis saem como imagem colorida do tamanho da celula (duas colunas), e
+    /// o que falta na fonte (🛢, ✓) sai do sistema em vez de um quadradinho; o
+    /// texto comum, o braille e os simbolos do htop/btop seguem como antes.
+    #[cfg(windows)]
+    #[test]
+    fn paints_emoji_as_color_images() {
+        for ppp in [1.0, 1.5] {
+            let mut t = Terminal::new(12, 3);
+            t.process("a🟢b🟠 ●⣿\r\n\x1b[31m❤\u{fe0f}\x1b[0mz\r\n🛢 x✓y".as_bytes());
+            let shapes = painted(&mut t, ppp);
+
+            let texts: Vec<String> = shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                texts.iter().all(|s| !s.contains(['🟢', '🟠', '❤', '🛢', '✓'])),
+                "ppp={ppp}: {texts:?}"
+            );
+            for s in ["●", "x", "y"] {
+                assert!(texts.iter().any(|t| t.trim() == s), "ppp={ppp}: {s} em {texts:?}");
+            }
+
+            let term = shapes
+                .iter()
+                .find_map(|s| match s {
+                    egui::Shape::Rect(r) if r.fill == TERM_BG => Some(r.rect),
+                    _ => None,
+                })
+                .expect("fundo do terminal");
+            let (cw, ch) = (term.width() / t.cols as f32, term.height() / t.rows as f32);
+            // Imagens: malhas com textura propria (o atlas de fontes e a padrao).
+            let imagens: Vec<(egui::TextureId, Rect)> = shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default() => {
+                        Some((m.texture_id, m.calc_bounds()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(imagens.len(), 5, "ppp={ppp}: {imagens:?}");
+            // A imagem tem folga em volta da celula (a sombra do emoji nao e
+            // cortada): o retangulo pintado e o da celula aumentado por ela.
+            let col = |c: f32, r: f32, span: f32| {
+                let (w, h) = ((span * cw * ppp).round() as u32, (ch * ppp).round() as u32);
+                let pad = emoji::pad_px(w, h) as f32 / ppp;
+                Rect::from_min_size(
+                    term.min + Vec2::new(c * cw, r * ch),
+                    Vec2::new(span * cw, ch),
+                )
+                .expand(pad)
+            };
+            // 🟢 na coluna 1, 🟠 na 4 (duas colunas cada); ❤ + FE0F na linha 2
+            // (uma coluna: a seguinte tem o "z"); na 3, o 🛢 de uma coluna usa
+            // tambem o espaco seguinte e o ✓ fica na sua.
+            let esperado = [
+                col(1.0, 0.0, 2.0),
+                col(4.0, 0.0, 2.0),
+                col(0.0, 1.0, 1.0),
+                col(0.0, 2.0, 2.0),
+                col(3.0, 2.0, 1.0),
+            ];
+            for (got, want) in imagens.iter().zip(esperado) {
+                assert!(
+                    (got.1.min - want.min).abs().max_elem() < 1.0 / ppp + 1e-3
+                        && (got.1.size() - want.size()).abs().max_elem() < 1.0 / ppp + 1e-3,
+                    "ppp={ppp}: imagem {:?} fora da celula {want:?}",
+                    got.1
+                );
+            }
+            // Cada emoji tem a sua textura.
+            assert_ne!(imagens[0].0, imagens[1].0);
+        }
     }
 
     #[test]

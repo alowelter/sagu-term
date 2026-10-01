@@ -63,6 +63,11 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
 - Emulação xterm com 256 cores, que se ajusta sozinha ao tamanho do painel.
 - Programas de tela cheia como o **htop** e o **btop** aparecem no lugar certo, inclusive
   os gráficos do btop, feitos com caracteres braille, que o SaguTerm desenha ponto a ponto.
+- **Emojis coloridos** (🟢 🟠 🚀 ✅ ❤️), desenhados pelo Windows com as mesmas imagens do
+  seletor `Win + .`. Cada emoji ocupa duas colunas, como no servidor; os compostos
+  (família, tom de pele) aparecem como emojis separados em vez de combinados. Símbolos
+  que a fonte do terminal não tem (✓, ✗, 🛢, ideogramas) vêm das fontes do Windows em
+  vez de um quadradinho.
 - **Selecionou, copiou:** o texto selecionado vai direto para a área de transferência.
   O **botão direito cola**.
 - **Histórico de rolagem:** o que já passou pela tela fica guardado (até 5.000 linhas da

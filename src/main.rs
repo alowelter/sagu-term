@@ -3,6 +3,7 @@
 
 mod app;
 mod download;
+mod emoji;
 mod hostkey;
 mod instance;
 mod osinfo;
