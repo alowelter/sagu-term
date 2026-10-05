@@ -8,11 +8,12 @@ use crate::hostkey::{self, HostKeyAnswer, HostKeyPrompt, KeyCheck};
 use crate::osinfo::{self, OsReport};
 use crate::paste;
 use crate::pty;
+use crate::remember;
 use crate::sftp::{self, SftpHandle, SftpToUi};
 use crate::ssh::{self, SshHandle, SshToUi};
 use crate::terminal::Terminal;
 use crate::upload::{self, UploadEvent};
-use crate::vault::{self, AuthMethod, Host, Vault};
+use crate::vault::{self, AuthMethod, Host, Vault, VaultKey};
 use crate::viewer::{self, ViewError, ViewEvent};
 
 const INITIAL_COLS: u16 = 80;
@@ -4930,7 +4931,9 @@ pub struct App {
     // Cofre
     vault: Vault,
     vault_path: Option<PathBuf>,
-    master_password: String,
+    // Chave do cofre aberto (sal + chave derivada da senha), para gravar; a
+    // senha em si nao fica guardada.
+    master_key: Option<VaultKey>,
 
     // Portao
     gate_mode: GateMode,
@@ -4961,6 +4964,13 @@ pub struct App {
 
     // Caminho do ultimo cofre aberto (persistido entre execucoes).
     last_vault_path: String,
+
+    // Arquivo das chaves do "abrir sem senha neste computador" (ver remember);
+    // `None` sem pasta de dados do app (e nos testes, salvo os do proprio recurso).
+    remember_file: Option<PathBuf>,
+
+    // O cofre aberto abre sozinho neste computador (caixa da tela de conexoes).
+    remembered: bool,
 
     // Pede foco no campo de senha ao abrir a janela do cofre.
     gate_focus_requested: bool,
@@ -5113,6 +5123,18 @@ fn host_icon(host: &Host) -> TileIcon {
 
 const STORAGE_LAST_PATH: &str = "last_vault_path";
 
+/// Opcao da tela de conexoes que abre o cofre sem a senha (ver remember). O
+/// que guarda e quando volta a pedir a senha ficam na dica.
+const REMEMBER_LABEL: &str = "Abrir sem senha neste computador";
+const REMEMBER_HINT: &str = "Ao iniciar o SaguTerm neste computador, com o seu usuário do \
+     Windows, este cofre abre direto, sem pedir a senha. A chave do cofre (não a senha) fica \
+     guardada protegida pela sua conta do Windows: em outro computador ou outra conta, o \
+     arquivo continua pedindo a senha. Bloquear o cofre volta a pedir a senha na próxima \
+     abertura. Proteja a conta do Windows com senha ou PIN e bloqueie a tela (Win+L) ao se \
+     afastar.";
+const AUTO_OPEN_FAILED: &str = "O cofre não abriu sozinho neste computador. Digite a senha \
+     e, se quiser, marque de novo \u{201C}Abrir sem senha neste computador\u{201D}.";
+
 /// Versao do app no topo da ajuda (vem do Cargo.toml, em tempo de compilacao).
 const APP_VERSION_LABEL: &str = concat!("versão ", env!("CARGO_PKG_VERSION"));
 /// Altura reservada na ajuda para barra de titulo, cabecalho, rodape e margens;
@@ -5148,7 +5170,7 @@ impl App {
             screen: Screen::Splash,
             vault: Vault::default(),
             vault_path: None,
-            master_password: String::new(),
+            master_key: None,
             gate_mode: GateMode::Open,
             gate_path: last_vault_path.clone(),
             gate_password: String::new(),
@@ -5163,6 +5185,8 @@ impl App {
             logo_load_attempted: false,
             splash_start: Instant::now(),
             last_vault_path,
+            remember_file: remember::default_file(),
+            remembered: false,
             gate_focus_requested: true,
             gate_busy: 0,
             focused_path: None,
@@ -5242,7 +5266,11 @@ impl App {
             .vault_path
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("nenhum cofre aberto"))?;
-        let bytes = vault::encrypt_vault(&self.vault, &self.master_password)?;
+        let key = self
+            .master_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("nenhum cofre aberto"))?;
+        let bytes = vault::encrypt_vault(&self.vault, key)?;
         // Escrita atomica: grava num arquivo temporario ao lado e renomeia por
         // cima. Uma falha no meio (queda de energia, disco cheio) nunca deixa
         // o cofre — unico arquivo com todas as credenciais — corrompido.
@@ -5261,6 +5289,13 @@ impl App {
     }
 
     fn lock(&mut self) {
+        // Abrindo sozinho neste computador: a proxima abertura do app pede a
+        // senha (senao fechar e abrir o app desfaria o bloqueio).
+        if let (true, Some(file), Some(key)) =
+            (self.remembered, &self.remember_file, &self.master_key)
+        {
+            let _ = remember::suspend(file, key.salt());
+        }
         if let Some(root) = &self.root {
             disconnect_tree(root);
         }
@@ -5269,9 +5304,9 @@ impl App {
         self.pending_download = None;
         self.fs_clip = None;
         self.vault = Vault::default();
-        self.master_password.clear();
-        self.gate_password.clear();
-        self.gate_password_confirm.clear();
+        self.master_key = None;
+        self.remembered = false;
+        self.clear_gate_passwords();
         self.editor = None;
         self.hosts_filter.clear();
         self.os_checked.clear();
@@ -5491,47 +5526,125 @@ impl App {
             return;
         }
         let path = PathBuf::from(self.gate_path.trim());
-        let path_str = self.gate_path.trim().to_string();
 
-        match self.gate_mode {
-            GateMode::Open => match std::fs::read(&path) {
-                Ok(bytes) => match vault::decrypt_vault(&bytes, &self.gate_password) {
-                    Ok(v) => {
-                        self.vault = v;
-                        self.vault_path = Some(path);
-                        self.master_password = std::mem::take(&mut self.gate_password);
-                        self.gate_password_confirm.clear();
-                        self.last_vault_path = path_str.clone();
-                        self.screen = Screen::Hosts;
-                    }
-                    Err(e) => self.gate_error = Some(format!("{e}")),
-                },
-                Err(e) => self.gate_error = Some(format!("Não foi possível ler o arquivo: {e}")),
-            },
+        let opened = match self.gate_mode {
+            GateMode::Open => std::fs::read(&path)
+                .map_err(|e| format!("Não foi possível ler o arquivo: {e}"))
+                .and_then(|bytes| {
+                    vault::decrypt_vault(&bytes, &self.gate_password).map_err(|e| format!("{e}"))
+                }),
             GateMode::Create => {
                 if self.gate_password != self.gate_password_confirm {
                     self.gate_error = Some("As senhas não conferem.".into());
                     return;
                 }
                 let v = Vault::default();
-                match vault::encrypt_vault(&v, &self.gate_password) {
-                    Ok(bytes) => match std::fs::write(&path, bytes) {
-                        Ok(()) => {
-                            self.vault = v;
-                            self.vault_path = Some(path);
-                            self.master_password = std::mem::take(&mut self.gate_password);
-                            self.gate_password_confirm.clear();
-                            self.last_vault_path = path_str.clone();
-                            self.screen = Screen::Hosts;
-                        }
-                        Err(e) => {
-                            self.gate_error = Some(format!("Não foi possível gravar: {e}"))
-                        }
-                    },
-                    Err(e) => self.gate_error = Some(format!("{e}")),
-                }
+                VaultKey::new(&self.gate_password)
+                    .and_then(|key| Ok((vault::encrypt_vault(&v, &key)?, key)))
+                    .map_err(|e| format!("{e}"))
+                    .and_then(|(bytes, key)| {
+                        std::fs::write(&path, bytes)
+                            .map(|()| (v, key))
+                            .map_err(|e| format!("Não foi possível gravar: {e}"))
+                    })
+            }
+        };
+        match opened {
+            Ok((v, key)) => self.open_vault(path, v, key, false),
+            Err(e) => self.gate_error = Some(e),
+        }
+    }
+
+    /// Cofre aberto, pela senha ou pela chave guardada neste computador (`auto`):
+    /// vai para a tela de conexoes.
+    fn open_vault(&mut self, path: PathBuf, vault: Vault, key: VaultKey, auto: bool) {
+        // Com a senha, um cofre que abre sozinho neste computador renova a
+        // chave guardada e sai da suspensao do bloqueio.
+        self.remembered = match &self.remember_file {
+            Some(_) if auto => true,
+            Some(file) if remember::state(file, key.salt()) != remember::State::Off => {
+                remember::enable(file, &key).is_ok()
+            }
+            _ => false,
+        };
+        self.last_vault_path = path.to_string_lossy().to_string();
+        self.vault = vault;
+        self.vault_path = Some(path);
+        self.master_key = Some(key);
+        self.clear_gate_passwords();
+        self.screen = Screen::Hosts;
+    }
+
+    /// Ao sair da splash: abre sozinho o ultimo cofre se a chave dele esta
+    /// guardada neste computador (ver remember); senao, o portao pede a senha.
+    fn leave_splash(&mut self) {
+        if !self.try_auto_open() {
+            self.screen = Screen::Gate;
+            self.gate_focus_requested = true;
+        }
+    }
+
+    fn try_auto_open(&mut self) -> bool {
+        let Some(file) = self.remember_file.clone() else {
+            return false;
+        };
+        if self.last_vault_path.trim().is_empty() {
+            return false;
+        }
+        let path = PathBuf::from(self.last_vault_path.trim());
+        let Ok(bytes) = std::fs::read(&path) else {
+            return false;
+        };
+        let Some(salt) = vault::file_salt(&bytes) else {
+            return false;
+        };
+        let opened = match remember::key_for(&file, salt) {
+            Ok(None) => return false,
+            Ok(Some(key)) => vault::decrypt_with_key(&bytes, &key).map(|v| (v, key)),
+            Err(e) => Err(e),
+        };
+        match opened {
+            Ok((v, key)) => {
+                self.open_vault(path, v, key, true);
+                true
+            }
+            Err(_) => {
+                // A chave guardada nao serve mais (senha do Windows redefinida,
+                // arquivo adulterado): apaga e pede a senha.
+                let _ = remember::disable(&file, salt);
+                self.gate_error = Some(AUTO_OPEN_FAILED.into());
+                false
             }
         }
+    }
+
+    /// Liga/desliga o "abrir sem senha neste computador" do cofre aberto.
+    fn set_remembered(&mut self, on: bool) {
+        let (Some(file), Some(key)) = (&self.remember_file, &self.master_key) else {
+            return;
+        };
+        let result = if on {
+            remember::enable(file, key)
+        } else {
+            remember::disable(file, key.salt())
+        };
+        match result {
+            Ok(()) => {
+                self.remembered = on;
+                self.hosts_error = None;
+            }
+            Err(e) => {
+                let acao = if on { "ligar" } else { "desligar" };
+                self.hosts_error = Some(format!("Não foi possível {acao} a abertura sem senha: {e}"));
+            }
+        }
+    }
+
+    /// Apaga as senhas digitadas no portao, sobrescrevendo a memoria delas.
+    fn clear_gate_passwords(&mut self) {
+        use zeroize::Zeroize;
+        self.gate_password.zeroize();
+        self.gate_password_confirm.zeroize();
     }
 
     // ---------------- Lista de hosts ----------------
@@ -5586,10 +5699,30 @@ impl App {
             });
         });
         if let Some(path) = &self.vault_path {
-            ui.label(
-                egui::RichText::new(format!("\u{1f5c4}  {}", path.to_string_lossy()))
-                    .color(TEXT_WEAK),
-            );
+            // Caminho do cofre a esquerda (cortado se nao couber) e, a direita,
+            // a opcao de abrir sem a senha neste computador.
+            let path_text = format!("\u{1f5c4}  {}", path.to_string_lossy());
+            let mut remember_on = self.remembered;
+            let mut toggled = false;
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.remember_file.is_some() {
+                        toggled = painted_checkbox(ui, &mut remember_on, REMEMBER_LABEL)
+                            .on_hover_text(REMEMBER_HINT)
+                            .changed();
+                        ui.add_space(12.0);
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(path_text).color(TEXT_WEAK))
+                                .truncate(),
+                        );
+                    });
+                });
+            });
+            if toggled {
+                self.set_remembered(remember_on);
+            }
         }
         ui.add_space(6.0);
         ui.separator();
@@ -10840,8 +10973,7 @@ impl eframe::App for App {
                 let elapsed = self.splash_start.elapsed().as_secs_f32();
                 let skip = ctx.input(|i| i.pointer.any_pressed() || i.key_pressed(egui::Key::Escape));
                 if elapsed >= SPLASH_SECS || skip {
-                    self.screen = Screen::Gate;
-                    self.gate_focus_requested = true;
+                    self.leave_splash();
                 } else {
                     ctx.request_repaint();
                 }
@@ -11039,7 +11171,7 @@ mod focus_tests {
             screen: Screen::Session,
             vault: Vault::default(),
             vault_path: None,
-            master_password: String::new(),
+            master_key: None,
             gate_mode: GateMode::Open,
             gate_path: String::new(),
             gate_password: String::new(),
@@ -11054,6 +11186,8 @@ mod focus_tests {
             logo_load_attempted: false,
             splash_start: Instant::now(),
             last_vault_path: String::new(),
+            remember_file: None,
+            remembered: false,
             gate_focus_requested: false,
             gate_busy: 0,
             focused_path: None,
@@ -11813,7 +11947,7 @@ mod focus_tests {
         let dir = temp_dir("hostkey");
         let path = dir.0.join("cofre.sagu");
         app.vault_path = Some(path.clone());
-        app.master_password = "t".into();
+        app.master_key = Some(VaultKey::new("t").unwrap());
 
         // Dois paineis do mesmo host, com a mesma chave: um clique libera os dois.
         app.split_pane(&[], SplitDir::SideBySide);
@@ -11834,7 +11968,7 @@ mod focus_tests {
 
         // Gravado na hora, cifrado, no arquivo do cofre.
         let bytes = std::fs::read(&path).unwrap();
-        let back = vault::decrypt_vault(&bytes, "t").unwrap();
+        let back = vault::decrypt_vault(&bytes, "t").unwrap().0;
         assert_eq!(back.hosts[0].host_key.as_deref(), Some(KEY_A));
     }
 
@@ -13224,13 +13358,13 @@ mod focus_tests {
         let dir = temp_dir("os");
         let path = dir.0.join("cofre.sagu");
         app.vault_path = Some(path.clone());
-        app.master_password = "t".into();
+        app.master_key = Some(VaultKey::new("t").unwrap());
         (dir, path)
     }
 
     /// SO do primeiro host gravado no arquivo do cofre.
     fn saved_os(path: &std::path::Path) -> Option<OsInfo> {
-        let back = vault::decrypt_vault(&std::fs::read(path).unwrap(), "t").unwrap();
+        let back = vault::decrypt_vault(&std::fs::read(path).unwrap(), "t").unwrap().0;
         back.hosts[0].os.clone()
     }
 
@@ -13391,7 +13525,7 @@ mod focus_tests {
         assert!(!app.vault.hosts[0].detect_os);
         assert_eq!(app.vault.hosts[0].os, None);
         assert!(!app.wants_os_probe(&app.vault.hosts[0]));
-        let back = vault::decrypt_vault(&std::fs::read(&path).unwrap(), "t").unwrap();
+        let back = vault::decrypt_vault(&std::fs::read(&path).unwrap(), "t").unwrap().0;
         assert!(!back.hosts[0].detect_os);
         assert_eq!(back.hosts[0].os, None);
 
@@ -16582,5 +16716,205 @@ mod focus_tests {
             }
             _ => panic!("Renomear nao confirmou"),
         }
+    }
+
+    /// Quadro da tela de conexoes (tema claro do Windows, como o do usuario).
+    fn hosts_frame(
+        ctx: &egui::Context,
+        app: &mut App,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(light_raw(size, events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.ui_hosts(ui));
+        })
+    }
+
+    /// Cofre de senha "t" com um host, gravado em `dir`; devolve o caminho dele
+    /// e o do arquivo de chaves do "abrir sem senha" (na mesma pasta).
+    fn remember_setup(dir: &TempDir) -> (PathBuf, PathBuf) {
+        let path = dir.0.join("cofre.sagu");
+        let mut v = Vault::default();
+        v.hosts.push(test_host());
+        let bytes = vault::encrypt_vault(&v, &VaultKey::new("t").unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        (path, dir.0.join("data").join("remembered.json"))
+    }
+
+    /// App recem-iniciado (na splash), com o ultimo cofre e o arquivo de chaves.
+    fn starting_app(path: &std::path::Path, file: &std::path::Path) -> App {
+        let mut app = app();
+        app.screen = Screen::Splash;
+        app.root = None;
+        app.last_vault_path = path.to_string_lossy().to_string();
+        app.gate_path = app.last_vault_path.clone();
+        app.remember_file = Some(file.to_path_buf());
+        app
+    }
+
+    fn open_with_password(app: &mut App, password: &str) {
+        app.gate_mode = GateMode::Open;
+        app.gate_password = password.into();
+        app.gate_submit();
+    }
+
+    /// Com a opcao ligada, o app abre o cofre sem a senha ate ser bloqueado; a
+    /// senha religa; desligar volta a pedir a senha.
+    #[cfg(windows)]
+    #[test]
+    fn remember_opens_without_password_until_locked() {
+        let dir = temp_dir("lembrar");
+        let (path, file) = remember_setup(&dir);
+
+        // Sem a opcao: da splash para o portao, que pede a senha.
+        let mut app = starting_app(&path, &file);
+        app.leave_splash();
+        assert!(matches!(app.screen, Screen::Gate));
+        assert_eq!(app.gate_error, None);
+        open_with_password(&mut app, "t");
+        assert!(matches!(app.screen, Screen::Hosts), "{:?}", app.gate_error);
+        assert!(!app.remembered);
+        assert!(app.gate_password.is_empty());
+
+        // Liga; gravar mantem o sal, entao a chave guardada continua valendo.
+        app.set_remembered(true);
+        assert!(app.remembered);
+        app.vault.hosts[0].name = "Renomeado".into();
+        app.save_vault().unwrap();
+
+        // Proxima abertura do app: entra direto, com o cofre gravado.
+        let mut app = starting_app(&path, &file);
+        app.leave_splash();
+        assert!(matches!(app.screen, Screen::Hosts), "{:?}", app.gate_error);
+        assert!(app.remembered);
+        assert_eq!(app.vault.hosts[0].name, "Renomeado");
+        assert_eq!(app.vault_path.as_deref(), Some(path.as_path()));
+        // A senha continua abrindo o arquivo.
+        let (back, _) = vault::decrypt_vault(&std::fs::read(&path).unwrap(), "t").unwrap();
+        assert_eq!(back.hosts[0].name, "Renomeado");
+
+        // Bloquear: a proxima abertura pede a senha...
+        app.lock();
+        assert!(app.master_key.is_none() && !app.remembered);
+        let mut app = starting_app(&path, &file);
+        app.leave_splash();
+        assert!(matches!(app.screen, Screen::Gate));
+        assert_eq!(app.gate_error, None);
+        // ...e digita-la religa a abertura automatica.
+        open_with_password(&mut app, "t");
+        assert!(app.remembered);
+        let mut app = starting_app(&path, &file);
+        app.leave_splash();
+        assert!(matches!(app.screen, Screen::Hosts));
+
+        // Desligar: volta a pedir a senha.
+        app.set_remembered(false);
+        assert!(!app.remembered);
+        let mut app = starting_app(&path, &file);
+        app.leave_splash();
+        assert!(matches!(app.screen, Screen::Gate));
+        assert_eq!(app.gate_error, None);
+    }
+
+    /// Chave guardada que nao serve mais: cofre regravado com outro sal (versao
+    /// anterior do app) pede a senha em silencio; chave adulterada avisa e e
+    /// apagada; cofre que sumiu so cai no portao.
+    #[cfg(windows)]
+    #[test]
+    fn remember_stale_or_broken_key_asks_password() {
+        let dir = temp_dir("lembrar-velho");
+        let (path, file) = remember_setup(&dir);
+        let mut app = starting_app(&path, &file);
+        app.leave_splash();
+        open_with_password(&mut app, "t");
+        app.set_remembered(true);
+
+        // Outro sal.
+        let (v, _) = vault::decrypt_vault(&std::fs::read(&path).unwrap(), "t").unwrap();
+        let bytes = vault::encrypt_vault(&v, &VaultKey::new("t").unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let mut app = starting_app(&path, &file);
+        app.leave_splash();
+        assert!(matches!(app.screen, Screen::Gate));
+        assert_eq!(app.gate_error, None);
+        open_with_password(&mut app, "t");
+        assert!(!app.remembered, "sal novo: a opcao fica desligada");
+
+        // Blob da DPAPI adulterado (ultimo digito trocado).
+        app.set_remembered(true);
+        let salt = app.master_key.as_ref().unwrap().salt().to_vec();
+        let salt_hex: String = salt.iter().map(|b| format!("{b:02x}")).collect();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        for e in json["vaults"].as_array_mut().unwrap() {
+            if e["salt"] == salt_hex.as_str() {
+                let k = e["key"].as_str().unwrap().to_string();
+                let last = if k.ends_with('0') { "1" } else { "0" };
+                e["key"] = format!("{}{last}", &k[..k.len() - 1]).into();
+            }
+        }
+        std::fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+        let mut app = starting_app(&path, &file);
+        app.leave_splash();
+        assert!(matches!(app.screen, Screen::Gate));
+        assert_eq!(app.gate_error.as_deref(), Some(AUTO_OPEN_FAILED));
+        assert_eq!(remember::state(&file, &salt), remember::State::Off);
+        open_with_password(&mut app, "t");
+        assert!(matches!(app.screen, Screen::Hosts));
+        assert_eq!(app.gate_error, None);
+
+        // Ultimo cofre sumiu.
+        app.set_remembered(true);
+        std::fs::remove_file(&path).unwrap();
+        let mut app = starting_app(&path, &file);
+        app.leave_splash();
+        assert!(matches!(app.screen, Screen::Gate));
+        assert_eq!(app.gate_error, None);
+    }
+
+    /// A caixa da tela de conexoes liga e desliga a opcao; cabe inteira na
+    /// janela minima, a direita do caminho do cofre (que e cortado).
+    #[cfg(windows)]
+    #[test]
+    fn remember_checkbox_on_hosts_screen() {
+        let dir = temp_dir("lembrar-caixa");
+        let (path, file) = remember_setup(&dir);
+        let ctx = light_ctx();
+        let mut app = starting_app(&path, &file);
+        app.leave_splash();
+        open_with_password(&mut app, "t");
+        let salt = app.master_key.as_ref().unwrap().salt().to_vec();
+
+        let min = egui::vec2(640.0, 420.0);
+        let click_option = |ctx: &egui::Context, app: &mut App| {
+            let out = hosts_frame(ctx, app, min, vec![]);
+            let texts = painted_texts(&out);
+            let opt = texts.iter().find(|(t, _)| t == REMEMBER_LABEL).expect("opcao pintada").1;
+            assert!(opt.right() <= min.x, "{opt:?}");
+            let caminho = texts
+                .iter()
+                .find(|(t, _)| t.starts_with('\u{1f5c4}'))
+                .expect("caminho do cofre")
+                .1;
+            assert!(caminho.right() <= opt.left(), "caminho invade a opcao: {caminho:?} {opt:?}");
+            assert!((caminho.center().y - opt.center().y).abs() < 4.0, "mesma linha");
+            let pos = opt.center();
+            hosts_frame(ctx, app, min, vec![egui::Event::PointerMoved(pos), click(pos, true)]);
+            hosts_frame(ctx, app, min, vec![click(pos, false)]);
+        };
+        for _ in 0..2 {
+            hosts_frame(&ctx, &mut app, min, vec![]);
+        }
+        click_option(&ctx, &mut app);
+        assert!(app.remembered, "{:?}", app.hosts_error);
+        assert_eq!(remember::state(&file, &salt), remember::State::On);
+        click_option(&ctx, &mut app);
+        assert!(!app.remembered);
+        assert_eq!(remember::state(&file, &salt), remember::State::Off);
+
+        // Sem pasta de dados do app: a opcao nao aparece.
+        app.remember_file = None;
+        let out = hosts_frame(&ctx, &mut app, min, vec![]);
+        assert!(!painted_texts(&out).iter().any(|(t, _)| t == REMEMBER_LABEL));
     }
 }

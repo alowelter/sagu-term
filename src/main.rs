@@ -9,6 +9,7 @@ mod instance;
 mod osinfo;
 mod paste;
 mod pty;
+mod remember;
 mod sftp;
 mod ssh;
 mod terminal;
@@ -18,6 +19,9 @@ mod viewer;
 mod vtfix;
 
 use app::App;
+
+/// Nome do app no eframe: define a pasta de dados (`%APPDATA%\SaguTerm\data`).
+pub const APP_NAME: &str = "SaguTerm";
 
 /// Carrega o mini-logo como icone da janela (embutido no binario).
 fn load_icon() -> Option<egui::IconData> {
@@ -54,7 +58,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "SaguTerm",
+        APP_NAME,
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )

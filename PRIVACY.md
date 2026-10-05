@@ -1,6 +1,6 @@
 # Política de Privacidade do SaguTerm
 
-**Vigência:** 30 de setembro de 2026 · [English version below](#english)
+**Vigência:** 5 de outubro de 2026 · [English version below](#english)
 
 Esta política vale para o SaguTerm distribuído pela **Microsoft Store** e também para um
 executável que você mesmo compile a partir do código-fonte, que é público no GitHub. O
@@ -14,7 +14,9 @@ MIT), mantido por Marcelo Welter ("o desenvolvedor").
   registros (logs) em disco.
 - Suas conexões, senhas e chaves, as chaves públicas dos servidores que você aceitou e o
   sistema operacional detectado em cada servidor ficam num **cofre criptografado**, num
-  arquivo guardado onde você escolher.
+  arquivo guardado onde você escolher. Se você ligar **Abrir sem senha neste computador**,
+  a chave do cofre fica guardada no seu computador, protegida pela sua conta do Windows
+  (seção 1).
 - Os arquivos que você baixa dos seus servidores vão só para a pasta que você escolhe.
 - O visualizador de arquivos do navegador SFTP lê do servidor só o arquivo que você abre,
   para mostrá-lo na tela. O conteúdo fica na memória e não é gravado em disco.
@@ -54,8 +56,9 @@ sistema é detectado de novo). O **Esquecer chave** não os apaga. O cofre guard
 para cada conexão, se a detecção está ligada.
 
 - Todo o conteúdo é criptografado com **AES-256-GCM**. A chave de 256 bits é derivada da
-  sua senha mestra com **Argon2id**, e um *salt* e um *nonce* aleatórios novos são gerados a
-  cada gravação.
+  sua senha mestra com **Argon2id** e de um *salt* aleatório. Um *nonce* aleatório novo é
+  gerado a cada gravação. Nas versões posteriores à 1.1.0, o *salt* é mantido nas gravações
+  seguintes; até a 1.1.0, um *salt* novo era gerado a cada gravação.
 - A senha mestra não é gravada em lugar nenhum. Se você esquecê-la, não há como recuperar
   o cofre.
 - Ao salvar alterações, o app grava primeiro um arquivo temporário `.sagu.tmp` (também
@@ -76,10 +79,39 @@ para cada conexão, se a detecção está ligada.
 
 ### Na memória, enquanto o cofre está aberto
 
-Para poder salvar as suas alterações, o app mantém a senha mestra e o conteúdo do cofre na
-memória enquanto o cofre está aberto. Ao bloquear o cofre, o app descarta esses dados, mas
-não sobrescreve a memória que eles ocupavam. Só a chave derivada da senha é apagada da
-memória ativamente, logo após cada uso.
+Para poder salvar as suas alterações, o app mantém na memória, enquanto o cofre está
+aberto, o conteúdo do cofre e a chave derivada da senha mestra. Nas versões posteriores à
+1.1.0, a senha mestra não fica guardada: o app a descarta logo depois de abrir o cofre (até
+a 1.1.0, ela ficava na memória até o cofre ser bloqueado). Ao bloquear o cofre, o app
+apaga a chave da memória ativamente e descarta o conteúdo do cofre, mas não sobrescreve a
+memória que o conteúdo ocupava.
+
+### Abrir sem senha neste computador
+
+Nas versões posteriores à 1.1.0, a tela de conexões tem a opção **Abrir sem senha neste
+computador**, que vem desligada. Ao ligá-la, o app guarda no arquivo
+`%APPDATA%\SaguTerm\data\remembered.json` a chave de 256 bits do cofre aberto (nunca a
+senha mestra), protegida pela sua conta do Windows com a DPAPI, a proteção de dados do
+próprio Windows. Junto vai o *salt* do cofre, que identifica a qual arquivo a chave
+pertence. Na versão da Microsoft Store, esse arquivo fica na pasta privada do app, como o
+`app.ron` (seção 4).
+
+- Ao iniciar o app, se o último cofre aberto tem a chave guardada, o app o abre direto,
+  sem pedir a senha.
+- Só a mesma conta do Windows, no mesmo computador, consegue usar a chave guardada. O
+  arquivo `.sagu` copiado para outro computador, ou aberto por outra conta do Windows,
+  continua pedindo a senha.
+- Qualquer programa que rode com a sua conta do Windows também consegue pedir ao Windows a
+  chave guardada, e quem usar o computador com a sua sessão do Windows aberta consegue abrir
+  o cofre. A proteção do cofre passa a ser a da sua conta do Windows: use senha ou PIN no
+  Windows e bloqueie a tela (`Win+L`) ao se afastar.
+- Bloquear o cofre não apaga a chave guardada, mas faz a próxima abertura do app pedir a
+  senha. Digitá-la religa a abertura automática.
+- Desmarcar a opção apaga a chave guardada daquele cofre. Se o Windows não devolver a chave
+  (por exemplo, depois de a senha da conta do Windows ser redefinida), o app a apaga e volta
+  a pedir a senha.
+- Se o cofre for salvo na versão 1.1.0 ou anterior, a chave guardada deixa de servir, porque
+  essas versões trocam o *salt* a cada gravação, e o app volta a pedir a senha.
 
 ### Histórico do terminal
 
@@ -267,7 +299,12 @@ você pede, para os servidores que você cadastra.
   da conexão, escolha **Editar**, desmarque **Detectar o sistema do servidor** e clique em
   **Salvar**. O sistema já detectado dessa conexão é apagado, e o cartão volta ao ícone de
   servidor.
-- **Bloquear o cofre:** `Ctrl+L` na tela de conexões ou o botão **Bloquear cofre**.
+- **Bloquear o cofre:** `Ctrl+L` na tela de conexões ou o botão **Bloquear cofre**. Com
+  **Abrir sem senha neste computador** ligado, a próxima abertura do app volta a pedir a
+  senha.
+- **Abrir sem senha neste computador:** desmarque a opção na tela de conexões para apagar
+  a chave guardada daquele cofre. Para apagar as de todos os cofres, com o app fechado,
+  apague o arquivo `remembered.json`, que fica na mesma pasta do `app.ron`.
 - **Apagar o cofre:** apague o arquivo `.sagu` (e um `.sagu.tmp` que tenha sobrado ao lado
   dele). Isso apaga todas as conexões guardadas.
 - **Apagar as preferências:** com o app fechado, apague `%APPDATA%\SaguTerm\data\app.ron`.
@@ -323,7 +360,7 @@ públicas: não inclua senhas, chaves, endereços de servidores nem outros dados
 
 # SaguTerm Privacy Policy
 
-**Effective date:** September 30, 2026
+**Effective date:** October 5, 2026
 
 This policy applies to SaguTerm distributed through the **Microsoft Store** and also to an
 executable you build yourself from the source code, which is public on GitHub. SaguTerm is
@@ -338,7 +375,9 @@ Portuguese version prevails.
   disk.
 - Your connections, passwords and keys, the public keys of the servers you accepted, and
   the operating system detected on each server are kept in an **encrypted vault**, in a
-  file stored wherever you choose.
+  file stored wherever you choose. If you turn on **Abrir sem senha neste computador** (Open
+  without password on this computer), the vault's key is kept on your computer, protected
+  by your Windows account (section 1).
 - Files you download from your servers go only to the folder you choose.
 - The file viewer in the SFTP browser reads from the server only the file you open, to show
   it on screen. Its content stays in memory and is not written to disk.
@@ -378,8 +417,9 @@ a new key from the server (the system is detected again). **Esquecer chave** (Fo
 does not delete it. The vault also stores, for each connection, whether detection is on.
 
 - All of its content is encrypted with **AES-256-GCM**. The 256-bit key is derived from
-  your master password with **Argon2id**, and a new random salt and nonce are generated on
-  every save.
+  your master password and a random salt with **Argon2id**. A new random nonce is generated
+  on every save. In versions after 1.1.0, the salt is kept on later saves; up to 1.1.0, a
+  new salt was generated on every save.
 - The master password is never stored anywhere. If you forget it, the vault cannot be
   recovered.
 - When saving changes, the app first writes a temporary `.sagu.tmp` file (also encrypted)
@@ -399,10 +439,40 @@ does not delete it. The vault also stores, for each connection, whether detectio
 
 ### In memory, while the vault is open
 
-To be able to save your changes, the app keeps the master password and the vault content
-in memory while the vault is open. When you lock the vault, the app discards this data but
-does not overwrite the memory it used. Only the key derived from the password is actively
-wiped from memory, right after each use.
+To be able to save your changes, the app keeps the vault content and the key derived from
+the master password in memory while the vault is open. In versions after 1.1.0, the master
+password itself is not kept: the app discards it right after opening the vault (up to
+1.1.0, it stayed in memory until the vault was locked). When you lock the vault, the app
+actively wipes the key from memory and discards the vault content, but does not overwrite
+the memory the content used.
+
+### Open without password on this computer
+
+In versions after 1.1.0, the connections screen has the option **Abrir sem senha neste
+computador** (Open without password on this computer), which is off by default. When you
+turn it on, the app stores in the file `%APPDATA%\SaguTerm\data\remembered.json` the
+256-bit key of the open vault (never the master password), protected by your Windows
+account with DPAPI, Windows' own data protection. Next to it goes the vault's salt, which
+identifies which file the key belongs to. In the Microsoft Store version, this file is in
+the app's private folder, like `app.ron` (section 4).
+
+- When the app starts, if the last opened vault has its key stored, the app opens it
+  directly, without asking for the password.
+- Only the same Windows account, on the same computer, can use the stored key. The `.sagu`
+  file copied to another computer, or opened by another Windows account, still asks for the
+  password.
+- Any program running under your Windows account can also ask Windows for the stored key,
+  and anyone using the computer with your Windows session unlocked can open the vault. The
+  vault's protection becomes that of your Windows account: use a password or PIN in Windows
+  and lock the screen (`Win+L`) when you step away.
+- Locking the vault does not delete the stored key, but makes the next start of the app ask
+  for the password. Typing it turns automatic opening back on.
+- Unchecking the option deletes that vault's stored key. If Windows does not return the key
+  (for example, after the Windows account password is reset), the app deletes it and asks
+  for the password again.
+- If the vault is saved with version 1.1.0 or earlier, the stored key no longer works,
+  because those versions change the salt on every save, and the app asks for the password
+  again.
 
 ### Terminal history
 
@@ -591,7 +661,11 @@ ones you ask for, to the servers you register.
   sistema do servidor** (Detect the server's system) and click **Salvar** (Save). The system
   already detected for that connection is deleted, and the card goes back to the server icon.
 - **Lock the vault:** `Ctrl+L` on the connections screen, or the **Bloquear cofre** (Lock
-  vault) button.
+  vault) button. With **Abrir sem senha neste computador** (Open without password on this
+  computer) on, the next start of the app asks for the password again.
+- **Open without password on this computer:** uncheck the option on the connections screen
+  to delete that vault's stored key. To delete the keys of all vaults, with the app closed,
+  delete the `remembered.json` file, in the same folder as `app.ron`.
 - **Delete the vault:** delete the `.sagu` file (and any `.sagu.tmp` file left next to
   it). This deletes all stored connections.
 - **Delete the settings:** with the app closed, delete

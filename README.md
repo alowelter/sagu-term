@@ -183,6 +183,11 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
   precisar, use **Esquecer chave** para confirmá-la de novo na próxima conexão. Trocar o
   endereço ou a porta também apaga a chave guardada.
 - Na tela de conexões, `Ctrl+L` **bloqueia o cofre** na hora.
+- **Abrir sem senha neste computador:** marque a opção na tela de conexões e, nas próximas
+  vezes, o SaguTerm abre o cofre direto ao iniciar, sem pedir a senha. A chave do cofre
+  (nunca a senha) fica guardada protegida pela sua conta do Windows. Em outro computador ou
+  em outra conta do Windows, o arquivo continua pedindo a senha. Bloquear o cofre faz a
+  próxima abertura pedir a senha de novo.
 - O cofre é salvo de forma atômica, então uma queda de energia no meio da gravação não
   corrompe o arquivo.
 - **Uma janela só:** abrir o SaguTerm com ele já aberto (atalho de teclado, menu Iniciar,
@@ -250,7 +255,13 @@ No topo da ajuda aparece a versão instalada.
   *salt* aleatório. O arquivo é autossuficiente e portátil. Não abra o cofre nas versões
   antigas 0.1.x: elas não conferem a chave do servidor e, ao salvar qualquer alteração,
   apagam as chaves guardadas. De volta a esta versão, cada servidor apareceria como novo.
-- **Na memória:** a chave derivada é apagada logo após o uso.
+- **Na memória:** a senha mestra é descartada assim que o cofre abre. A chave derivada
+  fica na memória enquanto o cofre está aberto, para gravar as alterações, e é apagada ao
+  bloquear.
+- **Abrir sem senha neste computador:** a chave do cofre fica guardada com a DPAPI do
+  Windows, que só a devolve à sua conta do Windows, neste computador. Com a opção ligada,
+  a proteção do cofre passa a ser a da sua conta do Windows: use senha ou PIN no Windows e
+  bloqueie a tela (`Win+L`) ao se afastar.
 - **Chave do servidor:** o SaguTerm confere a chave de cada servidor no estilo do PuTTY
   (*trust on first use*). Na primeira conexão, você confere a impressão digital SHA256 e
   decide se confia. A chave aceita fica guardada no cofre criptografado, e não no
