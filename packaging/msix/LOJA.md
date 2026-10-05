@@ -108,6 +108,7 @@ Tudo foi pensado para o teclado. Digite parte do nome da conexão, aperte Enter 
 
 TERMINAL SSH
 • Emulação xterm com 256 cores, que se ajusta sozinha ao tamanho do painel.
+• Emojis coloridos e símbolos de todo tipo (✓, ✗, ideogramas), desenhados pelo próprio Windows.
 • Selecionou, copiou: o texto selecionado vai direto para a área de transferência, e o botão direito cola.
 • Autenticação por senha ou por chave privada (formato OpenSSH ou PEM, com passphrase opcional).
 • Verificação da chave do servidor, no SSH e no SFTP: na primeira conexão, você confere o tipo e a impressão digital SHA256 da chave e decide se confia. A chave aceita fica guardada no cofre. Se o servidor apresentar outra chave depois, um alerta aparece antes de qualquer senha ser enviada, e cancelar é o padrão.
@@ -138,6 +139,7 @@ COFRE E CONEXÕES
 • Ao passar o mouse sobre um cartão, a dica mostra o nome completo da conexão, o endereço, o tipo de autenticação e, quando identificado, o sistema do servidor.
 • Ao editar uma conexão, veja a impressão digital da chave do servidor guardada ou esqueça a chave para confirmá-la de novo.
 • Bloqueie o cofre na hora com Ctrl+L.
+• Abrir sem senha neste computador: ao iniciar, o cofre abre direto, com a chave guardada protegida pela sua conta do Windows. Em outro computador, o arquivo continua pedindo a senha, e bloquear o cofre volta a pedir a senha na próxima abertura.
 • O cofre é gravado de forma atômica: uma queda de energia no meio da gravação não corrompe o arquivo.
 
 PRIVACIDADE
@@ -155,8 +157,16 @@ Leve e rápido: escrito em Rust do começo ao fim, incluindo o SSH (sem OpenSSL)
 
 ### What's new in this version (Novidades desta versão)
 
-Limite: 1500 caracteres. Texto da 1.1.0 (975 caracteres), com as melhorias do navegador SFTP
-(inclusive copiar e mover), do terminal, do ícone do sistema, dos cartões e da ajuda:
+Limite: 1500 caracteres. Texto da 1.2.0 (648 caracteres), com o abrir sem senha neste
+computador e os emojis do terminal:
+
+```text
+Abrir sem senha neste computador: marque a opção na tela de conexões e o SaguTerm passa a abrir o cofre direto ao iniciar, sem pedir a senha mestra. A chave do cofre fica guardada protegida pela sua conta do Windows: em outro computador ou em outra conta, o arquivo continua pedindo a senha, e bloquear o cofre (Ctrl+L) faz a próxima abertura pedir a senha de novo.
+A senha mestra não fica mais na memória enquanto o cofre está aberto, e salvar alterações no cofre ficou mais rápido.
+Terminal: emojis coloridos, como os do seletor do Windows (Win+.), e símbolos que faltavam na fonte, como ✓, ✗ e ideogramas, deixaram de aparecer como quadradinhos.
+```
+
+Texto da 1.1.0, só de referência:
 
 ```text
 Navegador SFTP: copie e mova arquivos e pastas no servidor com Ctrl+C, Ctrl+X e Ctrl+V. Enter num arquivo abre um visualizador somente leitura, com busca e cópia; arquivos binários mostram um aviso. A linha ".." sobe com Enter, PageUp, PageDown, Home, End e as primeiras letras do nome movem na lista, e a barra do caminho aceita digitar outro caminho. Pastas em âmbar com "/" e links simbólicos com seta, com o destino na dica.
@@ -184,11 +194,11 @@ Um recurso por campo, sem marcadores (a Store já coloca). Até 20 itens, com no
 caracteres cada.
 
 ```text
-Terminal SSH com emulação xterm de 256 cores, que se ajusta ao painel, e keepalive para a sessão não cair
+Terminal SSH com emulação xterm de 256 cores e emojis coloridos, que se ajusta ao painel, e keepalive para a sessão não cair
 Selecionou, copiou: o texto selecionado vai para a área de transferência, e o botão direito cola
 Autenticação por senha ou chave privada (OpenSSH ou PEM, com passphrase opcional)
 Verificação da chave do servidor: confira a impressão digital na primeira conexão e receba um alerta se ela mudar
-Cofre criptografado com AES-256-GCM e chave derivada da senha mestra por Argon2id
+Cofre criptografado com AES-256-GCM e Argon2id, com a opção de abrir sem senha no seu computador (chave protegida pela sua conta do Windows)
 Painéis divididos lado a lado ou empilhados, misturando sessões SSH, SFTP e terminais locais
 Prompt de Comando e WSL nos mesmos painéis dos servidores remotos
 Navegador SFTP: navegue pelas pastas, renomeie, altere permissões e proprietário e exclua arquivos
@@ -382,14 +392,13 @@ Abra o **SaguTerm** pelo menu Iniciar e confira:
 - no F1, o topo da ajuda mostra `SaguTerm` e `versão <versão>`, a mesma do `Cargo.toml`, e o
   título da janela é só `SaguTerm`;
 - com o app de teste aberto, abri-lo de novo pelo menu Iniciar traz a mesma janela para a
-  frente, sem abrir outra (a janela é achada pelo título, que mudou na 1.1.0). Se a 1.0.1
-  da Store estiver aberta (título `SaguTerm v1.0.1`), abrir o app de teste traz a janela
-  dela para a frente, como na troca de versão pela Store; feche-a antes de seguir. O
-  inverso não vale: com o app de teste aberto, a 1.0.1 não reconhece o título novo e,
-  depois de uns 3 segundos, abre outra janela. Isso só acontece nesse teste, porque a Store
-  não volta a abrir uma versão anterior depois de atualizar. A 1.0.0 não tem essa função;
+  frente, sem abrir outra. Se a versão da Store estiver aberta, abrir o app de teste traz a
+  janela dela para a frente, como na troca de versão pela Store; feche-a antes de seguir;
 - o cofre, o terminal local e uma conexão SSH funcionam como no executável avulso
   (`target\release\SaguTerm.exe`), inclusive a janela "Servidor novo" na primeira conexão;
+- na tela de conexões, marque **Abrir sem senha neste computador**, feche o app e abra de
+  novo pelo menu Iniciar: o cofre abre direto, sem pedir a senha. Depois, `Ctrl+L`, feche e
+  abra: a senha é pedida de novo, e digitá-la religa a abertura automática;
 - deixe uma sessão SSH ou SFTP aberta por uns 5 segundos num servidor de teste (por
   exemplo, uma distribuição do WSL com o `sshd` ligado). Depois disso, o cartão dessa
   conexão (na tela de conexões ou no seletor de um painel novo) mostra o ícone da

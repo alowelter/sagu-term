@@ -57,7 +57,7 @@ para cada conexão, se a detecção está ligada.
 
 - Todo o conteúdo é criptografado com **AES-256-GCM**. A chave de 256 bits é derivada da
   sua senha mestra com **Argon2id** e de um *salt* aleatório. Um *nonce* aleatório novo é
-  gerado a cada gravação. Nas versões posteriores à 1.1.0, o *salt* é mantido nas gravações
+  gerado a cada gravação. A partir da versão 1.2.0, o *salt* é mantido nas gravações
   seguintes; até a 1.1.0, um *salt* novo era gerado a cada gravação.
 - A senha mestra não é gravada em lugar nenhum. Se você esquecê-la, não há como recuperar
   o cofre.
@@ -80,15 +80,15 @@ para cada conexão, se a detecção está ligada.
 ### Na memória, enquanto o cofre está aberto
 
 Para poder salvar as suas alterações, o app mantém na memória, enquanto o cofre está
-aberto, o conteúdo do cofre e a chave derivada da senha mestra. Nas versões posteriores à
-1.1.0, a senha mestra não fica guardada: o app a descarta logo depois de abrir o cofre (até
-a 1.1.0, ela ficava na memória até o cofre ser bloqueado). Ao bloquear o cofre, o app
+aberto, o conteúdo do cofre e a chave derivada da senha mestra. A partir da versão 1.2.0,
+a senha mestra não fica guardada: o app a descarta logo depois de abrir o cofre (até a
+1.1.0, ela ficava na memória até o cofre ser bloqueado). Ao bloquear o cofre, o app
 apaga a chave da memória ativamente e descarta o conteúdo do cofre, mas não sobrescreve a
 memória que o conteúdo ocupava.
 
 ### Abrir sem senha neste computador
 
-Nas versões posteriores à 1.1.0, a tela de conexões tem a opção **Abrir sem senha neste
+A partir da versão 1.2.0, a tela de conexões tem a opção **Abrir sem senha neste
 computador**, que vem desligada. Ao ligá-la, o app guarda no arquivo
 `%APPDATA%\SaguTerm\data\remembered.json` a chave de 256 bits do cofre aberto (nunca a
 senha mestra), protegida pela sua conta do Windows com a DPAPI, a proteção de dados do
@@ -418,8 +418,8 @@ does not delete it. The vault also stores, for each connection, whether detectio
 
 - All of its content is encrypted with **AES-256-GCM**. The 256-bit key is derived from
   your master password and a random salt with **Argon2id**. A new random nonce is generated
-  on every save. In versions after 1.1.0, the salt is kept on later saves; up to 1.1.0, a
-  new salt was generated on every save.
+  on every save. Starting with version 1.2.0, the salt is kept on later saves; up to
+  1.1.0, a new salt was generated on every save.
 - The master password is never stored anywhere. If you forget it, the vault cannot be
   recovered.
 - When saving changes, the app first writes a temporary `.sagu.tmp` file (also encrypted)
@@ -440,15 +440,15 @@ does not delete it. The vault also stores, for each connection, whether detectio
 ### In memory, while the vault is open
 
 To be able to save your changes, the app keeps the vault content and the key derived from
-the master password in memory while the vault is open. In versions after 1.1.0, the master
-password itself is not kept: the app discards it right after opening the vault (up to
+the master password in memory while the vault is open. Starting with version 1.2.0, the
+master password itself is not kept: the app discards it right after opening the vault (up to
 1.1.0, it stayed in memory until the vault was locked). When you lock the vault, the app
 actively wipes the key from memory and discards the vault content, but does not overwrite
 the memory the content used.
 
 ### Open without password on this computer
 
-In versions after 1.1.0, the connections screen has the option **Abrir sem senha neste
+Starting with version 1.2.0, the connections screen has the option **Abrir sem senha neste
 computador** (Open without password on this computer), which is off by default. When you
 turn it on, the app stores in the file `%APPDATA%\SaguTerm\data\remembered.json` the
 256-bit key of the open vault (never the master password), protected by your Windows
