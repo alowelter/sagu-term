@@ -6,8 +6,10 @@
 //! - **copia automaticamente** o texto selecionado para a area de transferencia
 //!   ao soltar o botao do mouse;
 //! - redimensiona o PTY conforme a area disponivel;
-//! - traduz antes do parser as sequencias de cursor que o vt100 ignora (ver
-//!   `vtfix`) e desenha os caracteres braille, que a fonte nao tem;
+//! - traduz antes do parser as sequencias de cursor que o vt100 ignora, ou
+//!   as faz com o que ele conhece (tabulacao para tras e repeticao, que o
+//!   nano usa; ver `vtfix`), e desenha os caracteres braille, que a fonte
+//!   nao tem;
 //! - guarda um historico da tela principal (`SCROLLBACK_LINES` linhas), lido
 //!   com a roda do mouse e Shift+PgUp/PgDn/Home/End. Na tela alternativa
 //!   (tmux, less, htop...) nao ha historico: a roda vira evento de mouse se o
@@ -18,7 +20,7 @@ use std::time::Duration;
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Vec2};
 
 use crate::emoji;
-use crate::vtfix::{Piece, VtFix};
+use crate::vtfix::{Missing, Piece, VtFix};
 
 /// Cor de fundo padrao do terminal (compartilhada por render e resolucao de
 /// cores; celulas com este fundo nao precisam pintar retangulo). Grafite bem
@@ -323,6 +325,16 @@ impl Terminal {
                 was_alt = self.parser.screen().alternate_screen();
                 self.feed(chunk);
             }
+            // O vt100 descartou a sequencia: vai o equivalente que ele
+            // conhece, como um trecho do servidor.
+            Piece::Missing(m) => {
+                let bytes = self.emulate(m);
+                if !bytes.is_empty() {
+                    self.settle_exit();
+                    was_alt = self.parser.screen().alternate_screen();
+                    self.feed(&bytes);
+                }
+            }
             // O vt100 guarda um so conjunto de atributos salvos para as duas
             // telas: um ESC 7 (ou CSI s, como nas caixas de mensagem do btop)
             // na alternativa apaga o que o 1049h salvou da principal, e o
@@ -348,6 +360,42 @@ impl Terminal {
         });
         self.vtfix = vtfix;
         self.settle_exit();
+    }
+
+    /// Bytes que o vt100 conhece para uma sequencia que ele ignora (ver
+    /// `Missing`), a partir do cursor e da tela de agora. As paradas de
+    /// tabulacao sao a cada 8 colunas, como no HT do vt100.
+    fn emulate(&mut self, m: Missing) -> Vec<u8> {
+        let s = self.parser.screen_mut();
+        // As celulas da grade em que se escreve, nao as da visao rolada.
+        let view = s.scrollback();
+        s.set_scrollback(0);
+        let (row, col) = s.cursor_position();
+        let cols = s.size().1.max(1);
+        // Depois de escrever na ultima coluna o cursor fica alem dela (col ==
+        // cols), esperando a quebra; para as tabulacoes ele esta nela.
+        let at = u32::from(col.min(cols - 1));
+        let cha = |c: u32| format!("\x1b[{}G", c + 1).into_bytes();
+        let bytes = match m {
+            // Para a parada anterior a coluna (de 9 a 16, a 8), n vezes.
+            Missing::BackTab(n) => cha(at.div_ceil(8).saturating_sub(u32::from(n)) * 8),
+            Missing::Tab(n) => cha(((at / 8 + u32::from(n)) * 8).min(u32::from(cols) - 1)),
+            Missing::Repeat(n) => {
+                // O caractere logo antes do cursor (o ncurses manda o REP logo
+                // depois dele); num largo, antes do cursor fica a continuacao.
+                let prev = col.checked_sub(1).and_then(|c| match s.cell(row, c) {
+                    Some(cell) if cell.is_wide_continuation() => {
+                        c.checked_sub(1).and_then(|c| s.cell(row, c))
+                    }
+                    other => other,
+                });
+                prev.map_or_else(Vec::new, |cell| {
+                    cell.contents().repeat(usize::from(n)).into_bytes()
+                })
+            }
+        };
+        s.set_scrollback(view);
+        bytes
     }
 
     /// Um trecho para o parser, contando as linhas que sobem para o
@@ -1587,6 +1635,136 @@ mod tests {
             p.process(std::slice::from_ref(b));
         }
         assert_btop_frame(&p);
+    }
+
+    // Bytes reais do nano 2.9.8 e 8.1 (ncurses 6.1, AlmaLinux 8 e 10, pty
+    // 80x24, xterm-256color): cada tecla esconde o cursor, move e o mostra.
+    // Para chegar pela direita a uma coluna multipla de 8, o ncurses manda o
+    // CBT ("CSI Z") no lugar do BS.
+    const NANO_LEFT: &[u8] = b"\x1b[?25l\x08\x1b[?12l\x1b[?25h";
+    const NANO_LEFT_TO_STOP: &[u8] = b"\x1b[?25l\x1b[Z\x1b[?12l\x1b[?25h";
+    /// Backspace no meio da linha: volta e apaga o caractere (DCH).
+    const NANO_BS_MID: &[u8] = b"\x1b[?25l\x08\x1b[1P\x1b[?12l\x1b[?25h";
+    const NANO_BS_MID_TO_STOP: &[u8] = b"\x1b[?25l\x1b[Z\x1b[1P\x1b[?12l\x1b[?25h";
+    /// Backspace no fim da linha: volta, escreve um espaco e volta de novo.
+    const NANO_BS_END: &[u8] = b"\x1b[?25l\x08 \x08\x1b[?12l\x1b[?25h";
+    const NANO_BS_END_TO_STOP: &[u8] = b"\x1b[?25l\x1b[Z \x1b[Z\x1b[?12l\x1b[?25h";
+
+    #[test]
+    fn nano_left_arrow_and_backspace_cross_tab_stops() {
+        let cur = |t: &Terminal| t.parser.screen().cursor_position();
+        let mut t = Terminal::new(80, 24);
+        t.process(b"\x1b[3;1H0123456789abcdefghij");
+        // Seta para a esquerda do fim ate a coluna 1, pelas paradas 16 e 8.
+        for col in (1..20u16).rev() {
+            t.process(if col % 8 == 0 { NANO_LEFT_TO_STOP } else { NANO_LEFT });
+            assert_eq!(cur(&t), (2, col));
+        }
+        // Backspace depois do 'g' (coluna 16): some ele, nao o seguinte.
+        t.process(b"\x1b[3;18H");
+        t.process(NANO_BS_MID_TO_STOP);
+        assert_eq!(view_row(&t, 2), "0123456789abcdefhij");
+        t.process(NANO_BS_MID);
+        assert_eq!(view_row(&t, 2), "0123456789abcdehij");
+        assert_eq!(cur(&t), (2, 15));
+        // No fim da linha, passando pela parada 16.
+        t.process(b"\x1b[3;19H");
+        t.process(NANO_BS_END);
+        t.process(NANO_BS_END_TO_STOP);
+        assert_eq!(view_row(&t, 2), "0123456789abcdeh");
+        assert_eq!(cur(&t), (2, 16));
+        t.process(NANO_BS_END);
+        assert_eq!(view_row(&t, 2), "0123456789abcde");
+        assert_eq!(cur(&t), (2, 15));
+
+        // Sem o CBT o vt100 deixa o cursor uma coluna adiante, e o Backspace
+        // apaga o 'h' no lugar do 'g'.
+        let mut raw = vt100::Parser::new(24, 80, 0);
+        raw.process(b"\x1b[3;1H0123456789abcdefghij\x1b[3;18H");
+        raw.process(NANO_BS_MID_TO_STOP);
+        assert_eq!(raw.screen().cursor_position(), (2, 17));
+        assert_eq!(raw.screen().cell(2, 16).unwrap().contents(), "g");
+    }
+
+    /// Barra de titulo do nano 2.9.8 com localidade C (sem UTF-8 o ncurses
+    /// repete os espacos com REP, "CSI n b").
+    #[test]
+    fn nano_title_bar_with_repeat() {
+        let mut t = Terminal::new(80, 24);
+        t.process(
+            b"\x1b[H\x1b(B\x1b[0;7m  GNU nano 2.9.8 \x1b[20b/tmp/t4.txt \x1b[30b \x1b[1;79H\x1b(B\x1b[m",
+        );
+        let title = format!("  GNU nano 2.9.8{}/tmp/t4.txt", " ".repeat(21));
+        assert_eq!(view_row(&t, 0), title);
+        // A barra inteira em video inverso, ate a ultima coluna.
+        let screen = t.parser.screen();
+        assert!((0..80).all(|c| screen.cell(0, c).unwrap().inverse()));
+        assert_eq!(screen.cursor_position(), (0, 78));
+    }
+
+    #[test]
+    fn back_tab_tab_and_repeat() {
+        let cur = |t: &Terminal| t.parser.screen().cursor_position();
+        let mut t = Terminal::new(80, 4);
+        // CBT: para a parada anterior, n vezes, sem passar da coluna 0.
+        t.process(b"\x1b[1;21H\x1b[Z");
+        assert_eq!(cur(&t), (0, 16));
+        t.process(b"\x1b[Z");
+        assert_eq!(cur(&t), (0, 8));
+        t.process(b"\x1b[1;21H\x1b[2Z");
+        assert_eq!(cur(&t), (0, 8));
+        t.process(b"\x1b[1;21H\x1b[9Z\x1b[Z");
+        assert_eq!(cur(&t), (0, 0));
+        // Depois de escrever na ultima coluna (esperando a quebra), parte dela.
+        t.process(b"\x1b[1;80Hx\x1b[Z");
+        assert_eq!(cur(&t), (0, 72));
+        // CHT: para a proxima, n vezes, ate a ultima coluna.
+        t.process(b"\x1b[1;1H\x1b[I");
+        assert_eq!(cur(&t), (0, 8));
+        t.process(b"\x1b[1;9H\x1b[2I");
+        assert_eq!(cur(&t), (0, 24));
+        t.process(b"\x1b[1;75H\x1b[I");
+        assert_eq!(cur(&t), (0, 79));
+        t.process(b"\x1b[65535I");
+        assert_eq!(cur(&t), (0, 79));
+
+        // REP: o caractere antes do cursor, com os atributos de agora.
+        t.process(b"\x1b[2;1H=\x1b[31m\x1b[4b\x1b[0m");
+        assert_eq!(view_row(&t, 1), "=====");
+        assert_eq!(cell_fg(&t, 1, 0), vt100::Color::Default);
+        assert_eq!(cell_fg(&t, 1, 4), vt100::Color::Idx(1));
+        // De um largo, o caractere inteiro (antes do cursor fica a continuacao).
+        t.process("\x1b[3;1H日\x1b[2b".as_bytes());
+        let wide = |c| t.parser.screen().cell(2, c).map(|x| (x.contents(), x.is_wide()));
+        assert!([0, 2, 4].into_iter().all(|c| wide(c) == Some(("日", true))));
+        assert_eq!(cur(&t), (2, 6));
+        // Na ultima coluna, a repeticao quebra a linha.
+        t.process(b"\x1b[3;79Hab\x1b[2b");
+        assert_eq!(row_text(&t, 2, 78, 80), "ab");
+        assert_eq!(view_row(&t, 3), "bb");
+        // Sem caractere antes do cursor (coluna 0 ou celula vazia): nada.
+        t.process(b"\x1b[4;1H\x1b[K\x1b[3b\x1b[4;6H\x1b[3b");
+        assert_eq!(view_row(&t, 3), "");
+        assert_eq!(cur(&t), (3, 5));
+    }
+
+    #[test]
+    fn repeat_reads_the_grid_and_counts_history() {
+        let mut t = Terminal::with_scrollback(10, 3, 100);
+        t.process(&numbered(1, 20));
+        // Lendo o historico: o caractere vem da linha do cursor, nao da visao.
+        t.set_view(2);
+        t.process(b"ab\x1b[3b");
+        t.scroll_to_bottom();
+        assert_eq!(view_row(&t, 2), "abbbb");
+        // As linhas que a repeticao empurra contam no historico, como as do
+        // servidor: 1 da quebra e 2 das 30 letras na tela de 10 colunas.
+        let avail = t.avail();
+        t.process(b"\r\nx\x1b[29b");
+        assert_eq!(t.avail(), avail + 3);
+        assert!((0..3).all(|r| view_row(&t, r) == "x".repeat(10)));
+        t.set_view(1);
+        assert_eq!(view_row(&t, 0), "abbbb");
     }
 
     #[test]

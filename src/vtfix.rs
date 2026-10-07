@@ -19,6 +19,18 @@
 //!   `CSI > 1 u`, `CSI = 1;1 u`...);
 //! - todo o resto passa identico, byte a byte.
 //!
+//! Tres outras, do terminfo do xterm-256color, o vt100 ignora e o ncurses
+//! usa; o tradutor avisa (`Piece::Missing`) logo depois do byte final delas,
+//! e o `Terminal` as faz com a posicao do cursor e o conteudo da tela:
+//! - `CSI n Z` (CBT, `cbt`): volta n paradas de tabulacao. O nano a usa no
+//!   Backspace sempre que o cursor cai numa coluna multipla de 8; ignorada, o
+//!   cursor fica a direita do lugar e cada apagamento seguinte acerta outro
+//!   caractere;
+//! - `CSI n I` (CHT): avanca n paradas de tabulacao;
+//! - `CSI n b` (REP, `rep`): repete n vezes o caractere anterior. O ncurses a
+//!   usa em sequencias de caracteres iguais (barra de titulo, "=====")
+//!   quando a localidade nao e UTF-8.
+//!
 //! O tradutor tambem avisa (`Piece::AltScreen`) logo depois de cada
 //! `CSI ? 1049 h`/`l` exato (so esse parametro), que entra/sai da tela
 //! alternativa: o vt100 guarda um so conjunto de atributos salvos para as
@@ -61,6 +73,22 @@ pub enum Piece<'a> {
     /// O trecho anterior foi so o byte final de um `CSI ? 1049 h` (`true`,
     /// entra na tela alternativa) ou `CSI ? 1049 l` (`false`, sai dela).
     AltScreen(bool),
+    /// O trecho anterior terminou no byte final de uma sequencia que o vt100
+    /// ignora (ele a descarta) e o `Terminal` faz.
+    Missing(Missing),
+}
+
+/// Sequencia sem parametro ou com um so (so digitos), sem marcador nem
+/// intermediarios, que o vt100 ignora. A contagem e a do parametro, 1 se
+/// ausente ou 0 (como no xterm).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Missing {
+    /// `CSI n Z` (CBT): volta n paradas de tabulacao.
+    BackTab(u16),
+    /// `CSI n I` (CHT): avanca n paradas de tabulacao.
+    Tab(u16),
+    /// `CSI n b` (REP): repete n vezes o caractere anterior.
+    Repeat(u16),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,6 +118,9 @@ enum State {
 enum Csi {
     /// Nada que conte (so controles, DEL ou bytes >= 0x80).
     Empty,
+    /// Um parametro so, so digitos: o valor, contado como no vte (saturando),
+    /// para a contagem das `Missing`.
+    Num(u16),
     /// Parametros: digitos, ':' e ';'.
     Params,
     /// '?' no inicio e depois so digitos: o valor do parametro, contado como
@@ -281,7 +312,7 @@ impl VtFix {
                         // Byte final: o vte despacha (ou descarta, se Other).
                         0x40..=0x7e => {
                             let swap: Option<&[u8]> = match (b, kind) {
-                                (b'f', Csi::Empty | Csi::Params) => Some(b"H"),
+                                (b'f', Csi::Empty | Csi::Num(_) | Csi::Params) => Some(b"H"),
                                 // Houve controle/DEL entre o '[' e o final (o
                                 // "ESC [" ja foi repassado): o ESC aborta esse
                                 // CSI, sem efeito no vte, e comeca o ESC 7/8.
@@ -289,9 +320,26 @@ impl VtFix {
                                 (b'u', Csi::Empty) => Some(b"\x1b8"),
                                 _ => None,
                             };
+                            let count = match kind {
+                                Csi::Empty => Some(1),
+                                Csi::Num(n) => Some(n.max(1)),
+                                _ => None,
+                            };
+                            let missing = count.and_then(|n| match b {
+                                b'Z' => Some(Missing::BackTab(n)),
+                                b'I' => Some(Missing::Tab(n)),
+                                b'b' => Some(Missing::Repeat(n)),
+                                _ => None,
+                            });
                             if let Some(swap) = swap {
                                 emit!(&input[start..i]);
                                 emit!(swap);
+                                start = i + 1;
+                            } else if let Some(m) = missing {
+                                // A sequencia vai inteira ao vt100 (que a
+                                // descarta) e, logo depois, o aviso.
+                                emit!(&input[start..=i]);
+                                out(Piece::Missing(m));
                                 start = i + 1;
                             } else if kind == Csi::Dec(1049) && matches!(b, b'h' | b'l') {
                                 // O byte final sozinho num trecho e, logo
@@ -303,15 +351,17 @@ impl VtFix {
                             }
                             State::Text
                         }
-                        b'0'..=b'9' => State::Csi(match kind {
-                            Csi::Empty => Csi::Params,
-                            Csi::Dec(n) => {
-                                Csi::Dec(n.saturating_mul(10).saturating_add(u16::from(b - b'0')))
+                        b'0'..=b'9' => State::Csi({
+                            let digit = |n: u16| n.saturating_mul(10).saturating_add(u16::from(b - b'0'));
+                            match kind {
+                                Csi::Empty => Csi::Num(digit(0)),
+                                Csi::Num(n) => Csi::Num(digit(n)),
+                                Csi::Dec(n) => Csi::Dec(digit(n)),
+                                other => other,
                             }
-                            other => other,
                         }),
                         b':' | b';' => State::Csi(match kind {
-                            Csi::Empty | Csi::Params => Csi::Params,
+                            Csi::Empty | Csi::Num(_) | Csi::Params => Csi::Params,
                             // Mais de um parametro (ou subparametro): nao e
                             // o 1049 exato.
                             Csi::Dec(_) | Csi::Other => Csi::Other,
@@ -359,6 +409,9 @@ pub(crate) mod tests {
     /// Aviso de tela alternativa: (bytes entregues ate ele, entrou?).
     type Notice = (usize, bool);
 
+    /// Aviso de sequencia ignorada pelo vt100: (bytes entregues ate ele, qual).
+    type MissingAt = (usize, Missing);
+
     /// O que o tradutor entregou, para comparar.
     #[derive(Debug, Default, PartialEq)]
     struct Fixed {
@@ -368,10 +421,14 @@ pub(crate) mod tests {
         pending: Vec<u8>,
         /// Avisos de tela alternativa.
         alt: Vec<Notice>,
+        /// Avisos de sequencias ignoradas pelo vt100.
+        missing: Vec<MissingAt>,
     }
 
-    /// Recebe os trechos e confere as regras de entrega: nenhum trecho vazio
-    /// e o aviso logo depois do byte final, sozinho no trecho anterior.
+    /// Recebe os trechos e confere as regras de entrega: nenhum trecho vazio,
+    /// o aviso de tela alternativa logo depois do byte final, sozinho no
+    /// trecho anterior, e o de sequencia ignorada logo depois do trecho que
+    /// termina no byte final dela.
     #[derive(Default)]
     struct Sink {
         fixed: Fixed,
@@ -394,6 +451,19 @@ pub(crate) mod tests {
                         "aviso fora do lugar"
                     );
                     self.fixed.alt.push((self.fixed.out.len(), on));
+                }
+                Piece::Missing(m) => {
+                    let fin = match m {
+                        Missing::BackTab(_) => b'Z',
+                        Missing::Tab(_) => b'I',
+                        Missing::Repeat(_) => b'b',
+                    };
+                    assert_eq!(
+                        self.last.take().and_then(|s| s.last().copied()),
+                        Some(fin),
+                        "aviso fora do lugar"
+                    );
+                    self.fixed.missing.push((self.fixed.out.len(), m));
                 }
             }
         }
@@ -438,6 +508,7 @@ pub(crate) mod tests {
     enum Item {
         B(Vec<u8>),
         Alt(bool),
+        Miss(Missing),
     }
 
     /// Os trechos e avisos, na ordem, com os pedacos dados.
@@ -449,6 +520,7 @@ pub(crate) mod tests {
                 v.push(match p {
                     Piece::Bytes(s) => Item::B(s.to_vec()),
                     Piece::AltScreen(on) => Item::Alt(on),
+                    Piece::Missing(m) => Item::Miss(m),
                 })
             });
         }
@@ -747,6 +819,55 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn missing_sequence_notices() {
+        use Missing::*;
+        let cases: &[(&[u8], &[MissingAt])] = &[
+            (b"\x1b[Z", &[(3, BackTab(1))]),
+            (b"ab\x1b[Zc", &[(5, BackTab(1))]),
+            (b"\x1b[0Z", &[(4, BackTab(1))]),
+            (b"\x1b[3Z\x1b[12I", &[(4, BackTab(3)), (9, Tab(12))]),
+            (b"\x1b[I", &[(3, Tab(1))]),
+            // REP do ncurses: o caractere e a contagem menos um.
+            (b"=\x1b[9b", &[(5, Repeat(9))]),
+            (b"\x1b[0b", &[(4, Repeat(1))]),
+            (b"\x1b[99999b", &[(8, Repeat(u16::MAX))]),
+            // Bytes do Backspace do nano numa coluna multipla de 8.
+            (b"\x1b[?25l\x1b[Z \x1b[Z\x1b[?12l", &[(9, BackTab(1)), (13, BackTab(1))]),
+            // Controles dentro do CSI ou do escape: executados, a sequencia vale.
+            (b"\x1b[\r2Z", &[(5, BackTab(2))]),
+            (b"\x1b\r[Z", &[(4, BackTab(1))]),
+            (b"\x1b[2\x7f\xc3b", &[(6, Repeat(2))]),
+            // Nada: mais parametros, subparametro, marcador, intermediario,
+            // abortado, strings, escape com intermediario e texto.
+            (b"\x1b[1;2Z\x1b[;b\x1b[1:2b\x1b[?Z\x1b[>1b\x1b[=I\x1b[ Z\x1b[1$b", &[]),
+            (b"\x1b[2\x18Z\x1b[\x1aI", &[]),
+            (b"\x1b]0;[Z\x07\x1bP[b\x1b\\\x1b_[I\x1b\\", &[]),
+            (b"\x1b(Z\x1b#b Zb I", &[]),
+        ];
+        for (input, want) in cases {
+            let got = fix(input);
+            assert_eq!(got.out, *input);
+            assert_eq!(got.missing, *want, "{:?}", String::from_utf8_lossy(input));
+            assert_cut_invariant(input, true);
+        }
+        // So o aviso corta; o "ESC [" segurado no fim de um pedaco volta antes.
+        assert_eq!(
+            items(&[b"a\x1b[Z \x1b[Zb"]),
+            [
+                b(b"a\x1b[Z"),
+                Item::Miss(BackTab(1)),
+                b(b" \x1b[Z"),
+                Item::Miss(BackTab(1)),
+                b(b"b"),
+            ]
+        );
+        assert_eq!(
+            items(&[b"x\x1b[", b"3", b"Z"]),
+            [b(b"x\x1b"), b(b"["), b(b"3"), b(b"Z"), Item::Miss(BackTab(3))]
+        );
+    }
+
     /// Gerador deterministico (xorshift64*), sem dependencias.
     pub(crate) struct Rng(pub(crate) u64);
 
@@ -781,7 +902,7 @@ pub(crate) mod tests {
         }
     }
 
-    const ALPHABET: &[u8] = b"\x1b\x1b\x1b\x1b\x1b\x1b[[[[[[]]]P^_X\\01259;;:?><= !#(fffsssuuuHAmah\x07\r\n\x08\x05\x0e\x19\x1c\x18\x1a\x7f\x9c\x9b\xc3\xa9\xe2\xa3\xbf\x80\xff\x00";
+    const ALPHABET: &[u8] = b"\x1b\x1b\x1b\x1b\x1b\x1b[[[[[[]]]P^_X\\01259;;:?><= !#(fffsssuuuZZbbIHAmah\x07\r\n\x08\x05\x0e\x19\x1c\x18\x1a\x7f\x9c\x9b\xc3\xa9\xe2\xa3\xbf\x80\xff\x00";
 
     /// Pedacos para montar sequencias inteiras (1049, strings, UTF-8).
     const TOKENS: &[&[u8]] = &[
@@ -804,6 +925,9 @@ pub(crate) mod tests {
         b"f",
         b"s",
         b"u",
+        b"Z",
+        b"b",
+        b"I",
         b"m",
         b"\r",
         b"\x07",
@@ -825,17 +949,18 @@ pub(crate) mod tests {
     /// (todos os estados, como em vte/src/lib.rs), aplicada ao fluxo todo de
     /// uma vez, trocando o byte final dos CSI que o vt100 despacharia. Devolve
     /// tambem os avisos (bytes ate logo depois do final, entrou?) dos
-    /// `CSI ? 1049 h`/`l` com esse unico parametro.
-    fn reference(input: &[u8]) -> (Vec<u8>, Vec<Notice>) {
-        let (out, alt, _) = reference_full(input);
-        (out, alt)
+    /// `CSI ? 1049 h`/`l` com esse unico parametro, e os das sequencias que o
+    /// vt100 ignora (`CSI n Z`, `CSI n I`, `CSI n b`, com um parametro no maximo).
+    fn reference(input: &[u8]) -> (Vec<u8>, Vec<Notice>, Vec<MissingAt>) {
+        let (out, alt, missing, _) = reference_full(input);
+        (out, alt, missing)
     }
 
     /// A referencia, dizendo tambem se o vte termina no estado base (fora
     /// de escape, CSI e strings), que e o que `idle` promete. Um DCS que o
     /// vte encerrou pelo 0x9C conta como pendente ate o proximo ESC/CAN/SUB
     /// (o tradutor nao acompanha os estados do DCS: fica do lado seguro).
-    fn reference_full(input: &[u8]) -> (Vec<u8>, Vec<Notice>, bool) {
+    fn reference_full(input: &[u8]) -> (Vec<u8>, Vec<Notice>, Vec<MissingAt>, bool) {
         #[derive(Clone, Copy, PartialEq, Debug)]
         enum St {
             Ground,
@@ -865,13 +990,16 @@ pub(crate) mod tests {
         let mut inter = false; // intermediario ou marcador privado coletado
         let mut param = false; // algum byte de parametro
         let mut dec: Option<u16> = None; // so '?' e digitos ate aqui: o valor
+        let mut num: Option<u16> = None; // so digitos ate aqui: o valor (0 se nenhum)
         let mut bracket = 0; // posicao em `out` do '[' que abriu o CSI
         let mut out = Vec::new();
         let mut alt = Vec::new();
+        let mut missing = Vec::new();
         let mut dcs_c1_end = false; // DCS encerrado pelo 0x9C (ver acima)
         for &b in input {
             let mut byte = Some(b);
             let mut notice = None;
+            let mut miss = None;
             st = match st {
                 Ground => {
                     if matches!(b, 0x18 | 0x1a | 0x1b) {
@@ -896,6 +1024,7 @@ pub(crate) mod tests {
                         inter = false;
                         param = false;
                         dec = None;
+                        num = Some(0);
                         CsiEntry
                     }
                     b']' => Osc,
@@ -915,22 +1044,26 @@ pub(crate) mod tests {
                         0x20..=0x2f => {
                             inter = true;
                             dec = None;
+                            num = None;
                             CsiInt
                         }
                         0x30..=0x3b if s == CsiInt => CsiIgnore,
                         0x30..=0x3b => {
                             param = true;
-                            dec = match b {
-                                b'0'..=b'9' => dec.map(|n| {
+                            let digit = |v: Option<u16>| match b {
+                                b'0'..=b'9' => v.map(|n| {
                                     n.saturating_mul(10).saturating_add(u16::from(b - b'0'))
                                 }),
                                 _ => None,
                             };
+                            dec = digit(dec);
+                            num = digit(num);
                             CsiParam
                         }
                         0x3c..=0x3f if s == CsiEntry => {
                             inter = true;
                             dec = (b == b'?').then_some(0);
+                            num = None;
                             CsiParam
                         }
                         0x3c..=0x3f => CsiIgnore,
@@ -949,6 +1082,14 @@ pub(crate) mod tests {
                                         byte = Some(if b == b's' { b'7' } else { b'8' });
                                     }
                                     _ => {}
+                                }
+                                if let Some(n) = num.map(|n| n.max(1)) {
+                                    miss = match b {
+                                        b'Z' => Some(Missing::BackTab(n)),
+                                        b'I' => Some(Missing::Tab(n)),
+                                        b'b' => Some(Missing::Repeat(n)),
+                                        _ => None,
+                                    };
                                 }
                             } else if dec == Some(1049) && matches!(b, b'h' | b'l') {
                                 notice = Some(b == b'h');
@@ -997,8 +1138,11 @@ pub(crate) mod tests {
             if let Some(on) = notice {
                 alt.push((out.len(), on));
             }
+            if let Some(m) = miss {
+                missing.push((out.len(), m));
+            }
         }
-        (out, alt, st == Ground && !dcs_c1_end)
+        (out, alt, missing, st == Ground && !dcs_c1_end)
     }
 
     /// `idle` so e verdadeiro com o vte no estado base e nada segurado, em
@@ -1012,7 +1156,7 @@ pub(crate) mod tests {
                 if c > 0 {
                     f.feed(&s[c - 1..c], |_| {});
                 }
-                let (_, _, ground) = reference_full(&s[..c]);
+                let (_, _, _, ground) = reference_full(&s[..c]);
                 assert_eq!(
                     f.idle(),
                     ground && f.pending().is_empty(),
@@ -1063,7 +1207,7 @@ pub(crate) mod tests {
             let got = fix(s);
             // A referencia repassa na hora o que o tradutor segura no fim.
             let out = [got.out, got.pending].concat();
-            assert_eq!((out, got.alt), reference(s), "entrada {s:?}");
+            assert_eq!((out, got.alt, got.missing), reference(s), "entrada {s:?}");
         };
         let mut rng = Rng(0x5a60_7e2d_1234_5678);
         for _ in 0..20_000 {
@@ -1078,7 +1222,7 @@ pub(crate) mod tests {
             let out = [got.out, got.pending].concat();
             assert_eq!(
                 reference(input),
-                (out, got.alt),
+                (out, got.alt, got.missing),
                 "{input:?} (esperado {want:?})"
             );
         }
