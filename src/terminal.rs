@@ -801,10 +801,13 @@ impl Terminal {
         // Digitado/colado: vai ao servidor e volta a visao ao fim.
         let mut typed = Vec::new();
 
+        // Colagem entre marcadores se o programa pediu (CSI ? 2004 h).
+        let bracketed = self.parser.screen().bracketed_paste();
+
         // Botao direito cola o conteudo da area de transferencia (somente texto).
         if response.secondary_clicked() {
             if let Some(text) = clipboard_text() {
-                typed.extend_from_slice(text.as_bytes());
+                typed.extend(paste_bytes(&text, bracketed));
             }
         }
 
@@ -828,7 +831,9 @@ impl Terminal {
                                 typed.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                             }
                         }
-                        egui::Event::Paste(t) => typed.extend_from_slice(t.as_bytes()),
+                        egui::Event::Paste(t) if !t.is_empty() => {
+                            typed.extend(paste_bytes(t, bracketed))
+                        }
                         egui::Event::Copy => typed.push(0x03), // Ctrl+C = interrupcao
                         egui::Event::Cut => typed.push(0x18),  // Ctrl+X
                         egui::Event::Key {
@@ -1272,6 +1277,22 @@ fn pill(
     let text_pos = pill.center() - galley.size() / 2.0;
     painter.galley(text_pos, galley, color);
     clicked
+}
+
+/// Bytes de uma colagem, como no xterm. As quebras de linha (do Windows ou do
+/// Unix) viram `\r`, o que o Enter manda: o `\n` e o Ctrl+J, que no nano
+/// justifica o paragrafo (junta as linhas coladas numa so). Com o modo de
+/// colagem ligado pelo programa (`bracketed`: bash, nano 8, vim), o texto vai
+/// entre `ESC [ 200 ~` e `ESC [ 201 ~`, e sem ESC: o que se cola nao pode
+/// fechar a colagem antes da hora e virar comando.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = text.replace("\r\n", "\r").replace('\n', "\r");
+    if bracketed {
+        let text = text.replace('\x1b', "");
+        [&b"\x1b[200~"[..], text.as_bytes(), b"\x1b[201~"].concat()
+    } else {
+        text.into_bytes()
+    }
 }
 
 /// Texto da area de transferencia do sistema, se houver (colar com o botao
@@ -3599,6 +3620,37 @@ mod tests {
         t.set_view(9);
         assert!(right_click(&mut t).is_empty());
         assert_eq!(t.view, 9);
+        // Quebras viram Enter; com o modo de colagem ligado, entre marcadores.
+        CLIPBOARD.with(|c| *c.borrow_mut() = Some("a\r\nb\n".into()));
+        assert_eq!(right_click(&mut t), b"a\rb\r");
+        t.process(b"\x1b[?2004h");
+        assert_eq!(right_click(&mut t), b"\x1b[200~a\rb\r\x1b[201~");
+    }
+
+    #[test]
+    fn paste_sends_enter_and_brackets_when_asked() {
+        // Quebras do Unix, do Windows e soltas: todas viram o Enter. Com "\n"
+        // o nano justificava (Ctrl+J) e juntava as linhas coladas numa so.
+        assert_eq!(
+            paste_bytes("server {\n\tlisten 80;\r\n\r\n}\r", false),
+            b"server {\r\tlisten 80;\r\r}\r"
+        );
+        // Com o modo ligado: entre os marcadores e sem ESC, para o texto
+        // colado nao fechar a colagem e virar comando.
+        assert_eq!(
+            paste_bytes("a\nb\x1b[201~echo fora\n", true),
+            b"\x1b[200~a\rb[201~echo fora\r\x1b[201~"
+        );
+        let mut t = Terminal::new(30, 6);
+        let mut h = Harness::new(&mut t);
+        let mut paste = |t: &mut Terminal, s: &str| h.frame(t, vec![egui::Event::Paste(s.into())]).0;
+        assert_eq!(paste(&mut t, "x\ny"), b"x\ry");
+        // O bash e o nano 8 ligam o modo (CSI ? 2004 h) e o desligam ao sair.
+        t.process(b"\x1b[?2004h");
+        assert_eq!(paste(&mut t, "x\ny"), b"\x1b[200~x\ry\x1b[201~");
+        assert!(paste(&mut t, "").is_empty(), "colagem vazia: nem os marcadores");
+        t.process(b"\x1b[?2004l");
+        assert_eq!(paste(&mut t, "x\ny"), b"x\ry");
     }
 
     /// Saida do tmux 2.7 ao sair do shell (ainda na tela alternativa: o eco
