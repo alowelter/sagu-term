@@ -37,7 +37,7 @@ ordem e depois clique em **Submit for certification** (Enviar para certificaçã
 | **Age ratings** (Classificação etária) | [Questionário de classificação etária](#questionário-de-classificação-etária) |
 | **Packages** (Pacotes) | Envie o `.msix`. Deixe marcada só a família **Desktop**. |
 | **Store listings** (Listagens da Store) | Idioma **Português (Brasil)**, que vem do pacote: [Página da loja](#página-da-loja-português-brasil) |
-| **Submission options** (Opções de envio) | [Capacidade restrita](#capacidade-restrita-runfulltrust) e [Notas para a certificação](#notas-para-a-certificação) |
+| **Submission options** (Opções de envio) | [Capacidade restrita](#capacidade-restrita-runfulltrust) e [Notas para a certificação](#notas-para-a-certificação), numa página à parte |
 
 A certificação costuma levar de algumas horas a alguns dias úteis. Se for recusada, a
 Microsoft explica o motivo num relatório, e dá para corrigir e reenviar.
@@ -109,7 +109,7 @@ Tudo foi pensado para o teclado. Digite parte do nome da conexão, aperte Enter 
 TERMINAL SSH
 • Emulação xterm com 256 cores, que se ajusta sozinha ao tamanho do painel.
 • Emojis coloridos e símbolos de todo tipo (✓, ✗, ideogramas), desenhados pelo próprio Windows.
-• Selecionou, copiou: o texto selecionado vai direto para a área de transferência, e o botão direito cola.
+• Selecionou, copiou: o texto selecionado vai direto para a área de transferência, e o botão direito cola. Colar várias linhas manda o Enter de cada uma, e programas que pedem a colagem marcada, como o bash 5.1 ou mais novo, recebem o texto sem executar cada linha.
 • Autenticação por senha ou por chave privada (formato OpenSSH ou PEM, com passphrase opcional).
 • Verificação da chave do servidor, no SSH e no SFTP: na primeira conexão, você confere o tipo e a impressão digital SHA256 da chave e decide se confia. A chave aceita fica guardada no cofre. Se o servidor apresentar outra chave depois, um alerta aparece antes de qualquer senha ser enviada, e cancelar é o padrão.
 • Keepalive automático, para a sessão não cair quando fica parada.
@@ -128,6 +128,11 @@ NAVEGADOR SFTP
 TERMINAL LOCAL
 • Prompt de Comando e WSL (quando instalado) nos mesmos painéis dos servidores remotos.
 
+MONITORAMENTO
+• O cartão Monitoramento abre uma tela com um cartão por servidor: anéis de CPU, memória e do disco mais cheio, load de 1, 5 e 15 minutos, gráfico de CPU e memória da última hora, discos, swap, tempo ligado e processos.
+• Cada servidor ganha uma situação (Saudável, Atenção ou Crítico) pela pior medida, e o topo da tela resume quantos estão em cada uma. A dica do cartão mostra o que está fora do normal.
+• Atualiza sozinho a cada minuto enquanto está aberto, ou na hora com Atualizar agora, usando uma conexão por servidor que fecha junto com a tela. Funciona em servidores Linux.
+
 PAINÉIS DIVIDIDOS
 • Divida qualquer painel lado a lado ou empilhado, quantas vezes quiser, misturando sessões SSH, SFTP e terminais locais.
 • Cada painel novo já abre o seletor de conexões com a busca pronta para digitar.
@@ -143,7 +148,7 @@ COFRE E CONEXÕES
 • O cofre é gravado de forma atômica: uma queda de energia no meio da gravação não corrompe o arquivo.
 
 PRIVACIDADE
-Sem conta, sem anúncios e sem telemetria. O SaguTerm não envia nenhum dado ao desenvolvedor e não acessa a internet por conta própria: ele se conecta apenas aos servidores que você cadastra. Para mostrar o ícone do sistema, ele executa no servidor, com o seu usuário, um comando que só lê a identificação do sistema; isso pode ser desligado em cada conexão, e os detalhes estão na política de privacidade. As atualizações chegam pela Microsoft Store.
+Sem conta, sem anúncios e sem telemetria. O SaguTerm não envia nenhum dado ao desenvolvedor e não acessa a internet por conta própria: ele se conecta apenas aos servidores que você cadastra. Para mostrar o ícone do sistema, ele executa no servidor, com o seu usuário, um comando que só lê a identificação do sistema, e a tela de monitoramento, enquanto aberta, executa a cada minuto um comando que só lê o uso de CPU, memória, swap e disco, a carga, o tempo ligado e o número de processos; isso pode ser desligado em cada conexão, e os detalhes estão na política de privacidade. As atualizações chegam pela Microsoft Store.
 
 LIMITAÇÕES ATUAIS
 • A interface está em português (Brasil).
@@ -157,8 +162,16 @@ Leve e rápido: escrito em Rust do começo ao fim, incluindo o SSH (sem OpenSSL)
 
 ### What's new in this version (Novidades desta versão)
 
-Limite: 1500 caracteres. Texto da 1.2.0 (648 caracteres), com o abrir sem senha neste
-computador e os emojis do terminal:
+Limite: 1500 caracteres. Texto da 1.3.0 (950 caracteres), com o monitoramento dos
+servidores e as correções do terminal:
+
+```text
+Monitoramento: novo cartão na tela de conexões, ao lado do Terminal local e do WSL, com a saúde de todos os servidores numa só tela: CPU, memória, disco mais cheio, load, gráfico da última hora, discos, swap, tempo ligado e processos, e a situação de cada um (Saudável, Atenção ou Crítico). Atualiza sozinho a cada minuto enquanto está aberto, com uma conexão por servidor, e só lê informações do sistema (os detalhes estão na política de privacidade). Funciona em servidores Linux; conexões com a detecção do sistema desligada ficam de fora.
+Terminal: no nano, o Backspace e a seta para a esquerda não desalinham mais o cursor, e a barra de título não sai mais encurtada. Colar várias linhas manda o Enter de cada uma (antes, no nano, as linhas se juntavam numa só) e usa a colagem marcada quando o programa pede, como o bash, que não executa cada linha colada.
+Um servidor que encerra a conexão durante o login não é mais tratado como senha errada.
+```
+
+Texto da 1.2.0, só de referência:
 
 ```text
 Abrir sem senha neste computador: marque a opção na tela de conexões e o SaguTerm passa a abrir o cofre direto ao iniciar, sem pedir a senha mestra. A chave do cofre fica guardada protegida pela sua conta do Windows: em outro computador ou em outra conta, o arquivo continua pedindo a senha, e bloquear o cofre (Ctrl+L) faz a próxima abertura pedir a senha de novo.
@@ -208,9 +221,9 @@ Arraste arquivos do Windows para um painel SFTP ou um terminal SSH para enviá-l
 Baixe arquivos e pastas pelo SFTP com Ctrl+S, com andamento, cancelamento e aviso antes de substituir
 Copie e mova arquivos e pastas no servidor com Ctrl+C, Ctrl+X e Ctrl+V no navegador SFTP
 Histórico de rolagem: role com a roda do mouse ou Shift+PgUp e copie texto que já saiu da tela
-Busca instantânea: digite parte do nome da conexão e aperte Enter
 Ícone do sistema de cada servidor (Ubuntu, Debian, Red Hat, AlmaLinux e outros), identificado em segundo plano ao conectar
-Feito para o teclado: Alt+setas troca de painel, Ctrl+N cadastra um host, Ctrl+S baixa arquivos, Ctrl+L bloqueia o cofre, F1 mostra os atalhos
+Monitoramento: CPU, memória, disco e load dos seus servidores Linux numa só tela, atualizada a cada minuto, com a situação de cada um
+Feito para o teclado: digite parte do nome e aperte Enter para conectar; Alt+setas troca de painel, Ctrl+N cadastra um host, Ctrl+L bloqueia o cofre e F1 mostra os atalhos
 Cofre gravado de forma atômica: uma queda de energia durante a gravação não corrompe o arquivo
 Escrito em Rust, sem OpenSSL, com interface acelerada pela placa de vídeo
 Sem conta, sem anúncios e sem telemetria: suas credenciais ficam no seu computador e só vão para os seus servidores
@@ -221,7 +234,7 @@ Sem conta, sem anúncios e sem telemetria: suas credenciais ficam no seu computa
 Opcional, mas recomendada. Até 1000 caracteres; o ideal é ficar abaixo de 270.
 
 ```text
-Cliente SSH e SFTP com terminal local (Prompt de Comando e WSL) em painéis divididos. Envie e baixe arquivos, confira a chave de cada servidor e guarde hosts, senhas e chaves num cofre criptografado pela sua senha mestra. Tudo se faz pelo teclado.
+Cliente SSH e SFTP com terminal local (Prompt de Comando e WSL) em painéis divididos e monitoramento dos servidores. Envie e baixe arquivos, confira a chave de cada servidor e guarde hosts, senhas e chaves num cofre criptografado. Tudo pelo teclado.
 ```
 
 ### Keywords (Palavras-chave)
@@ -289,6 +302,7 @@ Sugestões de capturas e legendas:
 | Janela "Servidor novo" com a impressão digital da chave de um servidor de teste | Confira a chave do servidor na primeira conexão; ela fica guardada no cofre. |
 | Tela do cofre, na aba "Criar cofre" | Cofre criptografado com AES-256-GCM e Argon2id, protegido pela sua senha mestra. |
 | Janela de atalhos (F1) | Atalhos de teclado sempre à mão com F1. |
+| Tela de monitoramento com 2 ou 3 servidores de teste de nomes fictícios (como `web-01`), de uma distribuição sem ícone no SaguTerm (como Oracle Linux no WSL), para os cartões ficarem com o ícone padrão de servidor | Monitoramento: CPU, memória, disco e load dos seus servidores Linux numa só tela. |
 
 ### Store logos (Logotipos da Store)
 
@@ -340,35 +354,39 @@ nem atualizador próprio.
 
 ### Notas para a certificação
 
-Em **Submission options > Notes for certification** (Notas para a certificação). Os
-testadores são pessoas e precisam conseguir usar o app, então explique o caminho em inglês.
-Limite: 2000 caracteres. O texto abaixo tem 1759 (1874 com a linha do servidor de teste,
-ainda com os `<...>`), o que deixa folga para os dados reais do servidor; confira a
-contagem se mudar alguma coisa:
+Desde a 1.2.0, o Partner Center pede as notas numa página à parte: em **Opções de envio >
+Observações para certificação**, clique no link **Informações Adicionais de Teste**
+(*Additional Testing Info*) e cole o texto no campo **Descrição**. As notas não vêm do
+envio anterior: cole de novo a cada envio. Os testadores são pessoas e precisam conseguir
+usar o app, então explique o caminho em inglês. Limite: 2000 caracteres. O texto abaixo tem
+1895 (1982 com a linha do servidor de teste, que vai no fim); confira a contagem
+se mudar alguma coisa:
 
 ```text
-No account or sign-in is required; there is no backend service, ads, telemetry or in-app purchases. The interface is in Brazilian Portuguese; labels are quoted as they appear in the app.
-1. Launch SaguTerm; the splash screen closes after about 2 seconds (or click anywhere).
+No account, sign-in, backend service, ads, telemetry, in-app purchases or self-updater. The interface is in Brazilian Portuguese; labels are quoted as shown in the app.
+1. Launch SaguTerm; the splash screen closes after about 2 seconds or on a click.
 2. On the vault screen ("Cofre SaguTerm"), select the "Criar cofre" (Create vault) tab, click "Salvar como..." (Save as) and pick any file, e.g. Documents\test.sagu. Type any master password in "Senha mestra" and "Confirmar senha", then click "Criar cofre".
-3. Testing without a server: on the "Conexões" (Connections) screen, press Enter or double-click the "Terminal local" card to open a Command Prompt inside the app (a "WSL" card appears if WSL is installed). Ctrl+B then H (side by side) or V (stacked) splits the pane; F1 lists all shortcuts. In S mode Windows blocks cmd.exe and wsl.exe, so these cards show an error instead of a prompt; the vault, split panes and SSH/SFTP work normally.
-4. Testing SSH/SFTP: press Ctrl+N ("Novo host"), fill in "Host" (address), "Usuário" (user) and "Senha" (password), or choose "Chave" to paste or load a private key, then click "Salvar". Select the new card and press Enter for an SSH terminal or Ctrl+Enter for the SFTP browser. On the first connection, "Servidor novo" (New server) shows the key fingerprint: click "Confiar e conectar" (Trust and connect).
+3. Testing without a server: on the "Conexões" (Connections) screen, press Enter or double-click the "Terminal local" card to open a Command Prompt inside the app (a "WSL" card appears if WSL is installed). Ctrl+B then H (side by side) or V (stacked) splits the pane; F1 lists all shortcuts. In S mode Windows blocks cmd.exe and wsl.exe, so these cards show an error; everything else works.
+4. Testing SSH/SFTP: press Ctrl+N ("Novo host"), fill in "Host" (address), "Usuário" (user) and "Senha" (password), or choose "Chave" to paste or load a private key, then click "Salvar". Select the new card and press Enter for an SSH terminal or Ctrl+Enter for the SFTP browser. On the first connection, "Servidor novo" (New server) shows the key fingerprint: click "Confiar e conectar" (Trust and connect). The "Monitoramento" card shows each server's health.
 5. SFTP: files dragged from File Explorer are uploaded to the open folder. To download, select items (Ctrl+click for several), press Ctrl+S and pick a local folder. Enter opens folders, the ".." row goes up, and text files open read-only (Esc returns).
-6. Ctrl+L on the Connections screen locks the vault.
-No self-updater; the app only connects to the servers the user registers.
+6. Ctrl+L on the Connections screen locks the vault. With "Abrir sem senha neste computador" (Open without password on this computer) checked there, the vault opens at startup without the password; locking asks for it again.
+The app only connects to the servers the user registers.
 ```
 
 **Servidor de teste (recomendado).** A política 10.3 pede que o app possa ser testado. Sem
 servidor, os testadores conseguem testar o cofre, o terminal local e os painéis, mas não o
 SSH/SFTP, que é a função principal. Num PC em modo S, nem o terminal local abre (veja as
 notas acima). Se puder, crie um servidor SSH descartável, com um usuário sem privilégios e
-só para a certificação, e acrescente ao fim das notas:
+só para a certificação. A página pede que credenciais não fiquem na descrição: cadastre
+cada dado em **Credenciais > Nova credencial** (por exemplo, `SSH host`, `SSH port`,
+`SSH user` e `SSH password`) e acrescente ao fim da descrição:
 
 ```text
-Test SSH server (disposable, unprivileged account): address <host>, port <port>, user <user>, password <password>.
+A disposable test SSH server with an unprivileged account is listed under Credentials.
 ```
 
-Troque os `<...>` pelos dados reais, deixe o servidor ligado até a certificação terminar e
-apague a conta depois. Se não der para oferecer um servidor, envie sem essa linha.
+Deixe o servidor ligado até a certificação terminar e apague a conta depois. Se não der
+para oferecer um servidor, envie sem essa linha e sem credenciais.
 
 ## Gerar e testar o pacote
 
@@ -409,6 +427,14 @@ Abra o **SaguTerm** pelo menu Iniciar e confira:
   cartão ao ícone de servidor, e a dica deixa de mostrar a linha `Sistema:`. Marcar de novo
   e reconectar traz o ícone de volta;
 - o ícone de chave ou senha aparece à esquerda do endereço, no cartão;
+- o cartão **Monitoramento** (duplo clique) abre a tela com um cartão por conexão. O do
+  servidor de teste mostra CPU, memória, disco, load e, depois de alguns minutos, o gráfico
+  da última hora; a contagem no topo chega a zero e a coleta se repete. Uma conexão com
+  **Detectar o sistema do servidor** desmarcado aparece como `Desligado`, e uma com a chave
+  ainda não confirmada, como `Confirmar chave`. No servidor de teste,
+  `for i in $(seq $(nproc)); do yes > /dev/null & done` ocupa todas as CPUs (num servidor do
+  WSL, ocupa também o PC): em até duas coletas, a CPU passa de 95% e a situação passa a
+  `Crítico`. Depois de `kill $(jobs -p)`, a situação volta ao normal em poucos minutos;
 - num painel SFTP do servidor de teste, as setas, `PageUp`/`PageDown` e `Home`/`End` movem
   o cursor, inclusive até a linha `..`, que sobe para a pasta acima com `Enter` ou duplo
   clique. O `Backspace` também sobe, e a pasta de onde se saiu fica selecionada. Digitar as

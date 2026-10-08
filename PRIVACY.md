@@ -1,6 +1,6 @@
 # Política de Privacidade do SaguTerm
 
-**Vigência:** 5 de outubro de 2026 · [English version below](#english)
+**Vigência:** 8 de outubro de 2026 · [English version below](#english)
 
 Esta política vale para o SaguTerm distribuído pela **Microsoft Store** e também para um
 executável que você mesmo compile a partir do código-fonte, que é público no GitHub. O
@@ -408,7 +408,7 @@ públicas: não inclua senhas, chaves, endereços de servidores nem outros dados
 
 # SaguTerm Privacy Policy
 
-**Effective date:** October 5, 2026
+**Effective date:** October 8, 2026
 
 This policy applies to SaguTerm distributed through the **Microsoft Store** and also to an
 executable you build yourself from the source code, which is public on GitHub. SaguTerm is
