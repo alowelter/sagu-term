@@ -6,6 +6,7 @@ mod download;
 mod emoji;
 mod hostkey;
 mod instance;
+mod monitor;
 mod osinfo;
 mod paste;
 mod pty;

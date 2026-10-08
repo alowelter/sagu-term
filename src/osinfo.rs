@@ -352,7 +352,7 @@ fn invisible(c: char) -> bool {
 
 /// Texto do servidor para mostrar: controle (menos tab), bidi e invisiveis
 /// descartam o campo; espacos colapsados; no maximo `max` caracteres.
-fn clean(s: &str, max: usize) -> Option<String> {
+pub(crate) fn clean(s: &str, max: usize) -> Option<String> {
     let mut out = String::new();
     let (mut n, mut gap) = (0usize, false);
     for c in s.chars() {

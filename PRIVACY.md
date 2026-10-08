@@ -26,6 +26,11 @@ MIT), mantido por Marcelo Welter ("o desenvolvedor").
 - Ao conectar a um servidor, o app pode executar nele, com o seu usuário, um comando fixo
   que só lê a identificação do sistema operacional, para mostrar o ícone do sistema no
   cartão da conexão. Isso pode ser desligado em cada conexão (seções 2 e 4).
+- Com a tela **Monitoramento** aberta, o app executa a cada minuto, em cada servidor
+  cadastrado com a detecção do sistema ligada, um comando fixo que só lê o uso de CPU,
+  memória, swap e disco, a carga, o tempo ligado e o número de processos e de CPUs, para
+  mostrá-los na tela. Isso pode ser desligado em cada conexão, e nada disso é gravado
+  (seções 2 e 4).
 - O app só se conecta aos **servidores que você cadastra**. Ele não acessa a internet por
   conta própria: não procura atualizações e não consulta o GitHub nem nenhum outro servidor
   do desenvolvedor.
@@ -247,6 +252,46 @@ Do servidor, o app lê apenas o necessário para as funções que você usa:
 - a identificação que todo servidor SSH envia no início da conexão (por exemplo,
   `SSH-2.0-OpenSSH_for_Windows_9.5`). O app a usa só na memória, para reconhecer servidores
   Windows e alguns equipamentos de rede, nos quais o comando acima não é executado;
+- a partir da versão 1.3.0, **a saúde do servidor**, só enquanto a tela **Monitoramento**
+  estiver aberta. O app conecta a cada conexão cadastrada (menos as que têm **Detectar o
+  sistema do servidor** desmarcado) e executa nela, com o seu usuário e num canal sem
+  terminal, sempre este mesmo comando: ao abrir a tela, uma vez por minuto e na hora quando
+  você clica em **Atualizar agora** ou muda a lista de conexões monitoradas (cadastra ou
+  exclui uma conexão, troca o endereço, a porta, o usuário, a senha ou a chave dela, liga
+  ou desliga a detecção, aceita ou esquece a chave de um servidor):
+
+  ```text
+  echo SAGUMON.load; cat /proc/loadavg; echo SAGUMON.cpus; getconf _NPROCESSORS_ONLN; nproc; echo SAGUMON.mem; cat /proc/meminfo; echo SAGUMON.up; cat /proc/uptime; echo SAGUMON.stat; head -n 1 /proc/stat; sleep 1; head -n 1 /proc/stat; echo SAGUMON.df; env LC_ALL=C timeout -s KILL 5 df -P -k; env LC_ALL=C timeout -t 5 -s KILL df -P -k; echo SAGUMON.end
+  ```
+
+  Esse comando só lê a carga do sistema e o número de processos (`/proc/loadavg`), o
+  número de CPUs (`getconf` ou `nproc`), o uso de memória e de swap (`/proc/meminfo`), o
+  tempo ligado (`/proc/uptime`), os contadores de uso de CPU (a primeira linha do
+  `/proc/stat`, duas vezes, com 1 segundo entre elas) e o espaço dos sistemas de arquivos
+  montados (`df -P -k`, em inglês por causa do `LC_ALL=C` e encerrado pelo `timeout` se
+  passar de 5 segundos, como num compartilhamento de rede fora do ar; ele aparece duas
+  vezes, uma em cada forma de escrever o `timeout`, e a que o servidor não entende falha
+  na hora, sem rodar o `df`). Os `echo SAGUMON...` só marcam onde começa cada parte da
+  resposta. A resposta não aparece em nenhum terminal; o app lê no máximo 1 MiB dela,
+  mostra os números na tela e guarda só na memória a última leitura (com os contadores de
+  CPU, para calcular o uso médio até a coleta seguinte, e a última lista de discos, para
+  quando o `df` não responder) e o histórico de CPU e memória da última hora, descartados
+  quando você fecha a tela. Nada vai para o cofre nem para o disco. A conexão fica aberta
+  enquanto a tela estiver aberta e cai quando você a fecha: em geral, um login por
+  abertura da tela, não um por minuto. Se a conexão cair, o app conecta de novo na coleta
+  seguinte. Se o servidor recusar as credenciais, o app não tenta de novo sozinho, para
+  não encher os logs do servidor de tentativas de login falhas nem acionar bloqueios como
+  o fail2ban: só quando você clica em **Atualizar agora** ou edita a conexão. Se a chave
+  do servidor ainda não foi confirmada, ou se mudou, o app desiste antes de enviar o
+  usuário, a senha ou a assinatura da chave, e o cartão pede que você conecte pelo
+  terminal. Em servidores Windows e equipamentos de rede (reconhecidos pela identificação
+  do item anterior), o comando não é executado. Como qualquer comando executado por SSH,
+  ele pode ficar registrado nos logs do servidor, e o servidor pode carregar antes os
+  arquivos de inicialização do seu shell. **Se o servidor força um comando**
+  (`ForceCommand` no `sshd_config` ou `command="..."` no `authorized_keys`), é esse
+  comando do servidor que roda no lugar do comando acima, a cada coleta, e os scripts
+  `~/.ssh/rc` e `/etc/ssh/sshrc`, se existirem, também rodam a cada coleta; nesses
+  servidores, desmarque **Detectar o sistema do servidor** (seção 4);
 - ao soltar arquivos num terminal SSH, o app executa nesse servidor, com o seu usuário, um
   pequeno script embutido no app. O script descobre a pasta atual do shell lendo
   informações dos processos em `/proc` (e do tmux, se houver). O resultado fica só na
@@ -299,6 +344,9 @@ você pede, para os servidores que você cadastra.
   da conexão, escolha **Editar**, desmarque **Detectar o sistema do servidor** e clique em
   **Salvar**. O sistema já detectado dessa conexão é apagado, e o cartão volta ao ícone de
   servidor.
+- **Monitoramento:** o comando só roda com a tela **Monitoramento** aberta; feche o painel
+  para parar as coletas e encerrar as conexões dela. Para deixar um servidor de fora,
+  desmarque **Detectar o sistema do servidor** no editor da conexão.
 - **Bloquear o cofre:** `Ctrl+L` na tela de conexões ou o botão **Bloquear cofre**. Com
   **Abrir sem senha neste computador** ligado, a próxima abertura do app volta a pedir a
   senha.
@@ -387,6 +435,11 @@ Portuguese version prevails.
 - When connecting to a server, the app may run on it, as your user, a fixed command that
   only reads the operating system's identification, to show the system's icon on the
   connection card. This can be turned off for each connection (sections 2 and 4).
+- While the **Monitoramento** (Monitoring) screen is open, the app runs every minute, on
+  each registered server with system detection on, a fixed command that only reads CPU,
+  memory, swap and disk usage, the load, the uptime and the number of processes and CPUs,
+  to show them on screen. This can be turned off for each connection, and none of it is
+  saved (sections 2 and 4).
 - The app only connects to the **servers you register**. It does not access the internet
   on its own: it does not check for updates and does not contact GitHub or any other server
   of the developer.
@@ -609,6 +662,46 @@ From the server, the app reads only what the features you use need:
 - the identification every SSH server sends at the start of the connection (for example,
   `SSH-2.0-OpenSSH_for_Windows_9.5`). The app uses it, in memory only, to recognize Windows
   servers and some network devices, on which the command above is not run;
+- starting with version 1.3.0, **the server's health**, only while the **Monitoramento**
+  (Monitoring) screen is open. The app connects to each registered connection (except those
+  with **Detectar o sistema do servidor** unchecked) and runs on it, as your user and on a
+  channel without a terminal, always this same command: when the screen opens, once a
+  minute, and right away when you click **Atualizar agora** (Refresh now) or change the
+  list of monitored connections (add or delete a connection, change its address, port,
+  user, password or key, turn detection on or off, accept or forget a server's key):
+
+  ```text
+  echo SAGUMON.load; cat /proc/loadavg; echo SAGUMON.cpus; getconf _NPROCESSORS_ONLN; nproc; echo SAGUMON.mem; cat /proc/meminfo; echo SAGUMON.up; cat /proc/uptime; echo SAGUMON.stat; head -n 1 /proc/stat; sleep 1; head -n 1 /proc/stat; echo SAGUMON.df; env LC_ALL=C timeout -s KILL 5 df -P -k; env LC_ALL=C timeout -t 5 -s KILL df -P -k; echo SAGUMON.end
+  ```
+
+  This command only reads the system load and the number of processes (`/proc/loadavg`),
+  the number of CPUs (`getconf` or `nproc`), memory and swap usage (`/proc/meminfo`), the
+  uptime (`/proc/uptime`), the CPU usage counters (the first line of `/proc/stat`, twice,
+  1 second apart) and the space of the mounted file systems (`df -P -k`, in English
+  because of `LC_ALL=C`, and stopped by `timeout` if it takes more than 5 seconds, as with
+  a network share that is down; it appears twice, once in each way of writing `timeout`,
+  and the one the server does not understand fails right away without running `df`). The
+  `echo SAGUMON...` lines only mark where each part of the answer starts. The answer does
+  not appear in any terminal; the app reads at most 1 MiB of it, shows the numbers on
+  screen and keeps, in memory only, the latest reading (with the CPU counters, to compute
+  the average usage until the next collection, and the last list of disks, for when `df`
+  does not answer) and the last hour of CPU and memory history, discarded when you close
+  the screen. Nothing goes to the vault or to disk. The connection stays open while the
+  screen is open and is closed when you close it: usually one login per opening of the
+  screen, not one per minute. If the connection drops, the app connects again at the next
+  collection. If the server rejects the credentials, the app does not try again on its
+  own, so as not to fill the server's logs with failed login attempts or trigger blocks
+  such as fail2ban: only when you click **Atualizar agora** (Refresh now) or edit the
+  connection. If the server's key has not been confirmed yet, or has changed, the app gives
+  up before sending the user name, the password or the key signature, and the card asks
+  you to connect through the terminal. On Windows servers and network devices (recognized
+  by the identification in the previous item) the command is not run. Like any command run
+  over SSH, it may be recorded in the server's logs, and the server may first load your
+  shell's startup files. **If the server forces a command** (`ForceCommand` in
+  `sshd_config` or `command="..."` in `authorized_keys`), that server command runs instead
+  of the command above, at each collection, and the `~/.ssh/rc` and `/etc/ssh/sshrc`
+  scripts, if present, also run at each collection; on such servers, uncheck **Detectar o
+  sistema do servidor** (Detect the server's system) (section 4);
 - when you drop files onto an SSH terminal, the app runs on that server, as your user, a
   small script embedded in the app. The script finds the shell's current folder by reading
   process information under `/proc` (and from tmux, if present). The result stays in memory
@@ -660,6 +753,10 @@ ones you ask for, to the servers you register.
   server, right-click the connection card, choose **Editar** (Edit), uncheck **Detectar o
   sistema do servidor** (Detect the server's system) and click **Salvar** (Save). The system
   already detected for that connection is deleted, and the card goes back to the server icon.
+- **Monitoring:** the command only runs while the **Monitoramento** (Monitoring) screen is
+  open; close the pane to stop collecting and close its connections. To leave a server out,
+  uncheck **Detectar o sistema do servidor** (Detect the server's system) in the
+  connection's editor.
 - **Lock the vault:** `Ctrl+L` on the connections screen, or the **Bloquear cofre** (Lock
   vault) button. With **Abrir sem senha neste computador** (Open without password on this
   computer) on, the next start of the app asks for the password again.

@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::download::{self, ConflictChoice, DownloadEvent};
 use crate::hostkey::{self, HostKeyAnswer, HostKeyPrompt, KeyCheck};
+use crate::monitor;
 use crate::osinfo::{self, OsReport};
 use crate::paste;
 use crate::pty;
@@ -154,6 +155,8 @@ struct Pane {
     origin: Option<SftpOrigin>,
     /// Copiar/mover no servidor (um por vez por painel).
     paste: Option<PasteUi>,
+    /// Tela de monitoramento dos servidores (quando o painel e de monitoramento).
+    monitor: Option<MonitorUi>,
 }
 
 /// Pergunta de chave cancelada porque o host saiu do cofre.
@@ -635,6 +638,7 @@ impl Pane {
             download: None,
             origin: None,
             paste: None,
+            monitor: None,
         }
     }
 }
@@ -4577,6 +4581,8 @@ enum PaneAction {
     OpenLocal { path: Vec<usize>, shell: pty::LocalShell },
     /// Abrir um navegador SFTP no painel indicado para o host dado.
     Sftp { path: Vec<usize>, host: usize },
+    /// Abrir o monitoramento dos servidores no painel indicado.
+    Monitor { path: Vec<usize> },
     /// Abrir o editor para o host indicado (a partir do seletor de um painel).
     Edit { host: usize },
     /// Abrir o editor para cadastrar um host novo (a partir do seletor).
@@ -4629,6 +4635,7 @@ const ICON_SPLIT_STACK: egui::ImageSource =
     egui::include_image!("../assets/square-split-vertical.svg");
 const ICON_CLOSE: egui::ImageSource = egui::include_image!("../assets/x.svg");
 const ICON_SERVER: egui::ImageSource = egui::include_image!("../assets/server.svg");
+const ICON_ACTIVITY: egui::ImageSource = egui::include_image!("../assets/activity.svg");
 const ICON_TERMINAL: egui::ImageSource = egui::include_image!("../assets/square-terminal.svg");
 const ICON_PLUG: egui::ImageSource = egui::include_image!("../assets/plug.svg");
 const ICON_SETTINGS: egui::ImageSource = egui::include_image!("../assets/settings.svg");
@@ -5738,6 +5745,7 @@ impl App {
         let mut edit_index: Option<usize> = None;
         let mut delete_index: Option<usize> = None;
         let mut open_local: Option<pty::LocalShell> = None;
+        let mut open_monitor = false;
 
         // Seletor de conexoes compartilhado (com busca e gerenciamento). O foco
         // automatico no campo so vale quando nao ha um host sendo editado.
@@ -5755,6 +5763,7 @@ impl App {
             },
         ) {
             Some(PickerAction::OpenLocal(s)) => open_local = Some(s),
+            Some(PickerAction::Monitor) => open_monitor = true,
             Some(PickerAction::Connect(i)) => connect_index = Some(i),
             Some(PickerAction::Sftp(i)) => sftp_index = Some(i),
             Some(PickerAction::Edit(i)) => edit_index = Some(i),
@@ -5769,6 +5778,9 @@ impl App {
 
         if let Some(shell) = open_local {
             self.start_local_session(shell);
+        }
+        if open_monitor {
+            self.start_monitor_session();
         }
         if let Some(i) = edit_index {
             self.hosts_error = None;
@@ -6221,6 +6233,32 @@ impl App {
                 pane.terminal = Some(Terminal::new(INITIAL_COLS, INITIAL_ROWS));
                 pane.state = SessionState::Connecting;
                 pane.ssh = Some(handle);
+                pane.picking = false;
+            }
+        }
+    }
+
+    /// Abre uma nova sessao com a tela de monitoramento.
+    fn start_monitor_session(&mut self) {
+        self.root = Some(Node::Leaf(Pane::picker()));
+        self.screen = Screen::Session;
+        self.open_monitor_pane(&[]);
+    }
+
+    /// Poe a tela de monitoramento no painel (folha) indicado. As coletas
+    /// comecam no proximo quadro e seguem enquanto o painel existir.
+    fn open_monitor_pane(&mut self, path: &[usize]) {
+        let ctx = self.ctx_for_repaint.clone();
+        let handle = monitor::start(move || {
+            if let Some(ctx) = &ctx {
+                ctx.request_repaint();
+            }
+        });
+        if let Some(root) = &mut self.root {
+            if let Some(Node::Leaf(pane)) = node_at_mut(root, path) {
+                pane.host_name = MONITOR_TITLE.to_string();
+                pane.state = SessionState::Connected;
+                pane.monitor = Some(MonitorUi::new(handle));
                 pane.picking = false;
             }
         }
@@ -7947,6 +7985,7 @@ impl App {
                     self.connect_local_pane(&path, shell)
                 }
                 PaneAction::Sftp { path, host } => self.connect_sftp_pane(&path, host),
+                PaneAction::Monitor { path } => self.open_monitor_pane(&path),
                 PaneAction::Edit { host } => {
                     if host < self.vault.hosts.len() {
                         self.hosts_error = None;
@@ -9974,10 +10013,1285 @@ fn host_tile(ui: &mut egui::Ui, spec: &TileSpec, selected: bool) -> egui::Respon
         .on_hover_ui(|ui| tile_hint_ui(ui, &spec.hint))
 }
 
+// ------------------------------------------------------------ monitoramento
+
+const MONITOR_TITLE: &str = "Monitoramento";
+const MONITOR_SUBTITLE: &str = "Saúde dos servidores";
+/// Cartao de um host com a deteccao do SO desligada: o comando de
+/// monitoramento nao roda (o servidor forcaria o proprio comando no lugar).
+const MONITOR_OFF: &str = "Monitoramento desligado nesta conexão: \u{201C}Detectar o sistema \
+     do servidor\u{201D} está desmarcado (o servidor força um comando próprio).";
+const MONITOR_EMPTY: &str = "Nenhum host cadastrado para monitorar.";
+/// Janela do grafico de historico (a ultima hora).
+const MON_SPAN: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Intervalo sem coleta acima do qual a linha do grafico se interrompe
+/// (coletas que falharam nao viram um trecho reto e enganoso).
+const MON_GAP: std::time::Duration = std::time::Duration::from_secs(150);
+/// Pontos guardados por host, no maximo (muitos "Atualizar agora" seguidos).
+const MON_HISTORY_MAX: usize = 720;
+const MON_CARD_SIZE: egui::Vec2 = egui::vec2(312.0, 350.0);
+const MON_PAD: f32 = 12.0;
+/// Fundo das barras e aneis (a parte nao preenchida).
+const GAUGE_TRACK: egui::Color32 = hex("#2f2f36");
+/// Series do grafico de historico.
+const SERIES_CPU: egui::Color32 = hex("#7aa2f7");
+const SERIES_MEM: egui::Color32 = hex("#c099ff");
+
+fn monitor_hint() -> Vec<String> {
+    vec![
+        MONITOR_TITLE.to_string(),
+        "CPU, memória, disco e load de cada servidor, atualizados a cada minuto".to_string(),
+        LOCAL_HINT_USE.to_string(),
+    ]
+}
+
+/// Estado da tela de monitoramento de um painel. Soltar encerra as coletas.
+struct MonitorUi {
+    handle: monitor::MonitorHandle,
+    /// Hora da proxima coleta (a primeira e logo ao abrir).
+    next_at: Instant,
+    hosts: std::collections::HashMap<uuid::Uuid, HostWatch>,
+    /// Hosts da ultima coleta pedida: mudou o destino, o usuario, a senha, a
+    /// chave ou a chave do servidor (ou entrou/saiu um host), coleta na hora.
+    sent: Vec<Host>,
+    /// Numero do ultimo pedido de coleta (ver `monitor::Request::seq`).
+    seq: u64,
+    /// O proximo pedido e um "Atualizar agora" (tenta de novo tambem quem
+    /// teve as credenciais recusadas).
+    force_next: bool,
+}
+
+/// O que se sabe de um host no monitoramento.
+#[derive(Default)]
+struct HostWatch {
+    /// Ultima coleta que deu certo (continua na tela se a seguinte falhar).
+    last: Option<monitor::Sample>,
+    /// Erro da ultima coleta.
+    error: Option<monitor::Failure>,
+    /// Quando chegou o ultimo resultado.
+    at: Option<Instant>,
+    /// Quando chegou a ultima coleta que deu certo (`last`).
+    ok_at: Option<Instant>,
+    /// Servidor a que os dados se referem (`monitor::target`).
+    target: Option<monitor::Target>,
+    /// Coleta pedida e ainda sem resposta.
+    pending: bool,
+    /// Pedido mais novo que inclui este host: resultado de pedido anterior
+    /// e descartado (nao apaga o "Coletando..." nem mostra dado velho).
+    pending_seq: u64,
+    /// Hora, CPU e memoria (%) das coletas da ultima hora, da mais antiga a
+    /// mais nova.
+    history: std::collections::VecDeque<(Instant, [f32; 2])>,
+}
+
+impl MonitorUi {
+    fn new(handle: monitor::MonitorHandle) -> Self {
+        MonitorUi {
+            handle,
+            next_at: Instant::now(),
+            hosts: Default::default(),
+            sent: Vec::new(),
+            seq: 0,
+            force_next: false,
+        }
+    }
+
+    /// Recebe os resultados e, na hora, pede a proxima coleta (so dos hosts
+    /// com a deteccao do SO ligada). Devolve quanto falta para a proxima.
+    fn tick(&mut self, hosts: &[Host]) -> std::time::Duration {
+        while let Ok(ev) = self.handle.rx.try_recv() {
+            self.apply(ev);
+        }
+        let now = Instant::now();
+        let on: Vec<&Host> = hosts.iter().filter(|h| h.detect_os).collect();
+        // Host excluido ou desligado sai; o que passou a apontar para outro
+        // servidor recomeca do zero (nada do servidor antigo fica no cartao).
+        self.hosts.retain(|id, _| on.iter().any(|h| h.id == *id));
+        for &h in &on {
+            let t = monitor::target(h);
+            let w = self.hosts.entry(h.id).or_default();
+            if w.target.as_ref() != Some(&t) {
+                *w = HostWatch {
+                    target: Some(t),
+                    ..Default::default()
+                };
+            }
+        }
+        // Host novo, editado (destino, usuario, senha ou chave) ou com a chave
+        // do servidor aceita agora: coleta na hora, sem esperar o minuto.
+        let changed = self.sent.len() != on.len()
+            || self
+                .sent
+                .iter()
+                .zip(&on)
+                .any(|(a, b)| a.id != b.id || !monitor::same_target(a, b));
+        if changed {
+            self.next_at = now;
+        }
+        if now >= self.next_at {
+            self.seq += 1;
+            for h in &on {
+                if let Some(w) = self.hosts.get_mut(&h.id) {
+                    w.pending = true;
+                    w.pending_seq = self.seq;
+                }
+            }
+            let list: Vec<Host> = on.iter().map(|&h| h.clone()).collect();
+            self.handle.refresh(list.clone(), self.seq, self.force_next);
+            self.sent = list;
+            self.force_next = false;
+            self.next_at = now + monitor::INTERVAL;
+        }
+        self.next_at.saturating_duration_since(now)
+    }
+
+    /// "Atualizar agora": coleta ja, tentando de novo tambem os hosts com
+    /// as credenciais recusadas.
+    fn refresh_now(&mut self) {
+        self.next_at = Instant::now();
+        self.force_next = true;
+    }
+
+    /// Alguma coleta pedida ainda sem resposta.
+    fn collecting(&self) -> bool {
+        self.hosts.values().any(|w| w.pending)
+    }
+
+    fn apply(&mut self, ev: monitor::MonitorEvent) {
+        // Resultado de um host que saiu ou do servidor para onde ele apontava
+        // antes de ser editado: descartado.
+        // Resultado de um pedido anterior ao mais novo (ex.: uma coleta lenta
+        // ainda em curso quando veio o "Atualizar agora", ou o erro da senha
+        // antiga): o pedido novo responde logo em seguida.
+        let Some(w) = self
+            .hosts
+            .get_mut(&ev.host_id)
+            .filter(|w| w.target.as_ref() == Some(&ev.target) && ev.seq >= w.pending_seq)
+        else {
+            return;
+        };
+        w.pending = false;
+        let now = Instant::now();
+        while w.history.front().is_some_and(|(t, _)| now.duration_since(*t) > MON_SPAN) {
+            w.history.pop_front();
+        }
+        // Falha repetida sem nova tentativa: a hora continua a da tentativa.
+        if ev.replayed && w.error.as_ref() == ev.result.as_ref().err() {
+            return;
+        }
+        w.at = Some(now);
+        match ev.result {
+            Ok(s) => {
+                w.ok_at = Some(now);
+                let mem = s.mem.map_or(f32::NAN, |m| m.pct());
+                w.history.push_back((now, [s.cpu_pct.unwrap_or(f32::NAN), mem]));
+                while w.history.len() > MON_HISTORY_MAX
+                    || w.history.front().is_some_and(|(t, _)| now.duration_since(*t) > MON_SPAN)
+                {
+                    w.history.pop_front();
+                }
+                w.last = Some(s);
+                w.error = None;
+            }
+            Err(e) => w.error = Some(e),
+        }
+    }
+}
+
+/// Situacao de um host no resumo do topo.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MonState {
+    Level(monitor::Level),
+    /// Ultima coleta falhou (conexao, prazo, credenciais).
+    Failed,
+    /// Chave do servidor a confirmar pelo terminal.
+    Key,
+    /// Windows, equipamento de rede ou sem /proc: nunca vai ter dados.
+    Unsupported,
+    /// Deteccao do SO desligada.
+    Off,
+    /// Ainda sem nenhum resultado.
+    Waiting,
+}
+
+fn mon_state(host: &Host, w: Option<&HostWatch>) -> MonState {
+    if !host.detect_os {
+        return MonState::Off;
+    }
+    match w {
+        Some(HostWatch { error: Some(f), .. }) => match f.kind {
+            monitor::FailKind::Unsupported | monitor::FailKind::NoData => MonState::Unsupported,
+            monitor::FailKind::Key => MonState::Key,
+            monitor::FailKind::Error | monitor::FailKind::Auth => MonState::Failed,
+        },
+        Some(HostWatch { last: Some(s), .. }) => MonState::Level(s.health()),
+        _ => MonState::Waiting,
+    }
+}
+
+/// Cor do texto de uma falha: sem suporte nao e problema do servidor.
+fn fail_color(kind: monitor::FailKind) -> egui::Color32 {
+    match kind {
+        monitor::FailKind::Unsupported | monitor::FailKind::NoData => TEXT_WEAK,
+        monitor::FailKind::Key => AUTH_PASS,
+        monitor::FailKind::Error | monitor::FailKind::Auth => ERROR_FG,
+    }
+}
+
+fn level_color(l: monitor::Level) -> egui::Color32 {
+    match l {
+        monitor::Level::Ok => AUTH_KEY,
+        monitor::Level::Warn => AUTH_PASS,
+        monitor::Level::Crit => ERROR_FG,
+    }
+}
+
+fn state_label(s: MonState) -> (&'static str, egui::Color32) {
+    match s {
+        MonState::Level(monitor::Level::Ok) => ("Saudável", AUTH_KEY),
+        MonState::Level(monitor::Level::Warn) => ("Atenção", AUTH_PASS),
+        MonState::Level(monitor::Level::Crit) => ("Crítico", ERROR_FG),
+        MonState::Failed => ("Sem resposta", ERROR_FG),
+        MonState::Key => ("Confirmar chave", AUTH_PASS),
+        MonState::Unsupported => ("Não suportado", TEXT_WEAK),
+        MonState::Off => ("Desligado", TEXT_WEAK),
+        MonState::Waiting => ("Coletando", TEXT_WEAK),
+    }
+}
+
+/// Tamanho em KiB para mostrar, curto para caber no cartao: MB sem casas,
+/// GB e TB com uma (virgula decimal), ex. "962 MB", "15,2 GB"; de 100 GB em
+/// diante sem casas ("252 GB").
+fn fmt_kb(kb: u64) -> String {
+    const MIB: f64 = 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+    let k = kb as f64;
+    let s = if k < MIB {
+        format!("{kb} KB")
+    } else if k < GIB {
+        format!("{:.0} MB", k / MIB)
+    } else if k < 100.0 * GIB {
+        format!("{:.1} GB", k / GIB)
+    } else if k < TIB {
+        format!("{:.0} GB", k / GIB)
+    } else {
+        format!("{:.1} TB", k / TIB)
+    };
+    s.replace('.', ",")
+}
+
+/// Tempo ligado, ex. "3 d 4 h", "5 h 12 min", "8 min".
+fn fmt_uptime(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
+    if d > 0 {
+        format!("{d} d {h} h")
+    } else if h > 0 {
+        format!("{h} h {m} min")
+    } else {
+        format!("{m} min")
+    }
+}
+
+/// Idade de um resultado, ex. "agora", "há 40 s", "há 3 min".
+fn fmt_ago(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 5 {
+        "agora".to_string()
+    } else if s < 60 {
+        format!("há {s} s")
+    } else {
+        format!("há {} min", s / 60)
+    }
+}
+
+/// Load com virgula decimal, como no resto da interface em portugues.
+fn fmt_load(v: f32) -> String {
+    format!("{v:.2}").replace('.', ",")
+}
+
+/// Texto numa linha, cortado com "…" na largura dada.
+fn mon_galley(
+    ui: &egui::Ui,
+    text: &str,
+    size: f32,
+    color: egui::Color32,
+    width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        text.to_string(),
+        egui::FontId::proportional(size),
+        color,
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(0.0));
+    ui.fonts(|f| f.layout_job(job))
+}
+
+/// Anel de 0 a 100% comecando no topo, no sentido horario.
+fn mon_ring(painter: &egui::Painter, c: egui::Pos2, r: f32, frac: f32, color: egui::Color32) {
+    let stroke = 7.0;
+    painter.circle_stroke(c, r, egui::Stroke::new(stroke, GAUGE_TRACK));
+    let frac = frac.clamp(0.0, 1.0);
+    if frac <= 0.0 {
+        return;
+    }
+    let n = ((frac * 72.0).ceil() as usize).max(2);
+    let pts: Vec<egui::Pos2> = (0..=n)
+        .map(|i| {
+            let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * frac * i as f32 / n as f32;
+            c + r * egui::vec2(a.cos(), a.sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(pts, egui::Stroke::new(stroke, color)));
+}
+
+/// Barra horizontal fina de 0 a 100%.
+fn mon_bar(painter: &egui::Painter, rect: egui::Rect, frac: f32, color: egui::Color32) {
+    painter.rect_filled(rect, 3.0, GAUGE_TRACK);
+    let w = rect.width() * frac.clamp(0.0, 1.0);
+    if w > 0.5 {
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(w.max(rect.height()), rect.height())),
+            3.0,
+            color,
+        );
+    }
+}
+
+/// Trechos do grafico de uma serie (`k`: 0 = CPU, 1 = memoria) na area
+/// `plot`: x pela idade da coleta (a borda direita e agora, a esquerda uma
+/// hora atras), y de 0 a 100%. Um intervalo maior que `MON_GAP` sem coleta
+/// (falhas) comeca um trecho novo.
+fn spark_runs(
+    hist: &std::collections::VecDeque<(Instant, [f32; 2])>,
+    now: Instant,
+    plot: egui::Rect,
+    k: usize,
+) -> Vec<Vec<egui::Pos2>> {
+    let span = MON_SPAN.as_secs_f32();
+    let mut runs: Vec<Vec<egui::Pos2>> = Vec::new();
+    let mut prev: Option<Instant> = None;
+    for (t, v) in hist {
+        let age = now.saturating_duration_since(*t).as_secs_f32();
+        if !v[k].is_finite() || age > span {
+            prev = None;
+            continue;
+        }
+        let p = egui::pos2(
+            plot.right() - age / span * plot.width(),
+            plot.bottom() - v[k].clamp(0.0, 100.0) / 100.0 * plot.height(),
+        );
+        match runs.last_mut() {
+            Some(run) if prev.is_some_and(|pt| t.saturating_duration_since(pt) <= MON_GAP) => {
+                run.push(p)
+            }
+            _ => runs.push(vec![p]),
+        }
+        prev = Some(*t);
+    }
+    runs
+}
+
+/// Historico de CPU e memoria da ultima hora (0 a 100%), pela hora de cada
+/// coleta: a mais nova fica na borda direita.
+fn mon_sparkline(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    hist: &std::collections::VecDeque<(Instant, [f32; 2])>,
+    now: Instant,
+) {
+    painter.rect_filled(rect, 4.0, WIDGET_BG);
+    let mid = rect.center().y;
+    painter.line_segment(
+        [egui::pos2(rect.left() + 4.0, mid), egui::pos2(rect.right() - 4.0, mid)],
+        egui::Stroke::new(1.0, GAUGE_TRACK),
+    );
+    let plot = rect.shrink2(egui::vec2(4.0, 3.0));
+    for (k, color) in [(1, SERIES_MEM), (0, SERIES_CPU)] {
+        for run in spark_runs(hist, now, plot, k) {
+            if run.len() == 1 {
+                painter.circle_filled(run[0], 1.5, color);
+            } else {
+                painter.add(egui::Shape::line(run, egui::Stroke::new(1.5, color)));
+            }
+        }
+    }
+}
+
+/// Dica do cartao de um host: tudo o que nao cabe nele.
+fn monitor_card_hint(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
+    ui.label(egui::RichText::new(display_name(host)).color(CARD_TEXT));
+    ui.label(egui::RichText::new(host_address(host)).color(TEXT_WEAK));
+    if let Some(os) = &host.os {
+        ui.label(egui::RichText::new(format!("Sistema: {}", os.label())).color(TEXT_WEAK));
+    }
+    if !host.detect_os {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(MONITOR_OFF).color(TEXT_WEAK));
+        return;
+    }
+    let Some(w) = w else {
+        return;
+    };
+    if let Some(e) = &w.error {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(&e.msg).color(fail_color(e.kind)));
+    }
+    if let Some(s) = &w.last {
+        ui.add_space(4.0);
+        // Com a ultima coleta falhando, o que segue e a leitura anterior.
+        if w.error.is_some() {
+            let ago = w.ok_at.map(|t| fmt_ago(t.elapsed())).unwrap_or_default();
+            ui.label(egui::RichText::new(format!("Última leitura ({ago}):")).color(TEXT_WEAK));
+        }
+        let alerts = s.alerts();
+        if alerts.is_empty() && w.error.is_none() {
+            ui.label(egui::RichText::new("Tudo dentro dos limites").color(AUTH_KEY));
+        }
+        for (a, l) in alerts {
+            ui.label(egui::RichText::new(a).color(level_color(l)));
+        }
+        if let Some(m) = s.mem {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Memória: {} de {} ({:.0}%)",
+                    fmt_kb(m.used_kb),
+                    fmt_kb(m.total_kb),
+                    m.pct()
+                ))
+                .color(TEXT_WEAK),
+            );
+        }
+        match s.swap {
+            Some(sw) => ui.label(
+                egui::RichText::new(format!(
+                    "Swap: {} de {} ({:.0}%)",
+                    fmt_kb(sw.used_kb),
+                    fmt_kb(sw.total_kb),
+                    sw.pct()
+                ))
+                .color(TEXT_WEAK),
+            ),
+            None => ui.label(egui::RichText::new("Sem swap").color(TEXT_WEAK)),
+        };
+        for d in &s.disks {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}: {} de {} ({:.0}%)",
+                    d.mount,
+                    fmt_kb(d.used_kb),
+                    fmt_kb(d.size_kb),
+                    d.pct()
+                ))
+                .color(TEXT_WEAK),
+            );
+        }
+        if s.disks_stale {
+            ui.label(egui::RichText::new(disks_stale_text(s)).color(AUTH_PASS));
+        }
+    }
+    if let Some(at) = w.at {
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(format!("Atualizado {}", fmt_ago(at.elapsed())))
+                .small()
+                .color(TEXT_WEAK),
+        );
+    }
+}
+
+/// Aviso de `df` sem resposta nesta coleta (travado num NFS, por exemplo).
+fn disks_stale_text(s: &monitor::Sample) -> &'static str {
+    if s.disks.is_empty() {
+        "O df não respondeu: sem dados de disco."
+    } else {
+        "O df não respondeu: discos da leitura anterior."
+    }
+}
+
+/// Cartao de um host na tela de monitoramento: aneis de CPU, memoria e do
+/// disco mais cheio, load, historico da ultima hora, discos e swap.
+fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
+    let (rect, resp) = ui.allocate_exact_size(MON_CARD_SIZE, egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter_at(rect);
+    painter.rect(
+        rect,
+        8.0,
+        CARD_BG,
+        egui::Stroke::new(1.0, CARD_BORDER),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink(MON_PAD);
+    let state = mon_state(host, w);
+
+    // --- Cabecalho: icone, nome, endereco e a situacao.
+    let badge = egui::Rect::from_min_size(inner.min, egui::Vec2::splat(32.0));
+    painter.rect(
+        badge,
+        8.0,
+        WIDGET_BG,
+        egui::Stroke::new(1.0, hex("#3d3d45")),
+        egui::StrokeKind::Inside,
+    );
+    let icon = host_icon(host);
+    egui::Image::new(icon.image)
+        .tint(icon.tint)
+        .paint_at(ui, egui::Rect::from_center_size(badge.center(), egui::Vec2::splat(18.0)));
+
+    let (pill_text, pill_color) = state_label(state);
+    let pill_g = mon_galley(ui, pill_text, 11.0, pill_color, 120.0);
+    let pill = egui::Rect::from_min_size(
+        egui::pos2(inner.right() - pill_g.size().x - 16.0, inner.top() + 6.0),
+        egui::vec2(pill_g.size().x + 16.0, 20.0),
+    );
+    painter.rect(
+        pill,
+        10.0,
+        pill_color.gamma_multiply(0.15),
+        egui::Stroke::new(1.0, pill_color.gamma_multiply(0.6)),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(pill.center() - pill_g.size() / 2.0, pill_g, pill_color);
+
+    let name_x = badge.right() + 10.0;
+    let name_w = pill.left() - 8.0 - name_x;
+    painter.galley(
+        egui::pos2(name_x, inner.top()),
+        mon_galley(ui, &display_name(host), 14.0, egui::Color32::WHITE, name_w),
+        egui::Color32::WHITE,
+    );
+    painter.galley(
+        egui::pos2(name_x, inner.top() + 19.0),
+        mon_galley(ui, &host_address(host), 11.0, TEXT_WEAK, name_w),
+        TEXT_WEAK,
+    );
+
+    let top = inner.top() + 44.0;
+    let footer_y = inner.bottom() - 14.0;
+    let sample = w.and_then(|w| w.last.as_ref());
+
+    // --- Sem dados: so a mensagem (ou a espera) no corpo.
+    let Some(s) = sample else {
+        let body = egui::Rect::from_min_max(egui::pos2(inner.left(), top), inner.max);
+        let msg = match (state, w.and_then(|w| w.error.as_ref())) {
+            (MonState::Off, _) => Some((MONITOR_OFF, TEXT_WEAK)),
+            (_, Some(e)) => Some((e.msg.as_str(), fail_color(e.kind))),
+            _ => None,
+        };
+        match msg {
+            Some((text, color)) => {
+                let job = egui::text::LayoutJob::simple(
+                    text.to_string(),
+                    egui::FontId::proportional(12.0),
+                    color,
+                    body.width() - 16.0,
+                );
+                let g = ui.fonts(|f| f.layout_job(job));
+                painter.galley(body.center() - g.size() / 2.0, g, color);
+            }
+            None => {
+                // Desenhado direto: um widget aqui mexeria no fluxo da grade.
+                let spin = egui::Rect::from_center_size(body.center(), egui::Vec2::splat(20.0));
+                egui::Spinner::new().size(20.0).paint_at(ui, spin);
+            }
+        }
+        resp.on_hover_ui_at_pointer(|ui| monitor_card_hint(ui, host, w));
+        return;
+    };
+
+    // --- Aneis: CPU, memoria e o disco mais cheio.
+    let col_w = inner.width() / 3.0;
+    let disk = s.disks.first();
+    let gauges: [(Option<f32>, monitor::Level, String, String); 3] = [
+        (
+            s.cpu_pct,
+            s.cpu_level(),
+            "CPU".to_string(),
+            s.cpus.map_or(String::new(), |c| format!("{c} CPU(s)")),
+        ),
+        (
+            s.mem.map(|m| m.pct()),
+            s.mem_level(),
+            "Memória".to_string(),
+            s.mem
+                .map_or(String::new(), |m| format!("{} de {}", fmt_kb(m.used_kb), fmt_kb(m.total_kb))),
+        ),
+        (
+            disk.map(|d| d.pct()),
+            s.disk_level(),
+            disk.map_or("Disco".to_string(), |d| format!("Disco {}", d.mount)),
+            if s.disks_stale {
+                "df sem resposta".to_string()
+            } else {
+                disk.map_or(String::new(), |d| format!("{} livres", fmt_kb(d.avail_kb)))
+            },
+        ),
+    ];
+    for (i, (value, lvl, label, sub)) in gauges.iter().enumerate() {
+        let cx = inner.left() + col_w * (i as f32 + 0.5);
+        let c = egui::pos2(cx, top + 34.0);
+        let color = level_color(*lvl);
+        mon_ring(&painter, c, 29.0, value.unwrap_or(0.0) / 100.0, color);
+        let text = value.map_or("—".to_string(), |v| format!("{v:.0}%"));
+        let g = mon_galley(ui, &text, 15.0, egui::Color32::WHITE, col_w);
+        painter.galley(c - g.size() / 2.0, g, egui::Color32::WHITE);
+        let g = mon_galley(ui, label, 11.0, CARD_TEXT, col_w - 6.0);
+        painter.galley(egui::pos2(cx - g.size().x / 2.0, top + 72.0), g, CARD_TEXT);
+        let g = mon_galley(ui, sub, 10.0, TEXT_WEAK, col_w - 6.0);
+        painter.galley(egui::pos2(cx - g.size().x / 2.0, top + 87.0), g, TEXT_WEAK);
+    }
+
+    // --- Load de 1, 5 e 15 min. Os numeros ficam neutros e o ponto leva a
+    // cor da mesma regra da situacao do cartao (`Sample::load_level`): pintar
+    // cada media pela propria carga deixava o de 5 e o de 15 min vermelhos
+    // por varios minutos depois de o problema acabar, com o cartao ja normal.
+    let load_y = top + 106.0;
+    let mut job = egui::text::LayoutJob::default();
+    let font = egui::FontId::proportional(12.0);
+    let push = |job: &mut egui::text::LayoutJob, t: &str, color: egui::Color32| {
+        job.append(t, 0.0, egui::TextFormat::simple(font.clone(), color));
+    };
+    push(&mut job, "Load  ", TEXT_WEAK);
+    match s.load {
+        Some(load) => {
+            for (i, v) in load.iter().enumerate() {
+                push(&mut job, &fmt_load(*v), CARD_TEXT);
+                if i < 2 {
+                    push(&mut job, "  ", TEXT_WEAK);
+                }
+            }
+            push(&mut job, "   (1, 5 e 15 min)", TEXT_WEAK);
+        }
+        None => push(&mut job, "\u{2014}", TEXT_WEAK),
+    }
+    let dot_x = inner.left() + 4.0;
+    job.wrap = egui::text::TextWrapping::truncate_at_width(inner.width() - 14.0);
+    let g = ui.fonts(|f| f.layout_job(job));
+    let dot_color = match (s.load, s.cpus.filter(|&c| c > 0)) {
+        (Some(_), Some(_)) => level_color(s.load_level()),
+        _ => TEXT_WEAK,
+    };
+    painter.circle_filled(egui::pos2(dot_x, load_y + g.size().y / 2.0), 3.5, dot_color);
+    painter.galley(egui::pos2(inner.left() + 14.0, load_y), g, CARD_TEXT);
+
+    // --- Historico da ultima hora.
+    let legend_y = top + 128.0;
+    let g = mon_galley(ui, "CPU", 10.0, SERIES_CPU, 60.0);
+    let cpu_w = g.size().x;
+    painter.galley(egui::pos2(inner.left(), legend_y), g, SERIES_CPU);
+    let g = mon_galley(ui, "Memória", 10.0, SERIES_MEM, 80.0);
+    painter.galley(egui::pos2(inner.left() + cpu_w + 10.0, legend_y), g, SERIES_MEM);
+    let g = mon_galley(ui, "última hora", 10.0, TEXT_WEAK, 100.0);
+    painter.galley(egui::pos2(inner.right() - g.size().x, legend_y), g, TEXT_WEAK);
+    let spark = egui::Rect::from_min_max(
+        egui::pos2(inner.left(), top + 143.0),
+        egui::pos2(inner.right(), top + 183.0),
+    );
+    if let Some(w) = w {
+        mon_sparkline(&painter, spark, &w.history, Instant::now());
+    }
+
+    // --- Discos (os mais cheios) e swap: uma barra por linha.
+    let mut rows: Vec<(String, f32, monitor::Level)> = Vec::new();
+    let max_disks = if s.swap.is_some() { 3 } else { 4 };
+    let shown = s.disks.len().min(max_disks);
+    for (i, d) in s.disks.iter().take(shown).enumerate() {
+        let mut label = d.mount.clone();
+        // A ultima linha conta os que nao couberam (estao todos na dica).
+        if i + 1 == shown && s.disks.len() > shown {
+            label = format!("{label}  +{}", s.disks.len() - shown);
+        }
+        rows.push((label, d.pct(), monitor::level(d.pct(), monitor::DISK_WARN, monitor::DISK_CRIT)));
+    }
+    if let Some(sw) = s.swap {
+        rows.push(("Swap".to_string(), sw.pct(), s.swap_level()));
+    }
+    let label_w = 104.0;
+    let pct_w = 38.0;
+    for (i, (label, p, lvl)) in rows.iter().enumerate() {
+        let y = top + 192.0 + i as f32 * 18.0;
+        painter.galley(
+            egui::pos2(inner.left(), y),
+            mon_galley(ui, label, 11.0, CARD_TEXT, label_w - 6.0),
+            CARD_TEXT,
+        );
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(inner.left() + label_w, y + 5.0),
+            egui::pos2(inner.right() - pct_w, y + 11.0),
+        );
+        mon_bar(&painter, bar, p / 100.0, level_color(*lvl));
+        let g = mon_galley(ui, &format!("{p:.0}%"), 11.0, CARD_TEXT, pct_w);
+        painter.galley(egui::pos2(inner.right() - g.size().x, y), g, CARD_TEXT);
+    }
+
+    // --- Rodape: tempo ligado e processos (ou o erro da ultima coleta) e a
+    // idade do dado.
+    let ago = w
+        .and_then(|w| w.at)
+        .map(|at| fmt_ago(at.elapsed()))
+        .unwrap_or_default();
+    let ago_g = mon_galley(ui, &ago, 10.0, TEXT_WEAK, 80.0);
+    let ago_w = ago_g.size().x;
+    painter.galley(egui::pos2(inner.right() - ago_w, footer_y + 1.0), ago_g, TEXT_WEAK);
+    let (left, color) = match w.and_then(|w| w.error.as_ref()) {
+        Some(e) => (e.msg.clone(), fail_color(e.kind)),
+        None => {
+            let mut parts = Vec::new();
+            if let Some(up) = s.uptime_secs {
+                parts.push(format!("Ligado há {}", fmt_uptime(up)));
+            }
+            if let Some(p) = s.procs {
+                parts.push(format!("{p} processos"));
+            }
+            (parts.join(" \u{00b7} "), TEXT_WEAK)
+        }
+    };
+    painter.galley(
+        egui::pos2(inner.left(), footer_y),
+        mon_galley(ui, &left, 11.0, color, inner.width() - ago_w - 8.0),
+        color,
+    );
+
+    // Junto ao ponteiro: ancorada no cartao (quase 350 px de altura), a dica
+    // abriria embaixo dele, longe do nome.
+    resp.on_hover_ui_at_pointer(|ui| monitor_card_hint(ui, host, w));
+}
+
+/// Contagem de hosts por situacao no topo da tela de monitoramento.
+fn monitor_summary(ui: &mut egui::Ui, mon: &MonitorUi, hosts: &[Host]) {
+    let mut counts = [0usize; 6];
+    for h in hosts {
+        let i = match mon_state(h, mon.hosts.get(&h.id)) {
+            MonState::Level(monitor::Level::Ok) => 0,
+            MonState::Level(monitor::Level::Warn) => 1,
+            MonState::Level(monitor::Level::Crit) => 2,
+            MonState::Failed => 3,
+            MonState::Key => 4,
+            MonState::Unsupported | MonState::Off | MonState::Waiting => 5,
+        };
+        counts[i] += 1;
+    }
+    let total = hosts.len();
+    ui.label(
+        egui::RichText::new(if total == 1 {
+            "1 servidor".to_string()
+        } else {
+            format!("{total} servidores")
+        })
+        .strong()
+        .color(CARD_TEXT),
+    );
+    let chips = [
+        (counts[0], "saudável", "saudáveis", AUTH_KEY),
+        (counts[1], "em atenção", "em atenção", AUTH_PASS),
+        (counts[2], "crítico", "críticos", ERROR_FG),
+        (counts[3], "sem resposta", "sem resposta", ERROR_FG),
+        (counts[4], "chave a confirmar", "chaves a confirmar", AUTH_PASS),
+    ];
+    for (n, one, many, color) in chips {
+        if n == 0 {
+            continue;
+        }
+        ui.add_space(6.0);
+        let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+        ui.painter().circle_filled(dot.center(), 4.0, color);
+        ui.label(
+            egui::RichText::new(format!("{n} {}", if n == 1 { one } else { many }))
+                .color(TEXT_WEAK),
+        );
+    }
+}
+
+/// "Atualizar agora" e a contagem para a proxima coleta (alinhados a direita).
+fn monitor_controls(ui: &mut egui::Ui, mon: &mut MonitorUi, left: std::time::Duration) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if fit_btn(ui, "Atualizar agora", &BTN_GHOST, "Coletar os dados de novo agora") {
+            mon.refresh_now();
+            ui.ctx().request_repaint();
+        }
+        ui.add_space(8.0);
+        if mon.collecting() {
+            ui.label(egui::RichText::new("Coletando...").small().color(TEXT_WEAK));
+            ui.add(egui::Spinner::new().size(12.0));
+        } else {
+            let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+            ui.label(
+                egui::RichText::new(format!("Próxima atualização em {secs} s"))
+                    .small()
+                    .color(TEXT_WEAK),
+            );
+        }
+    });
+}
+
+/// Largura minima para o resumo e os controles na mesma linha.
+const MON_TOP_ONE_ROW: f32 = 760.0;
+
+/// Tela de monitoramento: resumo e "Atualizar agora" no topo e um cartao por
+/// host cadastrado. Coleta ao abrir e a cada `monitor::INTERVAL`. `path` (o
+/// painel) separa os ids de duas telas abertas lado a lado.
+fn monitor_ui(ui: &mut egui::Ui, mon: &mut MonitorUi, hosts: &[Host], path: &[usize]) {
+    let left = mon.tick(hosts);
+    // Contagem regressiva no topo: um quadro por segundo basta.
+    ui.ctx()
+        .request_repaint_after(left.min(std::time::Duration::from_secs(1)));
+
+    ui.push_id(("monitor", path), |ui| {
+        ui.add_space(6.0);
+        // Painel estreito (tela dividida): resumo numa linha, que quebra se
+        // preciso, e os controles na de baixo.
+        if ui.available_width() >= MON_TOP_ONE_ROW {
+            ui.horizontal(|ui| {
+                monitor_summary(ui, mon, hosts);
+                monitor_controls(ui, mon, left);
+            });
+        } else {
+            ui.horizontal_wrapped(|ui| monitor_summary(ui, mon, hosts));
+            ui.horizontal(|ui| monitor_controls(ui, mon, left));
+        }
+        ui.add_space(8.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt("monitor_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if hosts.is_empty() {
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new(MONITOR_EMPTY).color(TEXT_WEAK));
+                    return;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::Vec2::splat(TILE_SPACING);
+                    for h in hosts {
+                        monitor_card(ui, h, mon.hosts.get(&h.id));
+                    }
+                });
+                ui.add_space(8.0);
+            });
+    });
+}
+
+#[cfg(test)]
+mod monitor_ui_tests {
+    use super::*;
+
+    #[test]
+    fn short_sizes_fit_the_card() {
+        assert_eq!(fmt_kb(512), "512 KB");
+        assert_eq!(fmt_kb(985_088), "962 MB");
+        assert_eq!(fmt_kb(15_938_355), "15,2 GB");
+        // 251,8 GB: sem casa decimal (cabe no rotulo do anel).
+        assert_eq!(fmt_kb(264_030_000), "252 GB");
+        assert_eq!(fmt_kb(2 * 1024 * 1024 * 1024), "2,0 TB");
+    }
+
+    #[test]
+    fn uptime_and_age() {
+        assert_eq!(fmt_uptime(59), "0 min");
+        assert_eq!(fmt_uptime(3 * 3600 + 12 * 60), "3 h 12 min");
+        assert_eq!(fmt_uptime(2 * 86_400 + 5 * 3600 + 59), "2 d 5 h");
+        assert_eq!(fmt_ago(std::time::Duration::from_secs(2)), "agora");
+        assert_eq!(fmt_ago(std::time::Duration::from_secs(40)), "há 40 s");
+        assert_eq!(fmt_ago(std::time::Duration::from_secs(185)), "há 3 min");
+        assert_eq!(fmt_load(1.0), "1,00");
+    }
+
+    #[test]
+    fn card_state() {
+        let mut host = Host::new();
+        assert!(mon_state(&host, None) == MonState::Waiting);
+        let mut w = HostWatch {
+            last: Some(monitor::Sample {
+                cpu_pct: Some(97.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(mon_state(&host, Some(&w)) == MonState::Level(monitor::Level::Crit));
+        // Erro na ultima coleta vence o dado antigo; desligado vence tudo.
+        let fail = |k| Some(monitor::Failure::new(k, "x"));
+        w.error = fail(monitor::FailKind::Error);
+        assert!(mon_state(&host, Some(&w)) == MonState::Failed);
+        w.error = fail(monitor::FailKind::Auth);
+        assert!(mon_state(&host, Some(&w)) == MonState::Failed);
+        w.error = fail(monitor::FailKind::Key);
+        assert!(mon_state(&host, Some(&w)) == MonState::Key);
+        // Windows/sem /proc: neutro, fora do vermelho "sem resposta".
+        w.error = fail(monitor::FailKind::Unsupported);
+        assert!(mon_state(&host, Some(&w)) == MonState::Unsupported);
+        assert_eq!(state_label(MonState::Unsupported).1, TEXT_WEAK);
+        host.detect_os = false;
+        assert!(mon_state(&host, Some(&w)) == MonState::Off);
+    }
+
+    fn mon_host(name: &str, addr: &str) -> Host {
+        let mut h = Host::new();
+        h.name = name.into();
+        h.host = addr.into();
+        h.username = "root".into();
+        h
+    }
+
+    fn ok_event(h: &Host, cpu: f32, seq: u64) -> monitor::MonitorEvent {
+        monitor::MonitorEvent {
+            host_id: h.id,
+            target: monitor::target(h),
+            seq,
+            result: Ok(monitor::Sample {
+                cpu_pct: Some(cpu),
+                ..Default::default()
+            }),
+            replayed: false,
+        }
+    }
+
+    /// Host editado para outro servidor recomeca do zero (e coleta na hora);
+    /// host desligado ou excluido sai; resultado atrasado do servidor antigo
+    /// e descartado.
+    #[test]
+    fn tick_follows_host_edits() {
+        let (handle, mut sent, events) = monitor::test_handle();
+        let mut mon = MonitorUi::new(handle);
+        let mut a = mon_host("A", "srv-a");
+        let b = mon_host("B", "srv-b");
+        let mut hosts = vec![a.clone(), b.clone()];
+        let st = |mon: &MonitorUi, h: &Host| mon_state(h, mon.hosts.get(&h.id));
+
+        mon.tick(&hosts);
+        let req = sent.try_recv().unwrap();
+        assert_eq!((req.hosts.len(), req.seq, req.force), (2, 1, false));
+        assert!(mon.collecting());
+        events.send(ok_event(&a, 99.0, 1)).unwrap();
+        events.send(ok_event(&b, 10.0, 1)).unwrap();
+        mon.tick(&hosts);
+        assert!(!mon.collecting());
+        assert!(sent.try_recv().is_err(), "coletou de novo antes do minuto");
+        assert!(st(&mon, &a) == MonState::Level(monitor::Level::Crit));
+
+        // Endereco trocado: dados do servidor antigo somem e coleta na hora.
+        let old = a.clone();
+        a.host = "srv-novo".into();
+        hosts[0] = a.clone();
+        mon.tick(&hosts);
+        assert!(mon.hosts[&a.id].last.is_none());
+        assert!(st(&mon, &a) == MonState::Waiting);
+        assert_eq!(sent.try_recv().unwrap().seq, 2);
+        // Resultado atrasado do servidor antigo: descartado.
+        events.send(ok_event(&old, 99.0, 2)).unwrap();
+        mon.tick(&hosts);
+        assert!(mon.hosts[&a.id].last.is_none());
+        events.send(ok_event(&a, 5.0, 2)).unwrap();
+        mon.tick(&hosts);
+        assert!(st(&mon, &a) == MonState::Level(monitor::Level::Ok));
+
+        // So o nome mudou: nada a coletar de novo.
+        hosts[0].name = "A renomeado".into();
+        mon.tick(&hosts);
+        assert!(sent.try_recv().is_err());
+
+        // So a senha mudou (ex.: corrigida depois de recusada): coleta na hora.
+        hosts[0].auth = AuthMethod::Password {
+            password: "nova".into(),
+        };
+        mon.tick(&hosts);
+        assert_eq!(sent.try_recv().unwrap().seq, 3);
+
+        // Desligado: sai da coleta e do cartao (nada de saude antiga ao religar).
+        hosts[1].detect_os = false;
+        mon.tick(&hosts);
+        assert_eq!(sent.try_recv().unwrap().hosts.len(), 1);
+        assert!(!mon.hosts.contains_key(&b.id));
+        hosts[1].detect_os = true;
+        mon.tick(&hosts);
+        assert!(st(&mon, &hosts[1]) == MonState::Waiting);
+        assert_eq!(sent.try_recv().unwrap().hosts.len(), 2);
+
+        // Chave do servidor aceita no terminal: coleta na hora.
+        hosts[0].host_key = Some("ssh-ed25519 AAAA".into());
+        mon.tick(&hosts);
+        let req = sent.try_recv().unwrap();
+        assert!(!req.force);
+
+        // Resultado de um pedido anterior ao mais novo: descartado, e o
+        // "Coletando..." continua ate o pedido novo responder.
+        let seq = req.seq;
+        mon.refresh_now();
+        mon.tick(&hosts);
+        let req = sent.try_recv().unwrap();
+        assert_eq!((req.seq, req.force), (seq + 1, true));
+        events.send(ok_event(&hosts[0], 77.0, seq)).unwrap();
+        mon.tick(&hosts);
+        assert!(mon.hosts[&a.id].pending);
+        assert!(mon.hosts[&a.id].last.as_ref().unwrap().cpu_pct != Some(77.0));
+        events.send(ok_event(&hosts[0], 12.0, seq + 1)).unwrap();
+        mon.tick(&hosts);
+        assert!(!mon.hosts[&a.id].pending);
+        assert_eq!(mon.hosts[&a.id].last.as_ref().unwrap().cpu_pct, Some(12.0));
+        // O "Atualizar agora" vale um pedido so.
+        mon.next_at = Instant::now();
+        mon.tick(&hosts);
+        let req = sent.try_recv().unwrap();
+        assert!(!req.force);
+
+        // Credenciais recusadas: a falha repetida sem nova tentativa nao
+        // vira "Atualizado agora".
+        let fail = monitor::Failure::new(monitor::FailKind::Auth, "recusada");
+        let ev = |seq, replayed| monitor::MonitorEvent {
+            host_id: a.id,
+            target: monitor::target(&hosts[0]),
+            seq,
+            result: Err(fail.clone()),
+            replayed,
+        };
+        events.send(ev(req.seq, false)).unwrap();
+        mon.tick(&hosts);
+        let at = mon.hosts[&a.id].at;
+        assert!(st(&mon, &a) == MonState::Failed);
+        mon.next_at = Instant::now();
+        mon.tick(&hosts);
+        let seq = sent.try_recv().unwrap().seq;
+        events.send(ev(seq, true)).unwrap();
+        mon.tick(&hosts);
+        assert!(!mon.hosts[&a.id].pending);
+        assert_eq!(mon.hosts[&a.id].at, at);
+    }
+
+    /// Grafico pela hora de cada coleta: falhas no meio interrompem a linha
+    /// e o que passou de uma hora sai.
+    #[test]
+    fn sparkline_is_placed_by_time() {
+        // Base no futuro: `Instant - Duration` antes do boot da maquina entra
+        // em panico (o Windows conta o Instant desde o boot).
+        let now = Instant::now() + std::time::Duration::from_secs(2 * 3600);
+        let min = |m: u64| now - std::time::Duration::from_secs(m * 60);
+        let hist: std::collections::VecDeque<(Instant, [f32; 2])> = [
+            (min(70), [50.0, 50.0]),
+            (min(30), [10.0, 20.0]),
+            (min(29), [20.0, 20.0]),
+            // 20 min sem coleta (falhas).
+            (min(9), [30.0, f32::NAN]),
+            (min(8), [40.0, 20.0]),
+            (min(0), [100.0, 20.0]),
+        ]
+        .into_iter()
+        .collect();
+        let plot = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 100.0));
+        let cpu = spark_runs(&hist, now, plot, 0);
+        assert_eq!(cpu.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2, 1]);
+        // 30 min atras = meio da largura; agora = borda direita; 100% = topo.
+        assert!((cpu[0][0].x - 300.0).abs() < 0.5, "{:?}", cpu[0][0]);
+        assert_eq!(cpu[2][0], egui::pos2(600.0, 0.0));
+        // Memoria sem valor numa coleta: a linha tambem se interrompe ali.
+        let mem = spark_runs(&hist, now, plot, 1);
+        assert_eq!(mem.iter().map(Vec::len).collect::<Vec<_>>(), [2, 1, 1]);
+    }
+
+    /// Texto pintado: conteudo, cor de cada trecho e area.
+    fn painted(out: &egui::FullOutput) -> Vec<(String, Vec<egui::Color32>, egui::Rect)> {
+        out.shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some((
+                    t.galley.text().to_string(),
+                    t.galley.job.sections.iter().map(|x| x.format.color).collect(),
+                    egui::Rect::from_min_size(t.pos, t.galley.size()),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Cor dos pontos (raio 3,5) pintados no cartao: o do load.
+    fn dots(out: &egui::FullOutput) -> Vec<egui::Color32> {
+        out.shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Circle(c) if c.radius == 3.5 => Some(c.fill),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Problema resolvido (load de 1 min baixo, de 5 e 15 ainda altos): nada
+    /// no cartao fica vermelho ou ambar, e o ponto do load fica verde.
+    #[test]
+    fn recovered_load_paints_nothing_red() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let host = mon_host("Recuperado", "srv");
+        let mut w = HostWatch {
+            last: Some(monitor::Sample {
+                cpu_pct: Some(15.0),
+                cpus: Some(1),
+                load: Some([0.28, 2.07, 3.44]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let out = card_frame(&ctx, &host, &w, 0.0, vec![]);
+        let texts = painted(&out);
+        let load = texts
+            .iter()
+            .find(|(t, ..)| t.starts_with("Load"))
+            .expect("linha do load");
+        assert!(load.0.contains("2,07") && load.0.contains("3,44"), "{load:?}");
+        for (t, cs, _) in &texts {
+            assert!(
+                !cs.iter().any(|c| *c == ERROR_FG || *c == AUTH_PASS),
+                "{t:?} pintado de vermelho/ambar"
+            );
+        }
+        assert!(texts.iter().any(|(t, ..)| t == "Saudável"));
+        assert_eq!(dots(&out), [AUTH_KEY]);
+
+        // Carga alta que continua: o ponto fica vermelho.
+        w.last.as_mut().unwrap().load = Some([3.0, 2.5, 1.0]);
+        let out = card_frame(&ctx, &host, &w, 0.1, vec![]);
+        assert_eq!(dots(&out), [ERROR_FG]);
+        // Sem o numero de CPUs nao ha como julgar: ponto neutro.
+        w.last.as_mut().unwrap().cpus = None;
+        let out = card_frame(&ctx, &host, &w, 0.2, vec![]);
+        assert_eq!(dots(&out), [TEXT_WEAK]);
+    }
+
+    /// Ultima coleta falhou: a dica nao diz "Tudo dentro dos limites" sobre a
+    /// leitura antiga, e a apresenta como anterior.
+    #[test]
+    fn failed_collection_hint_marks_old_reading() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        ctx.style_mut(|s| s.interaction.tooltip_delay = 0.0);
+        let host = mon_host("Caiu", "srv");
+        let w = HostWatch {
+            last: Some(monitor::Sample {
+                cpu_pct: Some(5.0),
+                disks_stale: true,
+                ..Default::default()
+            }),
+            error: Some(monitor::Failure::new(monitor::FailKind::Error, monitor::NO_ANSWER)),
+            ok_at: Some(Instant::now()),
+            ..Default::default()
+        };
+        let out = card_frame(&ctx, &host, &w, 0.0, vec![]);
+        let name = painted(&out)
+            .into_iter()
+            .find(|(t, ..)| t == "Caiu")
+            .expect("nome")
+            .2;
+        card_frame(&ctx, &host, &w, 0.1, vec![egui::Event::PointerMoved(name.center())]);
+        let mut out = None;
+        for i in 0..3 {
+            out = Some(card_frame(&ctx, &host, &w, 0.6 + i as f64 * 0.5, vec![]));
+        }
+        let texts: Vec<String> = painted(out.as_ref().unwrap())
+            .into_iter()
+            .map(|(t, ..)| t)
+            .collect();
+        assert!(texts.iter().any(|t| t.starts_with("Última leitura")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "Tudo dentro dos limites"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == monitor::NO_ANSWER), "{texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("O df não respondeu")), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Sem resposta"), "{texts:?}");
+    }
+
+    /// Um cartao de monitoramento sozinho, com o ponteiro onde indicado.
+    fn card_frame(
+        ctx: &egui::Context,
+        host: &Host,
+        w: &HostWatch,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 800.0),
+            )),
+            events,
+            time: Some(time),
+            focused: true,
+            ..Default::default()
+        };
+        ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| monitor_card(ui, host, Some(w)));
+        })
+    }
+
+    /// A dica do cartao (que ocupa quase 350 px de altura) aparece junto ao
+    /// ponteiro, e nao embaixo do cartao inteiro, longe do nome.
+    #[test]
+    fn card_hint_opens_next_to_the_pointer() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        ctx.style_mut(|s| s.interaction.tooltip_delay = 0.0);
+        let mut host = Host::new();
+        host.name = "Servidor A".into();
+        host.host = "srv".into();
+        host.username = "root".into();
+        let w = HostWatch {
+            last: Some(monitor::Sample {
+                cpu_pct: Some(12.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let galleys = |out: &egui::FullOutput| -> Vec<(String, egui::Rect)> {
+            out.shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) => Some((
+                        t.galley.text().to_string(),
+                        egui::Rect::from_min_size(t.pos, t.galley.size()),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let out = card_frame(&ctx, &host, &w, 0.0, vec![]);
+        let name = galleys(&out)
+            .into_iter()
+            .find(|(t, _)| t == "Servidor A")
+            .expect("nome no cartao")
+            .1;
+        let card_bottom = name.top() + MON_CARD_SIZE.y;
+        let at = name.center();
+        card_frame(&ctx, &host, &w, 0.1, vec![egui::Event::PointerMoved(at)]);
+        let mut out = None;
+        for i in 0..3 {
+            out = Some(card_frame(&ctx, &host, &w, 0.6 + i as f64 * 0.5, vec![]));
+        }
+        let all = galleys(out.as_ref().unwrap());
+        let tip = all
+            .iter()
+            .find(|(t, _)| t == "Tudo dentro dos limites")
+            .unwrap_or_else(|| panic!("dica nao apareceu: {all:?}"))
+            .1;
+        // 1a linha da dica: o nome de novo, fora do cartao.
+        let first = all
+            .iter()
+            .filter(|(t, r)| t == "Servidor A" && *r != name)
+            .map(|(_, r)| *r)
+            .next()
+            .expect("nome na dica");
+        assert!(tip.top() < card_bottom, "dica embaixo do cartao: {tip:?}");
+        assert!(
+            first.top() > at.y && first.top() - at.y < 40.0,
+            "dica longe do ponteiro {at:?}: {first:?}"
+        );
+        assert!((first.left() - at.x).abs() < 30.0, "dica longe do ponteiro {at:?}: {first:?}");
+    }
+}
+
 /// Acao escolhida pelo usuario no seletor de conexoes compartilhado.
 enum PickerAction {
     /// Abrir um terminal local (cmd.exe ou WSL).
     OpenLocal(pty::LocalShell),
+    /// Abrir o monitoramento dos servidores.
+    Monitor,
     /// Conectar ao host no indice indicado.
     Connect(usize),
     /// Abrir um navegador de arquivos SFTP no host indicado.
@@ -9997,6 +11311,7 @@ enum PickerAction {
 #[derive(Clone, Copy)]
 enum PickerTile {
     Local(pty::LocalShell),
+    Monitor,
     Host(usize),
     New,
 }
@@ -10047,6 +11362,9 @@ fn connection_picker(
         && (termo.is_empty() || "wsl".contains(&termo) || "linux".contains(&termo))
     {
         tiles.push(PickerTile::Local(pty::LocalShell::Wsl));
+    }
+    if termo.is_empty() || "monitoramento".contains(&termo) {
+        tiles.push(PickerTile::Monitor);
     }
     for (i, host) in hosts.iter().enumerate() {
         // Filtra so pelo nome exibido no cartao (o endereco/IP nao conta).
@@ -10216,6 +11534,31 @@ fn connection_picker(
                                 paint_menu_bg(ui, bg);
                             });
                         }
+                        // Monitoramento dos servidores cadastrados.
+                        PickerTile::Monitor => {
+                            let spec = TileSpec {
+                                icon: TileIcon::theme(ICON_ACTIVITY),
+                                title: MONITOR_TITLE,
+                                subtitle: MONITOR_SUBTITLE,
+                                auth: None,
+                                hint: monitor_hint(),
+                            };
+                            let tile = host_tile(ui, &spec, selected);
+                            if selected && sel_changed {
+                                tile.scroll_to_me(None);
+                            }
+                            if tile.double_clicked() {
+                                action = Some(PickerAction::Monitor);
+                            }
+                            tile.context_menu(|ui| {
+                                let bg = style_context_menu(ui);
+                                if menu_item(ui, ICON_ACTIVITY, "Abrir", ACCENT) {
+                                    action = Some(PickerAction::Monitor);
+                                    ui.close_menu();
+                                }
+                                paint_menu_bg(ui, bg);
+                            });
+                        }
                         // Cartao de cadastro: um clique abre o editor de host.
                         PickerTile::New => {
                             let spec = TileSpec {
@@ -10323,6 +11666,7 @@ fn connection_picker(
         } else if activate {
             match tiles.get(sel) {
                 Some(PickerTile::Local(s)) => action = Some(PickerAction::OpenLocal(*s)),
+                Some(PickerTile::Monitor) => action = Some(PickerAction::Monitor),
                 Some(PickerTile::Host(i)) => action = Some(PickerAction::Connect(*i)),
                 Some(PickerTile::New) => action = Some(PickerAction::NewHost),
                 None => {}
@@ -10590,6 +11934,9 @@ fn render_node(
                             path: path.clone(),
                             shell: s,
                         }),
+                        Some(PickerAction::Monitor) => {
+                            actions.push(PaneAction::Monitor { path: path.clone() })
+                        }
                         Some(PickerAction::Connect(h)) => actions.push(PaneAction::Connect {
                             path: path.clone(),
                             host: h,
@@ -10611,6 +11958,8 @@ fn render_node(
                         }
                         None => {}
                     }
+                } else if let Some(mon) = &mut pane.monitor {
+                    monitor_ui(ui, mon, hosts, path);
                 } else if pane.sftp.is_some() && pane.host_key.is_some() {
                     // SFTP aguardando a confirmacao da chave: sem navegador ainda.
                     pane_spinner(ui, HOST_KEY_WAIT);

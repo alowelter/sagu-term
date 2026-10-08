@@ -161,6 +161,29 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
   arquivos e pastas. Num link simbólico, permissões e proprietário valem para o destino, e
   excluir remove só o link, nunca o destino.
 
+### Monitoramento
+- O cartão **Monitoramento**, ao lado do Terminal local e do WSL, abre uma tela com um
+  cartão por servidor cadastrado: anéis de **CPU** (média desde a coleta anterior),
+  **memória** e do **disco** mais cheio, **load** de 1, 5 e 15 minutos, gráfico de CPU e
+  memória da última hora, barras dos discos e do swap, tempo ligado e número de processos.
+- Cada servidor ganha uma situação (**Saudável**, **Atenção** ou **Crítico**) pela pior
+  medida, e o topo da tela resume quantos estão em cada uma. A dica do cartão lista o que
+  está fora do normal e todos os discos. O load conta pelo menor entre os de 1 e 5
+  minutos, por CPU: um pico curto e moderado não acusa, e a situação volta ao normal poucos
+  minutos depois que a carga cai (sem esperar a média de 5 minutos baixar). CD ou ISO
+  montado não conta como disco cheio, e um `df` que trava (compartilhamento de rede fora
+  do ar) é encerrado em 5 segundos, mantendo os discos da leitura anterior.
+- Atualiza sozinha a cada minuto enquanto estiver aberta (ou na hora, com **Atualizar
+  agora**), usando uma conexão por servidor que fica aberta só enquanto a tela existir.
+  Trocar o endereço, a porta, o usuário, a senha ou a chave de uma conexão, ou aceitar a
+  chave do servidor no terminal, já dispara uma coleta. Se o servidor recusar as
+  credenciais, o monitoramento não tenta de novo sozinho (para não acumular tentativas de
+  login falhas no servidor): corrija a conexão ou clique em **Atualizar agora**.
+- Funciona em servidores Linux (Windows e equipamentos de rede aparecem como **Não
+  suportado**); a chave do servidor precisa ter sido confirmada antes pelo terminal, e
+  conexões com **Detectar o sistema do servidor** desmarcado ficam de fora. O comando
+  executado está na [política de privacidade](PRIVACY.md).
+
 ### Cofre e conexões
 - Tela de conexões com **busca instantânea** pelo nome.
 - Cadastre, edite e exclua hosts em qualquer seletor (`Ctrl+N` cria um novo).

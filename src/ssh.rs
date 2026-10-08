@@ -99,6 +99,15 @@ impl client::Handler for Client {
     }
 }
 
+/// Credenciais recusadas pelo servidor (o monitoramento reconhece o erro
+/// para nao repetir a tentativa a cada minuto; ver `monitor`).
+pub(crate) const AUTH_FAILED: &str = "falha na autenticação (credenciais rejeitadas)";
+/// Comeco do erro de chave privada que nao abre (passphrase errada, formato).
+pub(crate) const KEY_INVALID: &str = "chave privada inválida";
+/// O servidor fechou a conexao no meio da autenticacao, sem recusar as
+/// credenciais (ex.: o PAM barrando logins durante o boot, com /run/nologin).
+pub(crate) const AUTH_CLOSED: &str = "o servidor encerrou a conexão durante a autenticação";
+
 /// Conecta e autentica uma sessao russh com os dados do host. Unico ponto de
 /// configuracao (timeouts, politica de chave do servidor, metodos de
 /// autenticacao), compartilhado entre as sessoes de terminal SSH e SFTP.
@@ -155,7 +164,7 @@ pub(crate) async fn connect_and_auth(
             passphrase,
         } => {
             let key = decode_secret_key(private_key, passphrase.as_deref())
-                .map_err(|e| anyhow::anyhow!("chave privada inválida: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("{KEY_INVALID}: {e}"))?;
             let hash = session.best_supported_rsa_hash().await?.flatten();
             session
                 .authenticate_publickey(
@@ -168,7 +177,12 @@ pub(crate) async fn connect_and_auth(
     };
 
     if !authenticated {
-        anyhow::bail!("falha na autenticação (credenciais rejeitadas)");
+        // O russh tambem devolve "falha" quando a conexao cai antes da
+        // resposta: so e credencial recusada se a conexao continua aberta.
+        if session.is_closed() {
+            anyhow::bail!("{AUTH_CLOSED}");
+        }
+        anyhow::bail!("{AUTH_FAILED}");
     }
     Ok((session, banner))
 }
