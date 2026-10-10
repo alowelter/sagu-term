@@ -123,6 +123,7 @@ NAVEGADOR SFTP
 • Baixe arquivos e pastas para o computador: selecione os itens, aperte Ctrl+S ou use o botão de download e escolha a pasta de destino. Pastas vêm com todo o conteúdo.
 • O andamento aparece no painel, com botão para cancelar. Se algo já existe no destino, você escolhe entre substituir, pular os existentes ou cancelar.
 • Cada arquivo é baixado num temporário e só recebe o nome final quando termina, com a data de modificação do servidor. Nomes que o Windows não aceita são ajustados, e nada é gravado fora da pasta escolhida.
+• Copie e mova arquivos e pastas no servidor com Ctrl+C, Ctrl+X e Ctrl+V. Para copiar entre dois servidores, arraste a seleção de um painel SFTP e solte no painel do outro: os dados passam pelo SaguTerm, sem gravar nada no seu computador.
 • Renomeie, altere permissões e proprietário/grupo e exclua arquivos e pastas.
 
 TERMINAL LOCAL
@@ -162,8 +163,15 @@ Leve e rápido: escrito em Rust do começo ao fim, incluindo o SSH (sem OpenSSL)
 
 ### What's new in this version (Novidades desta versão)
 
-Limite: 1500 caracteres. Texto da 1.3.0 (950 caracteres), com o monitoramento dos
-servidores e as correções do terminal:
+Limite: 1500 caracteres. Texto da 1.4.0 (764 caracteres), com a cópia entre servidores
+arrastando entre painéis e a correção do download de pastas grandes:
+
+```text
+Copiar entre servidores: com dois painéis SFTP abertos, arraste os arquivos e pastas selecionados de um painel e solte no outro para copiá-los para a pasta aberta ali, no mesmo servidor ou em outro. Antes de soltar, o painel mostra para onde vai a cópia, e o andamento aparece no rodapé, com Cancelar. A cópia passa pelo SaguTerm, sem gravar nada no seu computador, e tem as mesmas garantias do colar: nada é substituído sem perguntar, cada arquivo é gravado num temporário e renomeado no fim, e permissões, datas e links simbólicos são mantidos.
+Corrigido: em servidores com OpenSSH 8.7 ou mais novo, o download de uma pasta com mais de mil arquivos falhava a partir do milésimo, e o visualizador parava de abrir arquivos depois de muitos abertos na mesma sessão.
+```
+
+Texto da 1.3.0, só de referência:
 
 ```text
 Monitoramento: novo cartão na tela de conexões, ao lado do Terminal local e do WSL, com a saúde de todos os servidores numa só tela: CPU, memória, disco mais cheio, load, gráfico da última hora, discos, swap, tempo ligado e processos, e a situação de cada um (Saudável, Atenção ou Crítico). Atualiza sozinho a cada minuto enquanto está aberto, com uma conexão por servidor, e só lê informações do sistema (os detalhes estão na política de privacidade). Funciona em servidores Linux; conexões com a detecção do sistema desligada ficam de fora.
@@ -219,7 +227,7 @@ Visualizador somente leitura no SFTP: Enter num arquivo mostra o conteúdo, com 
 SFTP pelo teclado: PageUp/PageDown, Home/End, busca por letras e caminho digitado, com pastas, arquivos e links simbólicos inconfundíveis
 Arraste arquivos do Windows para um painel SFTP ou um terminal SSH para enviá-los ao servidor
 Baixe arquivos e pastas pelo SFTP com Ctrl+S, com andamento, cancelamento e aviso antes de substituir
-Copie e mova arquivos e pastas no servidor com Ctrl+C, Ctrl+X e Ctrl+V no navegador SFTP
+Copie e mova arquivos e pastas no servidor com Ctrl+C, Ctrl+X e Ctrl+V, e copie entre servidores arrastando de um painel SFTP para o outro
 Histórico de rolagem: role com a roda do mouse ou Shift+PgUp e copie texto que já saiu da tela
 Ícone do sistema de cada servidor (Ubuntu, Debian, Red Hat, AlmaLinux e outros), identificado em segundo plano ao conectar
 Monitoramento: CPU, memória, disco e load dos seus servidores Linux numa só tela, atualizada a cada minuto, com a situação de cada um

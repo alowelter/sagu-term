@@ -1,6 +1,6 @@
 # Política de Privacidade do SaguTerm
 
-**Vigência:** 8 de outubro de 2026 · [English version below](#english)
+**Vigência:** 10 de outubro de 2026 · [English version below](#english)
 
 Esta política vale para o SaguTerm distribuído pela **Microsoft Store** e também para um
 executável que você mesmo compile a partir do código-fonte, que é público no GitHub. O
@@ -21,8 +21,9 @@ MIT), mantido por Marcelo Welter ("o desenvolvedor").
 - O visualizador de arquivos do navegador SFTP lê do servidor só o arquivo que você abre,
   para mostrá-lo na tela. O conteúdo fica na memória e não é gravado em disco.
 - Copiar e mover arquivos no navegador SFTP (`Ctrl+C`/`Ctrl+X` e `Ctrl+V`) acontece no
-  próprio servidor: os dados de uma cópia passam pela memória do app, sem serem gravados no
-  seu computador.
+  próprio servidor, e arrastar arquivos de um painel SFTP para outro os copia para o
+  servidor desse painel, que pode ser outro dos que você cadastrou: os dados de uma cópia
+  passam pela memória do app, sem serem gravados no seu computador.
 - Ao conectar a um servidor, o app pode executar nele, com o seu usuário, um comando fixo
   que só lê a identificação do sistema operacional, para mostrar o ícone do sistema no
   cartão da conexão. Isso pode ser desligado em cada conexão (seções 2 e 4).
@@ -212,6 +213,13 @@ Do servidor, o app lê apenas o necessário para as funções que você usa:
   dados passam só pela memória do app, em blocos, e não são gravados no seu computador.
   Mover para outro disco do servidor só copia e apaga os originais depois de você
   confirmar;
+- a partir da versão 1.4.0, **os arquivos e pastas que você arrasta de um painel SFTP para
+  outro**, inclusive de um servidor para outro dos que você cadastrou. O app lê cada
+  arquivo pela conexão do painel de origem e grava a cópia, pela conexão do painel de
+  destino, na pasta aberta nele, com as permissões e as datas do original (o dono e o grupo
+  nunca passam de um servidor para outro); os dados passam só pela memória do app, em
+  blocos, e não são gravados no seu computador. Arrastar só copia: nada é movido nem
+  apagado na origem;
 - a partir da versão 1.1.0, **o arquivo que você abre no visualizador** do navegador SFTP
   (Enter ou duplo clique sobre ele), só para mostrá-lo na tela: o tipo, o tamanho e a data
   de modificação dele (num link simbólico, também o destino; num arquivo de tamanho 0,
@@ -408,7 +416,7 @@ públicas: não inclua senhas, chaves, endereços de servidores nem outros dados
 
 # SaguTerm Privacy Policy
 
-**Effective date:** October 8, 2026
+**Effective date:** October 10, 2026
 
 This policy applies to SaguTerm distributed through the **Microsoft Store** and also to an
 executable you build yourself from the source code, which is public on GitHub. SaguTerm is
@@ -430,8 +438,9 @@ Portuguese version prevails.
 - The file viewer in the SFTP browser reads from the server only the file you open, to show
   it on screen. Its content stays in memory and is not written to disk.
 - Copying and moving files in the SFTP browser (`Ctrl+C`/`Ctrl+X` and `Ctrl+V`) happens on
-  the server itself: the data of a copy passes through the app's memory without being
-  written to your computer.
+  the server itself, and dragging files from one SFTP pane to another copies them to that
+  pane's server, which may be another of the servers you registered: the data of a copy
+  passes through the app's memory without being written to your computer.
 - When connecting to a server, the app may run on it, as your user, a fixed command that
   only reads the operating system's identification, to show the system's icon on the
   connection card. This can be turned off for each connection (sections 2 and 4).
@@ -621,6 +630,13 @@ From the server, the app reads only what the features you use need:
   `root`, its owner and group); the data only passes through the app's memory, in blocks,
   and is not written to your computer. Moving to another disk of the server only copies and
   deletes the originals after you confirm;
+- starting with version 1.4.0, **the files and folders you drag from one SFTP pane to
+  another**, including from one server to another of the servers you registered. The app
+  reads each file over the source pane's connection and writes the copy, over the
+  destination pane's connection, to the folder open there, with the original's permissions
+  and dates (the owner and group never carry over from one server to another); the data
+  only passes through the app's memory, in blocks, and is not written to your computer.
+  Dragging only copies: nothing is moved or deleted at the source;
 - starting with version 1.1.0, **the file you open in the viewer** of the SFTP browser
   (Enter or double-click on it), only to show it on screen: its type, size and modification
   date (for a symbolic link, also its target; for a zero-size file, also its real path,
