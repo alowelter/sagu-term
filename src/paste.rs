@@ -1,4 +1,5 @@
-//! Colar no navegador SFTP: copiar e mover no mesmo servidor.
+//! Colar no navegador SFTP: copiar e mover no mesmo servidor, e copiar entre
+//! dois servidores (arrastar de um painel para o outro).
 //!
 //! A UI guarda o que foi copiado (Ctrl+C) ou recortado (Ctrl+X) e, no Ctrl+V,
 //! planeja os conflitos com a listagem do painel de destino (`prepare`) antes
@@ -11,6 +12,17 @@
 //!   SFTP (pela memoria do app, nunca pelo disco do Windows), cada arquivo num
 //!   temporario na pasta final, renomeado no fim. Sem exec de shell no
 //!   servidor: nada depende de shell nem corre risco com nomes estranhos.
+//!
+//! Entre servidores (`run_from`): a mesma copia, lendo pela sessao do painel
+//! de origem (emprestada, ver `sftp::SessionRef`) e gravando pela do destino,
+//! numa unica tarefa na thread do destino. So copia (nunca move), nunca
+//! preserva dono/grupo (os ids nao valem no outro servidor) e nao ha nome
+//! "(cópia)" automatico nem conferencia de "para dentro de si mesma" (os
+//! caminhos sao de servidores diferentes). A leitura passa pelo canal
+//! principal do painel de origem: uma copia longa divide esse canal com a
+//! navegacao dele, e um pedido preso la (stat em NFS parado) segura a copia
+//! ate o prazo do crate. Se a sessao de origem acaba no meio, o lote para
+//! com "conexão com o servidor de origem perdida".
 //!
 //! Garantias: nada e substituido sem `replace`, e a substituicao troca pelo
 //! nome com um backup (nunca ha momento sem o original); links simbolicos
@@ -73,6 +85,9 @@ const F_TOO_MANY: &str = "a seleção tem mais de 200.000 itens; copie partes me
 const F_TOO_BIG: &str = "a seleção é grande demais; copie partes menores";
 const F_WRITE: &str = "o servidor parou de aceitar gravações (disco cheio ou cota esgotada?)";
 const F_INTERNAL: &str = "erro interno ao colar";
+// Copia entre servidores: qual dos dois caiu.
+pub const F_SRC_CONNECTION: &str = "conexão com o servidor de origem perdida";
+pub const F_DST_CONNECTION: &str = "conexão com o servidor de destino perdida";
 
 // Origem mantida num "copiar e apagar".
 const K_NOT_CLEAN: &str = "nem tudo pôde ser copiado; a origem foi mantida";
@@ -386,13 +401,16 @@ pub struct Prepared {
 
 /// Separa os validos e os que ja existem no destino. `dest`: listagem do
 /// painel de destino, nome -> e pasta de verdade. Copiar para a propria pasta
-/// nunca conflita (o servidor escolhe o nome "(cópia)").
+/// nunca conflita (o servidor escolhe o nome "(cópia)"). `cross`: origem e
+/// destino em servidores diferentes; caminhos iguais nao sao a mesma pasta
+/// nem uma pasta "dentro de si mesma" (so os nomes ainda conflitam).
 pub fn prepare(
     op: PasteOp,
     src_dir: &str,
     dest_dir: &str,
     sources: &[Source],
     dest: &HashMap<&str, bool>,
+    cross: bool,
 ) -> Prepared {
     let mut p = Prepared {
         op,
@@ -402,13 +420,13 @@ pub fn prepare(
         mismatched: 0,
         invalid: Vec::new(),
     };
-    let same = same_dir(src_dir, dest_dir);
+    let same = !cross && same_dir(src_dir, dest_dir);
     for s in sources {
         if let Err(why) = check_remote_name(s.name) {
             p.invalid.push((s.name.to_string(), why.to_string()));
             continue;
         }
-        if s.is_dir && is_inside(dest_dir, s.path) {
+        if !cross && s.is_dir && is_inside(dest_dir, s.path) {
             p.invalid.push((s.name.to_string(), R_INTO_ITSELF.to_string()));
             continue;
         }
@@ -573,8 +591,9 @@ impl Drop for FinishGuard<'_> {
     }
 }
 
-/// Tarefa do colar (spawnada pela sessao SFTP). Termina sempre com um
-/// `PasteEvent::Finished`, salvo se for abortada junto com a sessao.
+/// Tarefa do colar no mesmo servidor (spawnada pela sessao SFTP). Termina
+/// sempre com um `PasteEvent::Finished`, salvo se for abortada junto com a
+/// sessao.
 pub async fn run(
     sftp: Arc<SftpSession>,
     links: Arc<LinkOrder>,
@@ -584,9 +603,45 @@ pub async fn run(
     cancel: watch::Receiver<bool>,
     tx: UnboundedSender<PasteEvent>,
 ) {
+    run_job(&sftp, &sftp, false, &links, am_root, id, req, cancel, &tx).await;
+}
+
+/// Copia entre servidores: le em `src` (sessao de outro painel, emprestada)
+/// e grava em `dst` (a sessao que roda esta tarefa). So copia (`op` e
+/// forcado a `Copy`); dono/grupo nunca sao preservados. Termina sempre com
+/// um `PasteEvent::Finished`, salvo se for abortada junto com a sessao.
+pub async fn run_from(
+    src: Arc<SftpSession>,
+    dst: Arc<SftpSession>,
+    links: Arc<LinkOrder>,
+    id: u64,
+    req: PasteRequest,
+    cancel: watch::Receiver<bool>,
+    tx: UnboundedSender<PasteEvent>,
+) {
+    let req = PasteRequest {
+        op: PasteOp::Copy,
+        ..req
+    };
+    run_job(&src, &dst, true, &links, false, id, req, cancel, &tx).await;
+}
+
+/// Um lote, do `Finished` garantido ao plano executado.
+#[allow(clippy::too_many_arguments)]
+async fn run_job(
+    src: &SftpSession,
+    dst: &SftpSession,
+    cross: bool,
+    links: &LinkOrder,
+    am_root: bool,
+    id: u64,
+    req: PasteRequest,
+    cancel: watch::Receiver<bool>,
+    tx: &UnboundedSender<PasteEvent>,
+) {
     let PasteRequest { op, dest_dir, items } = req;
     let mut finish = FinishGuard {
-        tx: &tx,
+        tx,
         report: PasteReport {
             id,
             op: Some(op),
@@ -605,15 +660,17 @@ pub async fn run(
         }
     }
     let mut job = Job {
-        sftp: &sftp,
-        links: &links,
+        src,
+        dst,
+        cross,
+        links,
         am_root,
         id,
         op,
         dest_dir: dest_dir.clone(),
         dest_real: String::new(),
         cancel,
-        tx: &tx,
+        tx,
         report: &mut finish.report,
         last_event: None,
         bytes: 0,
@@ -630,9 +687,15 @@ pub async fn run(
     finish.send();
 }
 
-/// Um lote em andamento.
+/// Um lote em andamento. Lado de leitura (`src`: lstat, listagem, readlink,
+/// open para ler) e lado de gravacao (`dst`: tudo o que e criado, gravado,
+/// renomeado ou apagado no destino). No mesmo servidor sao a mesma sessao;
+/// mover e "copiar e apagar" so existem nesse caso.
 struct Job<'a> {
-    sftp: &'a SftpSession,
+    src: &'a SftpSession,
+    dst: &'a SftpSession,
+    /// Servidores diferentes (ver `run_from`).
+    cross: bool,
     links: &'a LinkOrder,
     am_root: bool,
     id: u64,
@@ -700,21 +763,43 @@ impl Job<'_> {
         tokio::time::timeout(PROBE_TIMEOUT, fut).await.ok()
     }
 
-    /// A conexao ainda responde?
-    async fn connection_alive(&self) -> bool {
+    /// A sessao `s` ainda responde? (Uma sessao emprestada cuja thread
+    /// acabou falha na hora: "session closed".)
+    async fn alive(s: &SftpSession) -> bool {
         matches!(
-            tokio::time::timeout(PROBE_TIMEOUT, self.sftp.canonicalize(".")).await,
+            tokio::time::timeout(PROBE_TIMEOUT, s.canonicalize(".")).await,
             Ok(Ok(_))
         )
     }
 
     /// Erro remoto num item: falha so dele, ou fatal se a conexao caiu.
+    /// Entre servidores as duas sessoes sao sondadas (juntas), e a mensagem
+    /// diz qual delas caiu.
     async fn remote_problem(&self, msg: String) -> Step {
-        if self.connection_alive().await {
-            Step::Failed(clip(&msg, MAX_REMOTE_MSG))
-        } else {
-            Step::Fatal(F_CONNECTION.into())
+        let failed = || Step::Failed(clip(&msg, MAX_REMOTE_MSG));
+        if !self.cross {
+            return if Self::alive(self.dst).await {
+                failed()
+            } else {
+                Step::Fatal(F_CONNECTION.into())
+            };
         }
+        let (src_ok, dst_ok) = tokio::join!(Self::alive(self.src), Self::alive(self.dst));
+        if !src_ok {
+            Step::Fatal(F_SRC_CONNECTION.into())
+        } else if !dst_ok {
+            Step::Fatal(F_DST_CONNECTION.into())
+        } else {
+            failed()
+        }
+    }
+
+    /// A conexao com o destino caiu: nada mais e gravado nele.
+    fn dest_lost(&self) -> bool {
+        matches!(
+            self.report.fatal.as_deref(),
+            Some(F_CONNECTION | F_DST_CONNECTION)
+        )
     }
 
     /// Registra a falha de um item; `false` = parar o lote.
@@ -753,14 +838,14 @@ impl Job<'_> {
     /// Canoniza e confere a pasta de destino; `false` = fatal (anotado).
     async fn open_dest(&mut self) -> bool {
         let dest = self.dest_dir.clone();
-        let Some(real) = self.ask(self.sftp.canonicalize(dest)).await else {
+        let Some(real) = self.ask(self.dst.canonicalize(dest)).await else {
             return false;
         };
         let Ok(real) = real else {
             self.report.fatal = Some(F_DEST_GONE.into());
             return false;
         };
-        let Some(meta) = self.ask(self.sftp.metadata(real.clone())).await else {
+        let Some(meta) = self.ask(self.dst.metadata(real.clone())).await else {
             return false;
         };
         if !matches!(meta.map(|m| kind_of(&m)), Ok(RawKind::Dir)) {
@@ -771,9 +856,20 @@ impl Job<'_> {
         true
     }
 
-    /// lstat que distingue "nao existe" (`Ok(None)`) de erro.
+    /// lstat no destino que distingue "nao existe" (`Ok(None)`) de erro.
     async fn lstat(&mut self, path: &str) -> Result<Option<FileAttributes>, Step> {
-        match self.ask(self.sftp.symlink_metadata(path.to_string())).await {
+        let r = self.ask(self.dst.symlink_metadata(path.to_string())).await;
+        self.lstat_result(r).await
+    }
+
+    /// O mesmo lstat, na origem.
+    async fn lstat_src(&mut self, path: &str) -> Result<Option<FileAttributes>, Step> {
+        let r = self.ask(self.src.symlink_metadata(path.to_string())).await;
+        self.lstat_result(r).await
+    }
+
+    async fn lstat_result(&mut self, r: Option<Result<FileAttributes, SftpError>>) -> Result<Option<FileAttributes>, Step> {
+        match r {
             None => Err(Step::Cancelled),
             Some(Ok(m)) => Ok(Some(m)),
             Some(Err(e)) if code_of(&e) == Code::NoSuchFile => Ok(None),
@@ -787,7 +883,7 @@ impl Job<'_> {
         if let Some(r) = self.parents.get(&parent) {
             return r.clone();
         }
-        let r = match self.ask(self.sftp.canonicalize(parent.clone())).await {
+        let r = match self.ask(self.src.canonicalize(parent.clone())).await {
             Some(Ok(p)) => Some(p),
             _ => None,
         };
@@ -801,7 +897,7 @@ impl Job<'_> {
         if !item.src.ends_with(&format!("/{}", item.name)) {
             return Err(Step::Failed(R_INVALID.into()));
         }
-        match self.lstat(&item.src).await? {
+        match self.lstat_src(&item.src).await? {
             Some(m) => Ok(m),
             None => Err(Step::Failed(R_SRC_GONE.into())),
         }
@@ -837,7 +933,7 @@ impl Job<'_> {
             return Ok(());
         }
         if is_dir {
-            if let Some(Ok(src_real)) = self.ask(self.sftp.canonicalize(item.src.clone())).await {
+            if let Some(Ok(src_real)) = self.ask(self.src.canonicalize(item.src.clone())).await {
                 if is_inside(&self.dest_real, &src_real) {
                     return Err(Step::Failed(R_INTO_ITSELF.into()));
                 }
@@ -846,7 +942,7 @@ impl Job<'_> {
         let target = join_remote(&self.dest_real, &item.name);
         let shown_to = join_remote(&self.dest_dir, &item.name);
         match self.lstat(&target).await? {
-            None => match self.ask(self.sftp.rename(item.src.clone(), target.clone())).await {
+            None => match self.ask(self.dst.rename(item.src.clone(), target.clone())).await {
                 None => Err(Step::Cancelled),
                 Some(Ok(())) => {
                     self.moved(item, shown_to);
@@ -865,7 +961,7 @@ impl Job<'_> {
                     match self.merge(&item.src, &target, &item.name).await? {
                         Merge::CrossDevice => self.cross_device(item, true).await,
                         Merge::Done => {
-                            if self.lstat(&item.src).await?.is_none() {
+                            if self.lstat_src(&item.src).await?.is_none() {
                                 self.moved(item, shown_to);
                             }
                             Ok(())
@@ -899,8 +995,8 @@ impl Job<'_> {
     /// um ponto de montagem; o resto volta para a UI perguntar.
     async fn cross_device(&mut self, item: &PasteItem, is_dir: bool) -> Result<(), Step> {
         if is_dir {
-            let a = self.probe(self.sftp.fs_info(item.src.clone())).await;
-            let b = self.probe(self.sftp.fs_info(parent_of(&item.src))).await;
+            let a = self.probe(self.src.fs_info(item.src.clone())).await;
+            let b = self.probe(self.src.fs_info(parent_of(&item.src))).await;
             if let (Some(Ok(Some(a))), Some(Ok(Some(b)))) = (a, b) {
                 if a.fs_id != b.fs_id {
                     return Err(Step::Failed(R_MOUNT.into()));
@@ -912,7 +1008,8 @@ impl Job<'_> {
     }
 
     /// Classifica a falha de um RENAME conferindo origem, destino e a pasta de
-    /// destino (o OpenSSH devolve so "Failure" para varios motivos).
+    /// destino (o OpenSSH devolve so "Failure" para varios motivos), tudo em
+    /// `dst`, que e onde todo RENAME roda.
     /// `dst_known`: situacao do destino ja sabida (troca por backup).
     async fn rename_failed(&mut self, e: &SftpError, src: &str, target: &str, src_is_dir: bool, dst_known: Option<bool>) -> RenameFail {
         let exists = |r: Option<Result<FileAttributes, SftpError>>| match r {
@@ -920,12 +1017,15 @@ impl Job<'_> {
             Some(Err(e)) if code_of(&e) == Code::NoSuchFile => Some(false),
             _ => None,
         };
-        let src_exists = exists(self.probe(self.sftp.symlink_metadata(src.to_string())).await);
+        // O RENAME roda sempre em `dst`, entao a origem dele tambem esta la
+        // (entre servidores e o temporario, ou o link ao lado, ja gravado
+        // no destino).
+        let src_exists = exists(self.probe(self.dst.symlink_metadata(src.to_string())).await);
         let dst_exists = match dst_known {
             Some(k) => Some(k),
-            None => exists(self.probe(self.sftp.symlink_metadata(target.to_string())).await),
+            None => exists(self.probe(self.dst.symlink_metadata(target.to_string())).await),
         };
-        let dest_dir_ok = match self.probe(self.sftp.metadata(parent_of(target))).await {
+        let dest_dir_ok = match self.probe(self.dst.metadata(parent_of(target))).await {
             Some(Ok(m)) => Some(kind_of(&m) == RawKind::Dir),
             Some(Err(e)) if code_of(&e) == Code::NoSuchFile => Some(false),
             _ => None,
@@ -952,20 +1052,20 @@ impl Job<'_> {
     /// `Ok(Some(aviso))`: trocou, mas o backup ficou.
     async fn replace_by_backup(&mut self, new: &str, target: &str, name: &str) -> Result<Option<String>, Replace> {
         let bak = join_remote(&parent_of(target), &side_name(name, OLD_SUFFIX));
-        match self.ask(self.sftp.rename(target.to_string(), bak.clone())).await {
+        match self.ask(self.dst.rename(target.to_string(), bak.clone())).await {
             None => return Err(Replace::Step(Step::Cancelled)),
             Some(Err(e)) => return Err(Replace::Step(Step::Failed(clip(&format!("não foi possível substituir: {e}"), MAX_REMOTE_MSG)))),
             Some(Ok(())) => {}
         }
-        match self.sftp.rename(new.to_string(), target.to_string()).await {
-            Ok(()) => match self.probe(self.sftp.remove_file(bak.clone())).await {
+        match self.dst.rename(new.to_string(), target.to_string()).await {
+            Ok(()) => match self.probe(self.dst.remove_file(bak.clone())).await {
                 Some(Ok(())) => Ok(None),
                 _ => Ok(Some(format!("substituído, mas o arquivo antigo ficou como {bak}"))),
             },
             Err(e) => {
                 // Classifica antes de desfazer (o destino esta livre agora).
                 let fail = self.rename_failed(&e, new, target, false, Some(false)).await;
-                if self.sftp.rename(bak.clone(), target.to_string()).await.is_err() {
+                if self.dst.rename(bak.clone(), target.to_string()).await.is_err() {
                     return Err(Replace::Step(Step::Failed(format!(
                         "não foi possível substituir; o original ficou como {bak}"
                     ))));
@@ -983,7 +1083,8 @@ impl Job<'_> {
     /// explicita, com os limites da varredura). No fim as pastas de origem
     /// que ficaram vazias saem (as de dentro primeiro).
     async fn merge(&mut self, src: &str, dst: &str, shown: &str) -> Result<Merge, Step> {
-        let sftp = self.sftp;
+        // Mover: lado de leitura e de gravacao sao a mesma sessao.
+        let (rs, ws) = (self.src, self.dst);
         let mut stack = vec![(src.to_string(), dst.to_string(), shown.to_string(), 1usize)];
         let mut emptied: Vec<String> = Vec::new();
         let mut moved_any = false;
@@ -995,7 +1096,7 @@ impl Job<'_> {
                 }
                 continue;
             }
-            let listing = match self.ask(sftp.read_dir(s.clone())).await {
+            let listing = match self.ask(rs.read_dir(s.clone())).await {
                 None => return Err(Step::Cancelled),
                 Some(Ok(l)) => l,
                 Some(Err(e)) => {
@@ -1027,12 +1128,12 @@ impl Job<'_> {
                 }
                 let child_src = join_remote(&s, &name);
                 let child_dst = join_remote(&d, &name);
-                let Some(cm) = self.lstat(&child_src).await? else {
+                let Some(cm) = self.lstat_src(&child_src).await? else {
                     continue;
                 };
                 let child_dir = kind_of(&cm) == RawKind::Dir;
                 let r = match self.lstat(&child_dst).await? {
-                    None => match self.ask(sftp.rename(child_src.clone(), child_dst.clone())).await {
+                    None => match self.ask(ws.rename(child_src.clone(), child_dst.clone())).await {
                         None => return Err(Step::Cancelled),
                         Some(Ok(())) => Ok(()),
                         Some(Err(e)) => match self.rename_failed(&e, &child_src, &child_dst, child_dir, None).await {
@@ -1074,7 +1175,7 @@ impl Job<'_> {
         }
         // Sobrou algo (falhas ja anotadas): essa pasta de origem fica.
         for s in emptied.iter().rev() {
-            let _ = self.probe(sftp.remove_dir(s.clone())).await;
+            let _ = self.probe(rs.remove_dir(s.clone())).await;
         }
         Ok(Merge::Done)
     }
@@ -1098,7 +1199,7 @@ impl Job<'_> {
         // Espaco livre (statvfs): so quando o servidor informa. A cota do
         // cPanel nao aparece aqui (ver MAX_WRITE_FAILS).
         if total > 0 {
-            if let Some(Ok(Some(s))) = self.probe(self.sftp.fs_info(self.dest_real.clone())).await {
+            if let Some(Ok(Some(s))) = self.probe(self.dst.fs_info(self.dest_real.clone())).await {
                 let free = s.blocks_avail.saturating_mul(s.fragment_size);
                 if free < total {
                     let mb = |b: u64| b.div_ceil(1024 * 1024);
@@ -1213,7 +1314,7 @@ impl Job<'_> {
                 owner: self.owner(a),
             },
             RawKind::Link => {
-                let target = match self.ask(self.sftp.read_link(src.clone())).await {
+                let target = match self.ask(self.src.read_link(src.clone())).await {
                     None => return Err(Step::Cancelled),
                     Some(Ok(t)) => t,
                     Some(Err(e)) => return Err(self.remote_problem(format!("não foi possível ler o link: {e}")).await),
@@ -1295,7 +1396,7 @@ impl Job<'_> {
                 self.note_skipped(&dshown, R_TOO_DEEP);
                 continue;
             }
-            let listing = match self.ask(self.sftp.read_dir(dir.clone())).await? {
+            let listing = match self.ask(self.src.read_dir(dir.clone())).await? {
                 Ok(l) => l,
                 Err(e) => {
                     let step = self.remote_problem(format!("não foi possível listar: {e}")).await;
@@ -1321,7 +1422,7 @@ impl Job<'_> {
                 let src = join_remote(&dir, &name);
                 if meta.permissions.is_none() {
                     // Listagem sem o tipo: confirma com lstat.
-                    match self.ask(self.sftp.symlink_metadata(src.clone())).await? {
+                    match self.ask(self.src.symlink_metadata(src.clone())).await? {
                         Ok(m) => meta = m,
                         Err(e) => {
                             let step = self.remote_problem(format!("não foi possível ler: {e}")).await;
@@ -1361,8 +1462,10 @@ impl Job<'_> {
     /// destino com esse nome (falhas internas ja anotadas); `Ok(None)`: nao
     /// foi colocado (anotado).
     async fn copy_plan(&mut self, item: &PasteItem, plan: &ItemPlan, prog: &mut Prog) -> Result<Option<String>, Step> {
-        // Copiar para a propria pasta: nome automatico "(cópia)".
+        // Copiar para a propria pasta: nome automatico "(cópia)". Entre
+        // servidores nunca (caminhos iguais sao pastas diferentes).
         let auto = self.op == PasteOp::Copy
+            && !self.cross
             && self.parent_real(&item.src).await.as_deref() == Some(self.dest_real.as_str());
         let mut top_name = item.name.clone();
         // Pastas criadas neste item (para ajustar permissoes/datas no fim).
@@ -1476,9 +1579,9 @@ impl Job<'_> {
         }
         // Permissoes e datas das pastas criadas, filhas antes das maes (uma
         // pasta 0555 bloquearia as gravacoes; gravar filhos muda o mtime).
-        if self.report.fatal.as_deref() != Some(F_CONNECTION) {
+        if !self.dest_lost() {
             for (path, mode, atime, mtime, owner) in created.iter().rev() {
-                let _ = self.probe(self.sftp.set_metadata(path.clone(), copy_attrs(*mode, *atime, *mtime, *owner))).await;
+                let _ = self.probe(self.dst.set_metadata(path.clone(), copy_attrs(*mode, *atime, *mtime, *owner))).await;
             }
         }
         result?;
@@ -1499,12 +1602,12 @@ impl Job<'_> {
             } else {
                 (target.to_string(), own_name.clone())
             };
-            match self.ask(self.sftp.create_dir(path.clone())).await {
+            match self.ask(self.dst.create_dir(path.clone())).await {
                 None => return Err(Step::Cancelled),
                 Some(Ok(())) => {
                     let mut a = FileAttributes::empty();
                     a.permissions = Some(provisional_dir_mode(mode));
-                    let _ = self.probe(self.sftp.set_metadata(path.clone(), a)).await;
+                    let _ = self.probe(self.dst.set_metadata(path.clone(), a)).await;
                     return Ok((path, nm, true));
                 }
                 Some(Err(e)) => match self.lstat(&path).await? {
@@ -1541,7 +1644,7 @@ impl Job<'_> {
     ) -> Result<String, Step> {
         let dir = parent_of(target);
         let fname = target.rsplit('/').next().unwrap_or(top).to_string();
-        let mut src = match self.ask(self.sftp.open(e.src.clone())).await {
+        let mut src = match self.ask(self.src.open(e.src.clone())).await {
             None => return Err(Step::Cancelled),
             Some(Ok(f)) => f,
             Some(Err(err)) if code_of(&err) == Code::PermissionDenied => return Err(Step::Failed(R_NO_READ.into())),
@@ -1561,7 +1664,7 @@ impl Job<'_> {
         for _ in 0..3 {
             tmp = join_remote(&dir, &side_name(&fname, TEMP_SUFFIX));
             let flags = OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::EXCLUDE;
-            match self.ask(self.sftp.open_with_flags_and_attributes(tmp.clone(), flags, create.clone())).await {
+            match self.ask(self.dst.open_with_flags_and_attributes(tmp.clone(), flags, create.clone())).await {
                 None => return Err(Step::Cancelled),
                 Some(Ok(f)) => {
                     out = Some(f);
@@ -1598,6 +1701,14 @@ impl Job<'_> {
             got += n as u64;
             self.progress(PastePhase::Copying, p.index, p.count, &e.shown, p.done + got, p.total, false);
         };
+        // Fecha a origem de verdade (CLOSE com resposta): o drop so manda o
+        // pedido sem esperar e o russh-sftp nunca desconta esse handle; com
+        // milhares de arquivos o servidor pararia de abrir ("handle limit
+        // reached"). Numa falha ou cancelamento fica so o drop (a conexao
+        // pode ter caido, e o CLOSE esperaria o prazo).
+        if failure.is_none() {
+            let _ = unless_cancelled(&mut self.cancel, tokio::time::timeout(PROBE_TIMEOUT, src.shutdown())).await;
+        }
         drop(src);
         if let Some(step) = failure {
             drop(out);
@@ -1622,7 +1733,7 @@ impl Job<'_> {
             let mut chosen = None;
             for k in 1..=MAX_COPY_NAMES {
                 let n = copy_name(top, false, k);
-                match self.sftp.rename(tmp.clone(), join_remote(&dir, &n)).await {
+                match self.dst.rename(tmp.clone(), join_remote(&dir, &n)).await {
                     Ok(()) => {
                         chosen = Some(n);
                         break;
@@ -1649,7 +1760,7 @@ impl Job<'_> {
                 }
             }
         } else {
-            match self.sftp.rename(tmp.clone(), target.to_string()).await {
+            match self.dst.rename(tmp.clone(), target.to_string()).await {
                 Ok(()) => fname,
                 Err(err) => match self.lstat(target).await {
                     Ok(Some(_)) if !replace => {
@@ -1705,7 +1816,7 @@ impl Job<'_> {
 
     /// Apaga um temporario deixado por uma falha (prazo curto, melhor esforco).
     async fn discard(&self, tmp: &str) {
-        let _ = self.probe(self.sftp.remove_file(tmp.to_string())).await;
+        let _ = self.probe(self.dst.remove_file(tmp.to_string())).await;
     }
 
     /// Ordem do SYMLINK neste servidor (sonda uma vez por sessao, dentro da
@@ -1718,15 +1829,15 @@ impl Job<'_> {
         let b = format!("{a}-alvo");
         // OpenSSH: cria o link em `a` (apontando para `b`); servidor do
         // draft: cria em `b`.
-        let _ = self.probe(self.sftp.symlink(b.clone(), a.clone())).await;
+        let _ = self.probe(self.dst.symlink(b.clone(), a.clone())).await;
         let is_link = |r: Option<Result<FileAttributes, SftpError>>| {
             matches!(r, Some(Ok(m)) if kind_of(&m) == RawKind::Link)
         };
-        let order = if is_link(self.probe(self.sftp.symlink_metadata(a.clone())).await) {
-            let _ = self.probe(self.sftp.remove_file(a)).await;
+        let order = if is_link(self.probe(self.dst.symlink_metadata(a.clone())).await) {
+            let _ = self.probe(self.dst.remove_file(a)).await;
             SymlinkArgs::TargetFirst
-        } else if is_link(self.probe(self.sftp.symlink_metadata(b.clone())).await) {
-            let _ = self.probe(self.sftp.remove_file(b)).await;
+        } else if is_link(self.probe(self.dst.symlink_metadata(b.clone())).await) {
+            let _ = self.probe(self.dst.remove_file(b)).await;
             SymlinkArgs::LinkFirst
         } else {
             // Sem link nenhum: nao guarda (pode ter sido uma falha passageira).
@@ -1738,8 +1849,8 @@ impl Job<'_> {
 
     async fn make_symlink(&mut self, order: SymlinkArgs, link: &str, target: &str) -> Option<Result<(), SftpError>> {
         match order {
-            SymlinkArgs::TargetFirst => self.ask(self.sftp.symlink(target.to_string(), link.to_string())).await,
-            SymlinkArgs::LinkFirst => self.ask(self.sftp.symlink(link.to_string(), target.to_string())).await,
+            SymlinkArgs::TargetFirst => self.ask(self.dst.symlink(target.to_string(), link.to_string())).await,
+            SymlinkArgs::LinkFirst => self.ask(self.dst.symlink(link.to_string(), target.to_string())).await,
             SymlinkArgs::NoLinks => Some(Ok(())),
         }
     }
@@ -1815,8 +1926,8 @@ impl Job<'_> {
             }
             let is_top = e.sub.is_empty();
             let r = match e.kind {
-                Kind::Dir { .. } => self.probe(self.sftp.remove_dir(e.src.clone())).await,
-                _ => self.probe(self.sftp.remove_file(e.src.clone())).await,
+                Kind::Dir { .. } => self.probe(self.src.remove_dir(e.src.clone())).await,
+                _ => self.probe(self.src.remove_file(e.src.clone())).await,
             };
             match r {
                 Some(Ok(())) => top_gone |= is_top,
@@ -1863,6 +1974,102 @@ struct Prog {
 mod tests {
     use super::*;
 
+    /// Servidor SFTP falso que so responde lstat/stat (NoSuchFile fora do
+    /// mapa), para separar o que existe em cada lado da copia.
+    struct StatServer(HashMap<String, FileAttributes>);
+
+    impl russh_sftp::server::Handler for StatServer {
+        type Error = StatusCode;
+
+        fn unimplemented(&self) -> StatusCode {
+            StatusCode::OpUnsupported
+        }
+
+        fn lstat(
+            &mut self,
+            id: u32,
+            path: String,
+        ) -> impl std::future::Future<Output = Result<russh_sftp::protocol::Attrs, StatusCode>> + Send {
+            let a = self.0.get(&path).cloned();
+            async move { a.map(|attrs| russh_sftp::protocol::Attrs { id, attrs }).ok_or(StatusCode::NoSuchFile) }
+        }
+
+        fn stat(
+            &mut self,
+            id: u32,
+            path: String,
+        ) -> impl std::future::Future<Output = Result<russh_sftp::protocol::Attrs, StatusCode>> + Send {
+            let a = self.0.get(&path).cloned();
+            async move { a.map(|attrs| russh_sftp::protocol::Attrs { id, attrs }).ok_or(StatusCode::NoSuchFile) }
+        }
+    }
+
+    async fn stat_session(nodes: &[(&str, u32)]) -> SftpSession {
+        let map = nodes
+            .iter()
+            .map(|(p, mode)| {
+                (
+                    p.to_string(),
+                    FileAttributes {
+                        permissions: Some(*mode),
+                        size: Some(1),
+                        ..FileAttributes::empty()
+                    },
+                )
+            })
+            .collect();
+        let (client, server) = tokio::io::duplex(1 << 16);
+        russh_sftp::server::run(server, StatServer(map)).await;
+        crate::sftp::start_session(client).await.expect("sessao falsa")
+    }
+
+    /// Entre servidores, a origem de um RENAME que falhou (o temporario ja
+    /// gravado no destino) e conferida no destino, nao na sessao de origem,
+    /// onde ela nunca existe: senao toda falha viraria "nao existe mais na
+    /// origem".
+    #[test]
+    fn rename_failed_probes_rename_source_on_dst() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            // Origem: so /srv/a.txt. Destino: /dst e o temporario ja gravado
+            // la; /dst/a.txt virou backup (destino livre).
+            let src = stat_session(&[("/srv", 0o040755), ("/srv/a.txt", 0o100644)]).await;
+            let dst = stat_session(&[("/dst", 0o040755), ("/dst/.a.txt.deadbeef.sagu-part", 0o100644)]).await;
+            let links = LinkOrder::default();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_keep, cancel) = watch::channel(false);
+            let mut report = PasteReport::default();
+            let mut job = Job {
+                src: &src,
+                dst: &dst,
+                cross: true,
+                links: &links,
+                am_root: false,
+                id: 1,
+                op: PasteOp::Copy,
+                dest_dir: "/dst".into(),
+                dest_real: "/dst".into(),
+                cancel,
+                tx: &tx,
+                report: &mut report,
+                last_event: None,
+                bytes: 0,
+                write_fails: 0,
+                parents: HashMap::new(),
+            };
+            let e = SftpError::Status(russh_sftp::protocol::Status {
+                id: 7,
+                status_code: StatusCode::Failure,
+                error_message: "Failure".into(),
+                language_tag: "en-US".into(),
+            });
+            let fail = job
+                .rename_failed(&e, "/dst/.a.txt.deadbeef.sagu-part", "/dst/a.txt", false, Some(false))
+                .await;
+            assert_eq!(fail, RenameFail::CrossDevice, "temporario presente no destino");
+        });
+    }
+
     #[test]
     fn copy_names() {
         assert_eq!(copy_name("a.txt", false, 1), "a (cópia).txt");
@@ -1893,5 +2100,241 @@ mod tests {
         assert_eq!(classify_rename(Code::Failure, t, f, t, true), RenameFail::CrossDevice);
         assert_eq!(classify_rename(Code::Failure, None, f, t, false), RenameFail::Other);
         assert_eq!(classify_rename(Code::BadMessage, t, f, t, true), RenameFail::IntoItself);
+    }
+
+    /// Entre servidores (`cross`): o mesmo caminho dos dois lados nao e "a
+    /// mesma pasta" (os nomes conflitam normalmente) e um destino com o
+    /// prefixo da pasta de origem nao e "dentro dela mesma". No mesmo
+    /// servidor as duas regras continuam valendo, e nomes invalidos sao
+    /// barrados nos dois casos.
+    #[test]
+    fn prepare_between_servers_ignores_path_coincidences() {
+        let srcs = [
+            Source {
+                path: "/home/u/a.txt",
+                name: "a.txt",
+                is_dir: false,
+            },
+            Source {
+                path: "/home/u/pasta",
+                name: "pasta",
+                is_dir: true,
+            },
+        ];
+        let dest: HashMap<&str, bool> = [("a.txt", false), ("pasta", false)].into();
+        // Mesmo caminho dos dois lados: conflita por nome (pasta sobre
+        // arquivo conta como tipos diferentes).
+        let p = prepare(PasteOp::Copy, "/home/u", "/home/u/", &srcs, &dest, true);
+        assert_eq!(p.items.len(), 2, "{p:?}");
+        assert_eq!(p.conflicts, [0, 1]);
+        assert_eq!(p.mismatched, 1);
+        assert!(p.invalid.is_empty(), "{p:?}");
+        assert!(p.items.iter().all(|i| !i.replace));
+        let p = prepare(PasteOp::Copy, "/home/u", "/home/u/", &srcs, &dest, false);
+        assert_eq!(p.items.len(), 2, "{p:?}");
+        assert!(p.conflicts.is_empty() && p.invalid.is_empty(), "{p:?}");
+        // Destino com o caminho "dentro" da pasta de origem.
+        let none = HashMap::new();
+        let p = prepare(PasteOp::Copy, "/home/u", "/home/u/pasta/sub", &srcs, &none, true);
+        assert_eq!(p.items.len(), 2, "{p:?}");
+        assert!(p.invalid.is_empty() && p.conflicts.is_empty(), "{p:?}");
+        let p = prepare(PasteOp::Copy, "/home/u", "/home/u/pasta/sub", &srcs, &none, false);
+        assert_eq!(p.items.len(), 1, "{p:?}");
+        assert_eq!(p.invalid, [("pasta".to_string(), R_INTO_ITSELF.to_string())]);
+        // Nome invalido: barrado tambem entre servidores.
+        let bad = [Source {
+            path: "/x/a/b",
+            name: "a/b",
+            is_dir: false,
+        }];
+        let p = prepare(PasteOp::Copy, "/x", "/y", &bad, &none, true);
+        assert!(p.items.is_empty(), "{p:?}");
+        assert_eq!(p.invalid.len(), 1);
+    }
+
+    // --- Ponta a ponta contra um sshd real (ignorados) ---------------------
+    //
+    // Mesmas variaveis dos outros e2e (SAGU_E2E_PORT, SAGU_E2E_USER,
+    // SAGU_E2E_KEY). Duas sessoes independentes no mesmo sshd fazem o papel
+    // de dois paineis (cada uma na sua thread, como no app).
+    // Rodar com: cargo test e2e_copy_between -- --ignored --test-threads=1
+
+    use crate::download::tests::{close, e2e_host, remote_sh, sftp_session};
+    use crate::sftp::{SftpHandle, SftpToUi};
+    use crate::vault::Host;
+    use std::time::{Duration, Instant};
+
+    /// Apaga a arvore remota no fim (inclusive se o teste falhar).
+    struct RemoteCleanup {
+        host: Host,
+        dir: String,
+    }
+
+    impl Drop for RemoteCleanup {
+        fn drop(&mut self) {
+            if let Err(e) = remote_sh(&self.host, &format!("rm -rf '{}'", self.dir)) {
+                eprintln!("limpeza remota falhou: {e}");
+            }
+        }
+    }
+
+    /// Espera o `Finished` do lote `id` em `h` por ate `secs`, passando os
+    /// eventos de andamento a `on_event`.
+    fn wait_finished(h: &SftpHandle, id: u64, secs: u64, mut on_event: impl FnMut(&PasteEvent)) -> PasteReport {
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(secs) {
+            match h.from_sftp.recv_timeout(Duration::from_millis(200)) {
+                Ok(SftpToUi::Paste(PasteEvent::Finished(r))) => {
+                    assert_eq!(r.id, id);
+                    return *r;
+                }
+                Ok(SftpToUi::Paste(ev)) => on_event(&ev),
+                Ok(SftpToUi::Error(e)) => panic!("erro da sessao de destino: {e}"),
+                Ok(SftpToUi::Closed) => panic!("a sessao de destino fechou no meio da cópia"),
+                _ => {}
+            }
+        }
+        panic!("tempo esgotado esperando o fim da cópia");
+    }
+
+    fn item(dir: &str, name: &str) -> PasteItem {
+        PasteItem {
+            src: format!("{dir}/{name}"),
+            name: name.into(),
+            replace: false,
+        }
+    }
+
+    /// Copia de uma sessao para outra: arquivo (conteudo, modo e data),
+    /// pastas aninhadas (modo), links copiados como links (inclusive
+    /// quebrado), fifo pulado, nada movido nem renomeado, sem temporarios; o
+    /// `op` pedido e forcado a `Copy`.
+    #[test]
+    #[ignore]
+    fn e2e_copy_between_sessions() {
+        let host = e2e_host();
+        let r = format!("/tmp/sagu-e2e-entre-{}", std::process::id());
+        let _cleanup = RemoteCleanup {
+            host: host.clone(),
+            dir: r.clone(),
+        };
+        let script = format!(
+            r#"set -e; R='{r}'; rm -rf "$R"; mkdir -p "$R/src/pasta/sub1/sub2" "$R/src/pasta/vazia" "$R/dst"
+printf 'conteudo a' > "$R/src/a.txt"; chmod 640 "$R/src/a.txt"; touch -d '2020-01-02 03:04:05 UTC' "$R/src/a.txt"
+printf x > "$R/src/pasta/sub1/x.txt"; printf y > "$R/src/pasta/sub1/sub2/y.txt"; chmod 750 "$R/src/pasta/sub1"
+ln -s ../a.txt "$R/src/pasta/link-arq"; ln -s sub1 "$R/src/pasta/link-pasta"; ln -s /nao/existe "$R/src/pasta/quebrado"
+mkfifo "$R/src/pasta/fifo"
+"#
+        );
+        remote_sh(&host, &script).expect("preparo da arvore remota");
+        let a = sftp_session(&host);
+        let b = sftp_session(&host);
+        let src = a.session_ref().expect("sessao de origem sem sessao emprestavel");
+        let src_dir = format!("{r}/src");
+        let req = PasteRequest {
+            // Forcado a Copy: a origem tem de ficar.
+            op: PasteOp::Move,
+            dest_dir: format!("{r}/dst"),
+            items: vec![item(&src_dir, "a.txt"), item(&src_dir, "pasta")],
+        };
+        let _cancel = b.copy_from(1, src, req).expect("sessao de destino encerrada");
+        let mut progress = 0;
+        let rep = wait_finished(&b, 1, 60, |ev| {
+            if matches!(ev, PasteEvent::Progress { phase: PastePhase::Copying, count: 3, .. }) {
+                progress += 1;
+            }
+        });
+        assert_eq!(rep.op, Some(PasteOp::Copy));
+        assert!(rep.fatal.is_none() && !rep.cancelled, "{rep:?}");
+        assert!(rep.failed.is_empty(), "{:?}", rep.failed);
+        assert_eq!((rep.count, rep.done, rep.files, rep.saved), (2, 2, 3, 3), "{rep:?}");
+        assert_eq!(rep.last, "pasta");
+        assert_eq!(rep.skipped, [("pasta/fifo".to_string(), R_SPECIAL.to_string())]);
+        assert!(rep.renamed.is_empty() && rep.moved.is_empty(), "{rep:?}");
+        assert_eq!(rep.refresh, [format!("{r}/dst")]);
+        assert!(progress > 0, "nenhum andamento da cópia");
+        // Destino fiel; origem intacta; nenhum temporario.
+        let check = format!(
+            r#"set -e; R='{r}'; S="$R/src"; D="$R/dst"
+cmp "$S/a.txt" "$D/a.txt"; [ "$(stat -c %a "$D/a.txt")" = 640 ]; [ "$(stat -c %Y "$D/a.txt")" = 1577934245 ]
+cmp "$S/pasta/sub1/x.txt" "$D/pasta/sub1/x.txt"; cmp "$S/pasta/sub1/sub2/y.txt" "$D/pasta/sub1/sub2/y.txt"
+[ "$(stat -c %a "$D/pasta/sub1")" = 750 ]; [ -d "$D/pasta/vazia" ]
+[ -L "$D/pasta/link-arq" ]; [ "$(readlink "$D/pasta/link-arq")" = ../a.txt ]
+[ -L "$D/pasta/link-pasta" ]; [ "$(readlink "$D/pasta/link-pasta")" = sub1 ]
+[ -L "$D/pasta/quebrado" ]; [ "$(readlink "$D/pasta/quebrado")" = /nao/existe ]
+! [ -e "$D/pasta/fifo" ]; [ -p "$S/pasta/fifo" ]; [ -f "$S/a.txt" ]; [ -f "$S/pasta/sub1/sub2/y.txt" ]
+[ -z "$(find "$D" -name '*{TEMP_SUFFIX}' -o -name '*{LINK_PROBE_SUFFIX}*')" ]
+"#
+        );
+        remote_sh(&host, &check).expect("conferencia do destino");
+        close(a);
+        close(b);
+    }
+
+    /// A sessao de origem e encerrada no meio de um arquivo de 64 MiB: o
+    /// lote para com o fatal "de origem" (a leitura em voo so falha pelo
+    /// prazo do russh-sftp, 10 s; a sonda da sessao emprestada falha na
+    /// hora), o temporario e apagado e a sessao de destino segue viva.
+    #[test]
+    #[ignore]
+    fn e2e_copy_between_sessions_source_lost() {
+        let host = e2e_host();
+        let r = format!("/tmp/sagu-e2e-entre-queda-{}", std::process::id());
+        let _cleanup = RemoteCleanup {
+            host: host.clone(),
+            dir: r.clone(),
+        };
+        let script = format!(
+            r#"set -e; R='{r}'; rm -rf "$R"; mkdir -p "$R/src" "$R/dst"; head -c 67108864 /dev/urandom > "$R/src/grande.bin""#
+        );
+        remote_sh(&host, &script).expect("preparo da arvore remota");
+        let a = sftp_session(&host);
+        let b = sftp_session(&host);
+        let src = a.session_ref().expect("sessao de origem sem sessao emprestavel");
+        let req = PasteRequest {
+            op: PasteOp::Copy,
+            dest_dir: format!("{r}/dst"),
+            items: vec![item(&format!("{r}/src"), "grande.bin")],
+        };
+        let _cancel = b.copy_from(2, src, req).expect("sessao de destino encerrada");
+        let t0 = Instant::now();
+        let mut dropped_at = None;
+        let rep = wait_finished(&b, 2, 90, |ev| {
+            if let PasteEvent::Progress { done, .. } = ev {
+                if *done > 0 && dropped_at.is_none() {
+                    a.disconnect();
+                    dropped_at = Some(Instant::now());
+                }
+            }
+        });
+        let dropped_at = dropped_at.expect("a cópia terminou antes do primeiro bloco");
+        assert_eq!(rep.fatal.as_deref(), Some(F_SRC_CONNECTION), "{rep:?}");
+        assert!(rep.fatal.as_deref().unwrap().contains("origem"));
+        assert_eq!((rep.done, rep.saved, rep.files), (0, 0, 1), "{rep:?}");
+        assert!(!rep.cancelled);
+        // Nem na hora (a leitura em voo espera o prazo) nem para sempre.
+        let took = dropped_at.elapsed();
+        assert!(took < Duration::from_secs(40), "fatal demorou {took:?}");
+        eprintln!("fatal {:?} depois da queda ({:?} no total)", took, t0.elapsed());
+        let check = format!(r#"set -e; R='{r}'; ! [ -e "$R/dst/grande.bin" ]; [ -z "$(ls -A "$R/dst")" ]"#);
+        remote_sh(&host, &check).expect("destino limpo");
+        // A sessao de origem ja fechou; a de destino continua respondendo.
+        let t1 = Instant::now();
+        loop {
+            assert!(t1.elapsed() < Duration::from_secs(10), "a origem nao fechou");
+            if let Ok(SftpToUi::Closed) = a.from_sftp.recv_timeout(Duration::from_millis(200)) {
+                break;
+            }
+        }
+        b.list_dir(format!("{r}/dst"));
+        let t2 = Instant::now();
+        loop {
+            assert!(t2.elapsed() < Duration::from_secs(10), "o destino parou de responder");
+            if let Ok(SftpToUi::Listing { entries, .. }) = b.from_sftp.recv_timeout(Duration::from_millis(200)) {
+                assert!(entries.is_empty());
+                break;
+            }
+        }
+        close(b);
     }
 }

@@ -13,6 +13,15 @@
 //! O que pode travar o sftp-server (seguir links na listagem, o caminho
 //! digitado na barra e as leituras do visualizador) vai por um canal SFTP
 //! auxiliar e descartavel ([`AuxSftp`]), nunca pelo canal da navegacao.
+//!
+//! Copia entre dois paineis (arrastar de um para o outro): a sessao do
+//! painel de origem e emprestada ([`SessionRef`]) ao painel de destino, e a
+//! tarefa roda na thread deste ([`UiToSftp::CopyFrom`] -> `paste::run_from`),
+//! lendo pela sessao emprestada e gravando pela propria. Os pedidos a sessao
+//! emprestada seguem pelo canal dela (as tarefas de leitura/escrita do
+//! russh-sftp vivem na thread de origem); quando essa thread acaba, cada
+//! pedido novo falha na hora ("session closed") e um em voo falha pelo prazo
+//! do crate (10 s).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -200,19 +209,83 @@ pub enum UiToSftp {
         req: PasteRequest,
         cancel: watch::Receiver<bool>,
     },
+    /// Copia itens de outra sessao (`src`, de outro painel/servidor) para
+    /// `req.dest_dir` nesta; responde `SftpToUi::Paste` com o mesmo `id`.
+    CopyFrom {
+        id: u64,
+        src: SessionRef,
+        req: PasteRequest,
+        cancel: watch::Receiver<bool>,
+    },
     /// Encerra a sessao.
     Disconnect,
+}
+
+/// Sessao SFTP de um painel, emprestada a outro painel para a copia entre
+/// servidores (ver `paste::run_from`). A UI so a repassa; nunca a usa.
+#[derive(Clone)]
+pub struct SessionRef(Arc<SftpSession>);
+
+impl SessionRef {
+    /// A sessao em si (so a tarefa de copia a usa).
+    pub(crate) fn session(&self) -> Arc<SftpSession> {
+        Arc::clone(&self.0)
+    }
+
+    /// Sessao de mentira para os testes de UI: um `SftpSession` de verdade
+    /// sobre um `duplex`, com um servidor minimo que so responde ao INIT
+    /// (VERSION 3, sem extensoes). O objeto e so repassado pelos canais; as
+    /// tarefas dele morrem com o runtime descartavel, entao qualquer pedido
+    /// acidental falha na hora ("session closed") em vez de travar.
+    #[cfg(test)]
+    pub(crate) fn fake() -> Self {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime da sessao falsa");
+        let sftp = rt.block_on(async {
+            let (client, mut server) = tokio::io::duplex(4096);
+            tokio::spawn(async move {
+                // INIT (9 bytes): tamanho, tipo 1, versao 3.
+                let mut init = [0u8; 9];
+                if server.read_exact(&mut init).await.is_err() {
+                    return;
+                }
+                // VERSION: tamanho 5, tipo 2, versao 3.
+                let _ = server.write_all(&[0, 0, 0, 5, 2, 0, 0, 0, 3]).await;
+                // Segura o lado do servidor ate o runtime cair.
+                std::future::pending::<()>().await;
+            });
+            SftpSession::new(client).await.expect("sessao falsa")
+        });
+        SessionRef(Arc::new(sftp))
+    }
+}
+
+/// Vaga da sessao emprestavel de um painel: preenchida pela thread da sessao
+/// ao conectar e esvaziada quando ela acaba.
+type SharedSession = Arc<std::sync::Mutex<Option<SessionRef>>>;
+
+/// Esvazia a vaga ao cair (fim normal, erro ou panico de `run_session`).
+struct SharedGuard(SharedSession);
+
+impl Drop for SharedGuard {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 /// Lado da UI: enviar pedidos e receber eventos da sessao SFTP.
 pub struct SftpHandle {
     to_sftp: UnboundedSender<UiToSftp>,
     pub from_sftp: std::sync::mpsc::Receiver<SftpToUi>,
+    /// Sessao deste painel para emprestar a outro (ver `session_ref`).
+    shared: SharedSession,
 }
 
 impl SftpHandle {
     /// Handle ligado a canais de teste: devolve tambem o lado "sessao" (o que
-    /// a UI mandou e por onde injetar eventos).
+    /// a UI mandou e por onde injetar eventos). Sem sessao emprestavel.
     #[cfg(test)]
     pub(crate) fn test_pair() -> (
         Self,
@@ -224,8 +297,45 @@ impl SftpHandle {
         let handle = SftpHandle {
             to_sftp: to_tx,
             from_sftp: from_rx,
+            shared: Arc::new(std::sync::Mutex::new(None)),
         };
         (handle, to_rx, from_tx)
+    }
+
+    /// Como `test_pair`, mas com `src` ja na vaga (`session_ref` a devolve).
+    #[cfg(test)]
+    pub(crate) fn test_pair_with_session(
+        src: SessionRef,
+    ) -> (
+        Self,
+        UnboundedReceiver<UiToSftp>,
+        std::sync::mpsc::Sender<SftpToUi>,
+    ) {
+        let (handle, to_rx, from_tx) = Self::test_pair();
+        *handle.shared.lock().unwrap() = Some(src);
+        (handle, to_rx, from_tx)
+    }
+
+    /// Sessao deste painel para emprestar a outro painel (copia entre
+    /// servidores); `None` antes de conectar ou depois de encerrar.
+    pub fn session_ref(&self) -> Option<SessionRef> {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Copia itens lidos de outra sessao (`src`) para `req.dest_dir` nesta
+    /// sessao; responde `SftpToUi::Paste` com o mesmo `id`. `None` se a
+    /// sessao ja terminou. Soltar o `Cancel` devolvido tambem cancela.
+    pub fn copy_from(&self, id: u64, src: SessionRef, req: PasteRequest) -> Option<download::Cancel> {
+        let (cancel, rx) = download::cancel_pair();
+        self.to_sftp
+            .send(UiToSftp::CopyFrom {
+                id,
+                src,
+                req,
+                cancel: rx,
+            })
+            .ok()
+            .map(|_| cancel)
     }
 
     pub fn list_dir(&self, path: impl Into<String>) {
@@ -355,6 +465,8 @@ where
 {
     let (to_sftp_tx, to_sftp_rx) = tokio::sync::mpsc::unbounded_channel::<UiToSftp>();
     let (from_sftp_tx, from_sftp_rx) = std::sync::mpsc::channel::<SftpToUi>();
+    let shared: SharedSession = Arc::new(std::sync::Mutex::new(None));
+    let slot = Arc::clone(&shared);
 
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -371,7 +483,7 @@ where
 
         run_to_end(
             &rt,
-            run_session(host, detect_os, to_sftp_rx, &from_sftp_tx, &repaint),
+            run_session(host, detect_os, to_sftp_rx, &from_sftp_tx, &repaint, slot),
             &from_sftp_tx,
             &repaint,
         );
@@ -380,6 +492,7 @@ where
     SftpHandle {
         to_sftp: to_sftp_tx,
         from_sftp: from_sftp_rx,
+        shared,
     }
 }
 
@@ -413,6 +526,7 @@ async fn run_session<F>(
     mut to_sftp_rx: UnboundedReceiver<UiToSftp>,
     from_sftp: &std::sync::mpsc::Sender<SftpToUi>,
     repaint: &F,
+    shared: SharedSession,
 ) -> anyhow::Result<()>
 where
     F: Fn() + Send + 'static,
@@ -436,6 +550,10 @@ where
             .await
             .map_err(|e| anyhow::anyhow!("não foi possível iniciar o SFTP: {e}"))?,
     );
+    // Sessao emprestavel a outro painel (copia entre servidores): na vaga
+    // antes do `Connected`; o guard a esvazia quando esta funcao acaba.
+    *shared.lock().unwrap_or_else(|e| e.into_inner()) = Some(SessionRef(Arc::clone(&sftp)));
+    let _shared_guard = SharedGuard(shared);
     // Canal extra (aberto no primeiro uso) para o que pode travar o
     // sftp-server: stat de links, caminho digitado e visualizador.
     let aux = AuxSftp::new(aux_opener(&session));
@@ -535,6 +653,12 @@ where
             UiToSftp::Paste { id, req, cancel } => {
                 let (sftp, links, tx) = (Arc::clone(&sftp), Arc::clone(&link_order), pa_tx.clone());
                 pastes.spawn(paste::run(sftp, links, am_root, id, req, cancel, tx));
+                continue;
+            }
+            UiToSftp::CopyFrom { id, src, req, cancel } => {
+                // Le pela sessao emprestada (de outro painel) e grava por esta.
+                let (dst, links, tx) = (Arc::clone(&sftp), Arc::clone(&link_order), pa_tx.clone());
+                pastes.spawn(paste::run_from(src.session(), dst, links, id, req, cancel, tx));
                 continue;
             }
             UiToSftp::Disconnect => break,
@@ -712,6 +836,7 @@ where
                 UiToSftp::Download { .. }
                 | UiToSftp::ReadFile { .. }
                 | UiToSftp::Paste { .. }
+                | UiToSftp::CopyFrom { .. }
                 | UiToSftp::Disconnect => {}
             }
         };
@@ -2517,6 +2642,28 @@ mod tests {
         run_to_end(&runtime(), async { Err(anyhow::anyhow!("recusado")) }, &tx, &|| {});
         let got: Vec<SftpToUi> = rx.try_iter().collect();
         assert!(matches!(got.as_slice(), [SftpToUi::Error(e), SftpToUi::Closed] if e == "recusado"));
+    }
+
+    /// A sessao falsa dos testes de UI: e um `SftpSession` de verdade que
+    /// passa pelos canais; qualquer pedido nela falha na hora (as tarefas
+    /// morreram com o runtime descartavel), nunca trava. `test_pair` nao tem
+    /// sessao emprestavel; `test_pair_with_session` tem.
+    #[test]
+    fn fake_session_ref_is_inert_and_injectable() {
+        let (h, _rx, _tx) = SftpHandle::test_pair();
+        assert!(h.session_ref().is_none());
+        let fake = SessionRef::fake();
+        let (h, _rx, _tx) = SftpHandle::test_pair_with_session(fake.clone());
+        let got = h.session_ref().expect("sessao injetada");
+        assert!(Arc::ptr_eq(&got.session(), &fake.session()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        let r = rt.block_on(fake.session().canonicalize("."));
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        assert!(r.is_err(), "um pedido na sessao falsa respondeu");
     }
 
     // --- Ponta a ponta contra um sshd real (ignorados) ---------------------

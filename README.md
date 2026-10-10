@@ -145,7 +145,15 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
   cópia com "(cópia)" no nome. Nada é substituído sem perguntar, e mover para outro disco
   do servidor pede confirmação antes de copiar e apagar os originais. A cópia passa pelo
   SFTP, sem executar comandos no servidor; links simbólicos são copiados como links, com
-  permissões e datas mantidas. Colar num painel de outro servidor ainda não é possível.
+  permissões e datas mantidas. Para copiar entre dois painéis SFTP (do mesmo servidor ou
+  de servidores diferentes), basta arrastar a seleção de um para o outro.
+- **Copie entre servidores** arrastando: com dois painéis SFTP abertos, arraste a seleção
+  de um deles e solte sobre o outro; os itens são copiados para a pasta aberta ali. A cópia
+  passa pelo SaguTerm (os dados atravessam este computador, sem ficar no disco) e nunca
+  pelo shell dos servidores, com as mesmas garantias do colar: nada é substituído sem
+  perguntar, cada arquivo é gravado num temporário e renomeado no fim, permissões e datas
+  são mantidas e links simbólicos são copiados como links. Soltar num painel da mesma
+  conexão também copia para lá.
 - **Baixe arquivos e pastas** para o computador: selecione os itens (`Ctrl+clique`,
   `Shift+clique` ou `Ctrl+A`), aperte `Ctrl+S` ou use o botão de download do cabeçalho
   e escolha a pasta de destino. Pastas vêm com todo o conteúdo, e o que não dá para
@@ -264,6 +272,7 @@ No topo da ajuda aparece a versão instalada.
 | SFTP | `Ctrl+clique` / `Shift+clique` / `Ctrl+A` | Marcar itens / selecionar um intervalo / selecionar tudo |
 | SFTP | `Ctrl+S` | Baixar a seleção para o computador |
 | SFTP | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copiar / recortar / colar arquivos e pastas (mesma conexão) |
+| SFTP | arrastar para outro painel SFTP | Copiar a seleção para a pasta aberta lá (inclusive outro servidor) |
 | SFTP | `Esc` | Desistir de copiar ou mover |
 | SFTP | `F2` / `Delete` / `F5` | Renomear / excluir / atualizar |
 | Visualizador | `Ctrl+F` / `F3` / `Shift+F3` | Buscar / próxima ocorrência / ocorrência anterior |
@@ -338,7 +347,8 @@ No topo da ajuda aparece a versão instalada.
 - [ ] Enviar pastas inteiras (hoje o envio por arrastar aceita só arquivos)
 - [ ] Arrastar arquivos do navegador SFTP direto para o Explorador de Arquivos
 - [ ] Renomear e excluir vários itens de uma vez no navegador SFTP
-- [ ] Copiar e mover entre servidores diferentes
+- [x] Copiar entre servidores diferentes (arraste entre dois painéis SFTP)
+- [ ] Mover entre servidores diferentes
 
 Tem uma ideia ou encontrou um problema? [Abra uma issue](https://github.com/alowelter/sagu-term/issues).
 Toda sugestão ajuda.

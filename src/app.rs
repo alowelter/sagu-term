@@ -131,6 +131,10 @@ enum SessionState {
 /// Um painel da sessao: ou uma conexao SSH ativa, ou um seletor de host
 /// (quando `picking` e verdadeiro) aguardando o usuario escolher uma conexao.
 struct Pane {
+    /// Identidade do painel (nunca se repete): o caminho na arvore muda
+    /// quando um irmao fecha, entao quem precisa reconhecer um painel depois
+    /// (o arrasto entre paineis) guarda este numero, nao o caminho.
+    id: u64,
     ssh: Option<SshHandle>,
     terminal: Option<Terminal>,
     /// Sessao SFTP e estado do navegador de arquivos (quando o painel e SFTP).
@@ -418,6 +422,20 @@ struct FsClip {
     names: std::collections::BTreeSet<String>,
 }
 
+/// Itens arrastados de um painel SFTP (carga do arrastar-e-soltar do egui):
+/// soltos sobre outro painel SFTP, sao copiados para a pasta aberta nele,
+/// mesmo de outro servidor (ver `App::handle_fs_drag`).
+struct FsDrag {
+    origin: SftpOrigin,
+    /// `Pane::id` de onde sairam (soltar nele mesmo nao faz nada). Pelo id,
+    /// nao pelo caminho: se a origem fechar durante o arrasto, o irmao que
+    /// herda o caminho dela nao pode ser tomado pela origem.
+    src_pane: u64,
+    /// Pasta de onde sairam os itens (todos sao entradas dela).
+    src_dir: String,
+    items: Vec<ClipItem>,
+}
+
 /// Pedido de copiar/recortar/colar vindo do navegador.
 enum ClipCmd {
     Copy(Vec<ClipItem>),
@@ -450,6 +468,11 @@ struct PasteUi {
     pre_moved: Vec<(String, String)>,
     pre_done: usize,
     pre_count: usize,
+    /// Copia vinda de outro servidor (arrastar entre paineis): nome da
+    /// conexao de origem e a sessao dela emprestada a esta.
+    from: Option<(String, sftp::SessionRef)>,
+    /// Lote iniciado por arrastar (as mensagens dizem "copiado", nao "colado").
+    dragged: bool,
     stage: PasteStage,
 }
 
@@ -503,6 +526,8 @@ impl PasteUi {
             pre_moved: Vec::new(),
             pre_done: 0,
             pre_count: 0,
+            from: None,
+            dragged: false,
             stage: PasteStage::done(text.to_string(), String::new(), tone),
         }
     }
@@ -623,7 +648,9 @@ enum PasteAnswer {
 impl Pane {
     /// Painel vazio que mostra a lista de hosts para escolher uma conexao.
     fn picker() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Pane {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ssh: None,
             terminal: None,
             sftp: None,
@@ -929,6 +956,9 @@ struct ExplorerOut {
     view: Option<(u64, String)>,
     /// Copiar/recortar/colar (Ctrl+C/Ctrl+X/Ctrl+V, menu ou Esc).
     clip: Option<ClipCmd>,
+    /// Arrastar comecou numa linha: os itens levados (a selecao inteira
+    /// quando a linha faz parte dela; senao so ela).
+    drag: Option<Vec<ClipItem>>,
 }
 
 impl ExplorerOut {
@@ -943,6 +973,7 @@ impl ExplorerOut {
             inner_focus: false,
             view: None,
             clip: None,
+            drag: None,
         }
     }
 }
@@ -2435,6 +2466,11 @@ impl FileExplorer {
         let mut view_req: Option<(u64, String)> = None;
         let (edit_id, _) = explorer_field_ids(&id_salt);
         let mut clip: Option<ClipCmd> = None;
+        // Arrastar comecou numa linha (itens levados), tratado pelo painel.
+        let mut drag: Option<Vec<ClipItem>> = None;
+        // As linhas podem ser arrastadas para outro painel: nunca com a pasta
+        // ainda carregando, com um dialogo aberto ou sem pasta.
+        let can_drag = !self.loading && self.dialog.is_none() && !self.cur_path.is_empty();
         // A trava do Ctrl+V solta quando o painel perde o foco.
         if !has_focus {
             self.paste_latch = None;
@@ -2953,7 +2989,7 @@ impl FileExplorer {
                         color: FOLDER_FG,
                         slash: false,
                     };
-                    let up = file_row(ui, look, "..", None, false, self.on_up && has_focus);
+                    let up = file_row(ui, look, "..", None, false, self.on_up && has_focus, false);
                     if self.on_up {
                         cursor_rect = Some(up.rect);
                     }
@@ -2989,6 +3025,17 @@ impl FileExplorer {
 
                 // Clique: (linha, Ctrl, Shift), aplicado depois do laco.
                 let mut click_sel: Option<(usize, bool, bool)> = None;
+                // O ponteiro saiu do raio de clique desde o aperto: o egui
+                // tambem "decide" que e arrasto quando o botao fica apertado
+                // parado por mais de 0,8 s, e isso nao pode virar arrasto
+                // nem mexer na selecao.
+                let max_click_dist = ui.ctx().options(|o| o.input_options.max_click_dist);
+                let pointer_moved = ui.input(|i| {
+                    i.pointer
+                        .press_origin()
+                        .zip(i.pointer.latest_pos())
+                        .is_some_and(|(a, b)| a.distance(b) > max_click_dist)
+                });
                 // Duplo clique (Enter do mouse), tratado depois do laco.
                 let mut open_idx: Option<usize> = None;
                 // "Visualizar" no menu de contexto.
@@ -3019,11 +3066,25 @@ impl FileExplorer {
                         Some(cols),
                         selected,
                         is_cursor && has_focus,
+                        can_drag,
                     );
-                    // Tipo e alvo do link: montada so com o mouse em cima.
-                    if resp.hovered() {
+                    // Tipo e alvo do link: montada so com o mouse em cima (e
+                    // nunca enquanto a linha e arrastada).
+                    if resp.hovered() && !resp.dragged() {
                         if let Some(tip) = row_tip(node) {
                             resp = resp.on_hover_text(tip);
+                        }
+                    }
+                    // Arrastar (botao esquerdo, com o ponteiro de fato
+                    // movido) leva a selecao inteira quando a linha faz parte
+                    // dela; senao so ela, que passa a ser a selecao (como um
+                    // clique).
+                    if can_drag && pointer_moved && resp.drag_started_by(egui::PointerButton::Primary) {
+                        if selected {
+                            drag = Some(self.clip_items());
+                        } else {
+                            drag = Some(vec![clip_item(node)]);
+                            click_sel = Some((idx, false, false));
                         }
                     }
                     // Mantem o cursor visivel ao navegar pelo teclado (e ao
@@ -3259,6 +3320,7 @@ impl FileExplorer {
             inner_focus,
             view: view_req,
             clip,
+            drag,
         }
     }
 
@@ -4416,11 +4478,18 @@ fn file_row(
     cols: Option<RowCols>,
     selected: bool,
     cursor: bool,
+    drag: bool,
 ) -> egui::Response {
     let RowLook { icon, color, slash } = look;
     let width = ui.available_width();
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, ROW_H), egui::Sense::click());
+    // Com `drag`, a linha tambem pode ser arrastada para outro painel; o
+    // clique (simples, duplo e direito) segue igual.
+    let sense = if drag {
+        egui::Sense::click_and_drag()
+    } else {
+        egui::Sense::click()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, ROW_H), sense);
 
     // Cursor do teclado (painel em foco) numa linha nao marcada (sempre o
     // caso da ".."): o mesmo fundo do mouse em cima, alem do contorno.
@@ -6624,7 +6693,11 @@ impl App {
                                         Tone::Error,
                                     )),
                                     PasteStage::Asking(_) | PasteStage::Offer(_) => Some((
-                                        "Colagem cancelada: a sessão foi encerrada.",
+                                        if p.dragged {
+                                            "Cópia cancelada: a sessão foi encerrada."
+                                        } else {
+                                            "Colagem cancelada: a sessão foi encerrada."
+                                        },
                                         Tone::Neutral,
                                     )),
                                     PasteStage::Done { .. } => None,
@@ -7125,21 +7198,7 @@ impl App {
         if text.is_empty() {
             return;
         }
-        let color = if accepts { ACCENT } else { TEXT_WEAK };
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("drop_overlay"),
-        ));
-        let r = rect.shrink(3.0);
-        painter.rect_filled(r, 6.0, color.gamma_multiply(0.14));
-        painter.rect_stroke(r, 6.0, egui::Stroke::new(2.0, color), egui::StrokeKind::Inside);
-        painter.text(
-            r.center(),
-            egui::Align2::CENTER_CENTER,
-            text,
-            egui::FontId::proportional(16.0),
-            color,
-        );
+        paint_drop_overlay(ctx, "drop_overlay", rect, &text, accepts);
     }
 
     /// F1 abre/fecha a ajuda de atalhos em qualquer tela, inclusive com um
@@ -7202,7 +7261,7 @@ impl App {
             let atalho = |ui: &mut egui::Ui, teclas: &str, descricao: &str| {
                 ui.horizontal(|ui| {
                     ui.add_sized(
-                        [170.0, 16.0],
+                        [185.0, 16.0],
                         egui::Label::new(
                             egui::RichText::new(teclas).monospace().color(CARD_TEXT),
                         ),
@@ -7270,6 +7329,11 @@ impl App {
                     atalho(ui, "Ctrl+C", "copiar a seleção (cole com Ctrl+V)");
                     atalho(ui, "Ctrl+X", "recortar a seleção para mover");
                     atalho(ui, "Ctrl+V", "colar na pasta atual (copia ou move)");
+                    atalho(
+                        ui,
+                        "arrastar para outro painel",
+                        "copiar a seleção para lá (também para outro servidor)",
+                    );
                     atalho(ui, "Esc", "desistir de copiar/mover");
                     atalho(ui, "Enter, duplo clique", "abrir a pasta ou ver o arquivo (\"..\" sobe)");
                     atalho(ui, "Backspace", "voltar à pasta acima");
@@ -7812,8 +7876,8 @@ impl App {
                 pane.paste = notice(
                     format!(
                         "Os itens foram copiados em \u{201c}{}\u{201d}; colar só funciona num \
-                         painel SFTP dessa mesma conexão. Para levar arquivos a outro servidor, \
-                         baixe-os (Ctrl+S) e arraste-os para o outro painel.",
+                         painel SFTP dessa mesma conexão. Para copiar para outro servidor, \
+                         arraste os itens de um painel SFTP para o painel do outro servidor.",
                         show_path(&label)
                     ),
                     Tone::Neutral,
@@ -7837,61 +7901,216 @@ impl App {
             }
             PasteAvail::Ready => {}
         }
-        let (Some(clip), Some(exp)) = (self.fs_clip.as_ref(), pane.explorer.as_ref()) else {
+        // O que estava copiado/recortado sai do app ao colar (a faixa some) e
+        // so volta se nada for colado (cancelado, erro, tudo pulado).
+        let Some(clip) = self.fs_clip.take() else {
             return;
         };
-        let mode = clip.mode;
-        let op = match mode {
+        let op = match clip.mode {
             ClipMode::Copy => paste::PasteOp::Copy,
             ClipMode::Cut => paste::PasteOp::Move,
         };
-        let dest: std::collections::HashMap<&str, bool> =
-            exp.entries.iter().map(|n| (n.name.as_str(), n.is_real_dir())).collect();
-        let sources: Vec<paste::Source> = clip
-            .items
-            .iter()
-            .map(|i| paste::Source {
-                path: &i.path,
-                name: &i.name,
-                is_dir: i.is_dir,
-            })
-            .collect();
-        let prepared = paste::prepare(op, &clip.src_dir, &exp.cur_path, &sources, &dest);
-        let dest_dir = exp.cur_path.clone();
-        if prepared.items.is_empty() {
-            let text = match prepared.invalid.first() {
-                Some((nome, motivo)) => format!("Nada a colar: {}: {motivo}", show_path(nome)),
-                None => "Nada a colar.".to_string(),
-            };
-            pane.paste = notice(text, Tone::Error);
-            return;
-        }
-        let id = self.next_paste_id;
-        self.next_paste_id += 1;
-        // O que estava copiado/recortado sai do app ao colar (a faixa some) e
-        // so volta se nada for colado (cancelado, erro, tudo pulado).
-        let restore = self.fs_clip.take();
-        let mut pui = PasteUi {
-            id,
+        let (src_dir, items) = (clip.src_dir.clone(), clip.items.clone());
+        let back = start_copy_into(
+            pane,
+            &mut self.next_paste_id,
             op,
-            dest_dir,
-            origin: pane.origin.clone(),
-            restore,
-            pre_failed: Vec::new(),
-            pre_skipped: prepared.invalid.clone(),
-            pre_moved: Vec::new(),
-            pre_done: 0,
-            pre_count: 0,
-            stage: PasteStage::done(String::new(), String::new(), Tone::Neutral),
-        };
-        if !prepared.conflicts.is_empty() {
-            pui.stage = PasteStage::Asking(prepared);
-            pane.paste = Some(pui);
-            return;
-        }
-        if let Some(c) = start_paste(pane, pui, op, prepared.items) {
+            &src_dir,
+            &items,
+            CopySource::Clip(clip),
+        );
+        if let Some(c) = back {
             self.fs_clip.get_or_insert(c);
         }
+    }
+
+    /// `Pane::id` do painel no caminho `path`, se for uma folha.
+    fn pane_id_at(&self, path: &[usize]) -> Option<u64> {
+        match self.root.as_ref().and_then(|r| node_at(r, path)) {
+            Some(Node::Leaf(p)) => Some(p.id),
+            _ => None,
+        }
+    }
+
+    /// Sessao de origem para a copia entre servidores: a do painel de onde
+    /// os itens sairam (se ainda e a mesma conexao), senao a de qualquer
+    /// painel conectado a mesma conexao. `None` quando ela ja encerrou.
+    fn drag_source(&self, drag: &FsDrag) -> Option<sftp::SessionRef> {
+        let root = self.root.as_ref()?;
+        let same = |p: &Pane| p.origin.as_ref().is_some_and(|o| o.same(&drag.origin));
+        if let Some(p) = find_pane(root, &|p| p.id == drag.src_pane) {
+            if same(p) {
+                if let Some(s) = p.sftp.as_ref().and_then(|s| s.session_ref()) {
+                    return Some(s);
+                }
+            }
+        }
+        find_pane(root, &|p| {
+            same(p)
+                && matches!(p.state, SessionState::Connected)
+                && p.sftp.as_ref().is_some_and(|s| s.session_ref().is_some())
+        })
+        .and_then(|p| p.sftp.as_ref()?.session_ref())
+    }
+
+    /// Soltura dos itens arrastados de um painel SFTP (ver `FsDrag`): no
+    /// quadro em que o botao e solto a carga ainda esta la, e o painel sob o
+    /// cursor vem dos retangulos do quadro anterior (antes de os paineis
+    /// serem desenhados, como os arquivos soltos do Windows).
+    fn handle_fs_drag(&mut self, ctx: &egui::Context) {
+        let Some(drag) = egui::DragAndDrop::payload::<FsDrag>(ctx) else {
+            return;
+        };
+        let (pressed, released, pos) = ctx.input(|i| {
+            (
+                i.pointer.any_pressed(),
+                i.pointer.any_released(),
+                i.pointer.latest_pos().or(i.pointer.interact_pos()),
+            )
+        });
+        // Um aperto novo com a carga ainda pendente: a soltura anterior se
+        // perdeu (fora da janela, sem o movimento seguinte); a carga nao vale.
+        if pressed {
+            egui::DragAndDrop::clear_payload(ctx);
+            return;
+        }
+        if !released {
+            return;
+        }
+        egui::DragAndDrop::clear_payload(ctx);
+        let modal_open = self.editor.is_some()
+            || self.pending_delete.is_some()
+            || self.show_help
+            || self.host_key_pending();
+        if modal_open {
+            return;
+        }
+        let Some(pos) = pos else {
+            return;
+        };
+        let Some(path) = self
+            .pane_rects
+            .iter()
+            .find(|(_, r)| r.contains(pos))
+            .map(|(p, _)| p.clone())
+        else {
+            return;
+        };
+        if self.pane_id_at(&path) == Some(drag.src_pane) {
+            return;
+        }
+        self.begin_drag_copy(&drag, path);
+    }
+
+    /// Itens arrastados soltos sobre o painel `dest`: copia-os para a pasta
+    /// aberta nele (de outro servidor, lendo pela sessao emprestada da origem).
+    fn begin_drag_copy(&mut self, drag: &FsDrag, dest: Vec<usize>) {
+        let cross = match self.root.as_ref().and_then(|r| node_at(r, &dest)) {
+            Some(Node::Leaf(p)) => !p.origin.as_ref().is_some_and(|o| o.same(&drag.origin)),
+            _ => return,
+        };
+        let src = if cross { self.drag_source(drag) } else { None };
+        let Some(Node::Leaf(pane)) = self.root.as_mut().and_then(|r| node_at_mut(r, &dest)) else {
+            return;
+        };
+        let (_, accepts) = drag_hint(pane, drag, src.is_some());
+        if !accepts {
+            // O realce durante o arrasto ja explicou o motivo; so a origem
+            // encerrada nao da para ver la (a sessao pode acabar no meio do
+            // arrasto), entao fica o aviso no painel de destino.
+            let (_, ok_with_src) = drag_hint(pane, drag, true);
+            if ok_with_src {
+                pane.paste = Some(PasteUi::notice(
+                    "A conexão de origem foi encerrada; nada foi copiado.",
+                    Tone::Error,
+                ));
+            }
+            return;
+        }
+        let from = src.map(|s| (drag.origin.label.clone(), s));
+        start_copy_into(
+            pane,
+            &mut self.next_paste_id,
+            paste::PasteOp::Copy,
+            &drag.src_dir,
+            &drag.items,
+            CopySource::Drag { from },
+        );
+        // O painel que recebeu os itens passa a ser o focado (Esc/Enter
+        // chegam ao dialogo de conflito; o rodape fica no painel em foco).
+        self.pending_focus = Some(dest);
+    }
+
+    /// Enquanto itens de um painel SFTP sao arrastados: um "fantasma" com o
+    /// que esta sendo levado junto ao cursor e o realce do painel sob ele
+    /// (como `ui_drop_overlay`), menos no painel de origem.
+    fn ui_drag_overlay(&self, ctx: &egui::Context) {
+        let Some(drag) = egui::DragAndDrop::payload::<FsDrag>(ctx) else {
+            return;
+        };
+        let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) else {
+            return;
+        };
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        let under = self
+            .pane_rects
+            .iter()
+            .find(|(_, r)| r.contains(pos))
+            .filter(|(p, _)| self.pane_id_at(p) != Some(drag.src_pane));
+        if let Some((path, rect)) = under {
+            if let Some(Node::Leaf(pane)) = self.root.as_ref().and_then(|r| node_at(r, path)) {
+                let cross = !pane.origin.as_ref().is_some_and(|o| o.same(&drag.origin));
+                let src_ok = !cross || self.drag_source(&drag).is_some();
+                let (text, accepts) = drag_hint(pane, &drag, src_ok);
+                paint_drop_overlay(ctx, "drag_overlay", *rect, &text, accepts);
+            }
+        }
+        // Fantasma: icone de copiar e o nome (ou a quantidade) junto ao cursor.
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("fs_drag_ghost"),
+        ));
+        let text = match drag.items.as_slice() {
+            [one] => {
+                let mut t = elide(&show_path(&one.name), 40);
+                if one.is_dir {
+                    t.push('/');
+                }
+                t
+            }
+            many => format!("{} itens", many.len()),
+        };
+        let galley = painter.layout_no_wrap(text, egui::FontId::proportional(13.0), CARD_TEXT);
+        let pad = egui::vec2(8.0, 5.0);
+        let icon = 16.0;
+        let size = egui::vec2(icon + 6.0 + galley.size().x, galley.size().y.max(icon)) + pad * 2.0;
+        let rect = egui::Rect::from_min_size(pos + egui::vec2(16.0, 16.0), size);
+        painter.rect(
+            rect,
+            6.0,
+            MENU_BG,
+            egui::Stroke::new(1.0, ACCENT),
+            egui::StrokeKind::Inside,
+        );
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + pad.x + icon / 2.0, rect.center().y),
+            egui::vec2(icon, icon),
+        );
+        if let Ok(egui::load::TexturePoll::Ready { texture }) =
+            egui::Image::new(ICON_COPY).load_for_size(ctx, egui::vec2(icon, icon))
+        {
+            painter.image(
+                texture.id,
+                icon_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                ACCENT,
+            );
+        }
+        painter.galley(
+            egui::pos2(icon_rect.right() + 6.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            CARD_TEXT,
+        );
     }
 
     /// Depois de um colar: nos paineis da mesma conexao, segue uma pasta
@@ -8059,8 +8278,95 @@ fn any_pane(node: &Node, f: &dyn Fn(&Pane) -> bool) -> bool {
     }
 }
 
-/// Manda o lote de colar a sessao e passa o painel a "colando". Com a sessao
-/// ja encerrada fica so o aviso, e o recorte volta para quem chamou.
+/// Primeiro painel da arvore que satisfaz `f` (ordem de renderizacao).
+fn find_pane<'a>(node: &'a Node, f: &dyn Fn(&Pane) -> bool) -> Option<&'a Pane> {
+    match node {
+        Node::Leaf(p) => f(p).then_some(p),
+        Node::Split { children, .. } => children.iter().find_map(|c| find_pane(c, f)),
+    }
+}
+
+/// De onde vem um lote de `start_copy_into`.
+enum CopySource {
+    /// Ctrl+V: o recorte do app (volta a faixa se nada sair).
+    Clip(FsClip),
+    /// Arrastado de outro painel; `from` e a conexao de origem com a sessao
+    /// dela emprestada, quando os itens vem de outro servidor.
+    Drag {
+        from: Option<(String, sftp::SessionRef)>,
+    },
+}
+
+/// Cauda comum do colar (Ctrl+V) e do arrastar entre paineis: planeja a
+/// copia/movimentacao de `items` (entradas de `src_dir`) para a pasta aberta
+/// no painel, abre o dialogo de conflito ou manda o lote a sessao. Devolve o
+/// recorte quando nada foi mandado (ele volta a faixa).
+fn start_copy_into(
+    pane: &mut Pane,
+    next_id: &mut u64,
+    op: paste::PasteOp,
+    src_dir: &str,
+    items: &[ClipItem],
+    source: CopySource,
+) -> Option<FsClip> {
+    let (restore, from, dragged) = match source {
+        CopySource::Clip(c) => (Some(c), None, false),
+        CopySource::Drag { from } => (None, from, true),
+    };
+    let Some(exp) = pane.explorer.as_ref() else {
+        return restore;
+    };
+    // Outro servidor: caminhos iguais nao sao a mesma pasta.
+    let cross = from.is_some();
+    let dest: std::collections::HashMap<&str, bool> =
+        exp.entries.iter().map(|n| (n.name.as_str(), n.is_real_dir())).collect();
+    let sources: Vec<paste::Source> = items
+        .iter()
+        .map(|i| paste::Source {
+            path: &i.path,
+            name: &i.name,
+            is_dir: i.is_dir,
+        })
+        .collect();
+    let prepared = paste::prepare(op, src_dir, &exp.cur_path, &sources, &dest, cross);
+    let dest_dir = exp.cur_path.clone();
+    if prepared.items.is_empty() {
+        let verbo = if dragged { "copiar" } else { "colar" };
+        let text = match prepared.invalid.first() {
+            Some((nome, motivo)) => format!("Nada a {verbo}: {}: {motivo}", show_path(nome)),
+            None => format!("Nada a {verbo}."),
+        };
+        pane.paste = Some(PasteUi::notice(&text, Tone::Error));
+        return restore;
+    }
+    let id = *next_id;
+    *next_id += 1;
+    let mut pui = PasteUi {
+        id,
+        op,
+        dest_dir,
+        origin: pane.origin.clone(),
+        restore,
+        pre_failed: Vec::new(),
+        pre_skipped: prepared.invalid.clone(),
+        pre_moved: Vec::new(),
+        pre_done: 0,
+        pre_count: 0,
+        from,
+        dragged,
+        stage: PasteStage::done(String::new(), String::new(), Tone::Neutral),
+    };
+    if !prepared.conflicts.is_empty() {
+        pui.stage = PasteStage::Asking(prepared);
+        pane.paste = Some(pui);
+        return None;
+    }
+    start_paste(pane, pui, op, prepared.items)
+}
+
+/// Manda o lote de colar a sessao e passa o painel a "colando" (de outro
+/// servidor, pela sessao emprestada em `pui.from`). Com a sessao ja
+/// encerrada fica so o aviso, e o recorte volta para quem chamou.
 fn start_paste(
     pane: &mut Pane,
     mut pui: PasteUi,
@@ -8072,7 +8378,11 @@ fn start_paste(
         dest_dir: pui.dest_dir.clone(),
         items,
     };
-    match pane.sftp.as_ref().and_then(|s| s.paste(pui.id, req)) {
+    let sent = pane.sftp.as_ref().and_then(|s| match &pui.from {
+        Some((_, src)) => s.copy_from(pui.id, src.clone(), req),
+        None => s.paste(pui.id, req),
+    });
+    match sent {
         Some(cancel) => {
             pui.stage = PasteStage::Running {
                 cancel,
@@ -8095,7 +8405,12 @@ fn start_paste(
         }
         None => {
             let restore = pui.restore.take();
-            pane.paste = Some(PasteUi::notice("Sessão encerrada; nada foi colado.", Tone::Error));
+            let text = if pui.dragged {
+                "Sessão encerrada; nada foi copiado."
+            } else {
+                "Sessão encerrada; nada foi colado."
+            };
+            pane.paste = Some(PasteUi::notice(text, Tone::Error));
             restore
         }
     }
@@ -8122,10 +8437,12 @@ fn answer_paste_conflict(pane: &mut Pane, choice: ConflictChoice) -> Option<FsCl
     pui.pre_skipped.extend(skipped);
     if items.is_empty() {
         let restore = pui.restore.take();
-        pane.paste = Some(PasteUi::notice(
-            "Nada a colar: todos os itens já existem no destino.",
-            Tone::Neutral,
-        ));
+        let text = if pui.dragged {
+            "Nada a copiar: todos os itens já existem no destino."
+        } else {
+            "Nada a colar: todos os itens já existem no destino."
+        };
+        pane.paste = Some(PasteUi::notice(text, Tone::Neutral));
         return restore;
     }
     start_paste(pane, pui, op, items)
@@ -8258,6 +8575,12 @@ fn nothing_pasted(p: &PasteUi, r: &paste::PasteReport) -> bool {
 fn paste_result(p: &PasteUi, r: &paste::PasteReport) -> (String, String, Tone) {
     let moving = p.op != paste::PasteOp::Copy;
     let dest = elide_path(&show_path(&p.dest_dir), 48);
+    // Arrastado: "copiado", nunca "colado". De outro servidor: "de "X" para".
+    let nada = if p.dragged { "Nada foi copiado" } else { "Nada foi colado" };
+    let para = match &p.from {
+        Some((label, _)) => format!("de \u{201c}{}\u{201d} para {dest}", show_path(label)),
+        None => format!("para {dest}"),
+    };
     let failed: Vec<&(String, String)> = p.pre_failed.iter().chain(&r.failed).collect();
     let skipped: Vec<&(String, String)> = p.pre_skipped.iter().chain(&r.skipped).collect();
     let done = p.pre_done + r.done;
@@ -8286,9 +8609,9 @@ fn paste_result(p: &PasteUi, r: &paste::PasteReport) -> (String, String, Tone) {
         let (nome, erro) = (show_path(nome), show_path(erro));
         let verbo = if moving { "movidos" } else { "copiados" };
         let mut t = if done == 0 {
-            format!("Nada foi colado: {nome}: {erro}")
+            format!("{nada}: {nome}: {erro}")
         } else {
-            format!("{done} de {n} itens {verbo} para {dest}; {nome}: {erro}")
+            format!("{done} de {n} itens {verbo} {para}; {nome}: {erro}")
         };
         if failed.len() > 1 {
             t.push_str(&format!(" (+{} com erro)", failed.len() - 1));
@@ -8306,10 +8629,10 @@ fn paste_result(p: &PasteUi, r: &paste::PasteReport) -> (String, String, Tone) {
     } else if done == 0 {
         match skipped.first() {
             Some((nome, motivo)) => (
-                format!("Nada foi colado: {}: {motivo}", show_path(nome)),
+                format!("{nada}: {}: {motivo}", show_path(nome)),
                 Tone::Neutral,
             ),
-            None => ("Nada foi colado.".to_string(), Tone::Error),
+            None => (format!("{nada}."), Tone::Error),
         }
     } else {
         let t = if moving {
@@ -8326,9 +8649,9 @@ fn paste_result(p: &PasteUi, r: &paste::PasteReport) -> (String, String, Tone) {
                 format!("{done} cópias criadas nesta pasta")
             }
         } else if done == 1 {
-            format!("\u{201c}{}\u{201d} copiado para {dest}", show_path(&r.last))
+            format!("\u{201c}{}\u{201d} copiado {para}", show_path(&r.last))
         } else {
-            format!("{done} itens copiados para {dest}")
+            format!("{done} itens copiados {para}")
         };
         (t + &suffix, Tone::Ok)
     };
@@ -9359,6 +9682,74 @@ fn drop_target(ctx: &egui::Context, rects: &[(Vec<usize>, egui::Rect)]) -> Optio
         .iter()
         .find(|(_, r)| r.contains(pos))
         .map(|(p, _)| p.clone())
+}
+
+/// Realce de um painel alvo de arrasto (arquivos do Windows ou itens de outro
+/// painel SFTP) com a dica do que a soltura faria; `accepts` escolhe a cor.
+fn paint_drop_overlay(ctx: &egui::Context, id: &'static str, rect: egui::Rect, text: &str, accepts: bool) {
+    let color = if accepts { ACCENT } else { TEXT_WEAK };
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new(id)));
+    let r = rect.shrink(3.0);
+    painter.rect_filled(r, 6.0, color.gamma_multiply(0.14));
+    painter.rect_stroke(r, 6.0, egui::Stroke::new(2.0, color), egui::StrokeKind::Inside);
+    painter.text(
+        r.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(16.0),
+        color,
+    );
+}
+
+/// Dica sobre o painel enquanto itens de outro painel SFTP sao arrastados
+/// por cima; `true` quando ele aceita a soltura. `src_available`: a sessao
+/// de origem ainda existe (so importa quando vem de outro servidor).
+fn drag_hint(pane: &Pane, drag: &FsDrag, src_available: bool) -> (String, bool) {
+    if pane.picking {
+        return ("Escolha uma conexão antes de soltar".into(), false);
+    }
+    let (Some(_), Some(exp)) = (&pane.sftp, &pane.explorer) else {
+        return ("Solte num painel SFTP para copiar".into(), false);
+    };
+    let wait = || ("Aguarde a pasta carregar".to_string(), false);
+    let Some(origin) = pane.origin.as_ref() else {
+        return wait();
+    };
+    // Sessao encerrada (no meio de um download/colar) ou falha ao
+    // conectar: o painel fica aberto com o erro, mas nada vai carregar;
+    // nao promete a pasta.
+    if matches!(pane.state, SessionState::Closed | SessionState::Error(_)) {
+        return ("Este painel não está conectado".into(), false);
+    }
+    if !matches!(pane.state, SessionState::Connected) || exp.cur_path.is_empty() || exp.loading {
+        return wait();
+    }
+    if pane.paste.as_ref().is_some_and(PasteUi::busy) {
+        return ("Aguarde a cópia atual terminar".into(), false);
+    }
+    let dir = show_path(&exp.cur_path);
+    if origin.same(&drag.origin) {
+        if paste::same_dir(&drag.src_dir, &exp.cur_path) {
+            return ("Os itens já estão nesta pasta".into(), false);
+        }
+        if drag.items.iter().all(|i| i.is_dir && paste::is_inside(&exp.cur_path, &i.path)) {
+            return (
+                "Não é possível copiar uma pasta para dentro dela mesma".into(),
+                false,
+            );
+        }
+        (format!("Solte para copiar para {dir}"), true)
+    } else if !src_available {
+        ("A conexão de origem foi encerrada".into(), false)
+    } else {
+        (
+            format!(
+                "Solte para copiar de \u{201c}{}\u{201d} para {dir}",
+                show_path(&drag.origin.label)
+            ),
+            true,
+        )
+    }
 }
 
 /// Dica exibida sobre o painel enquanto arquivos sao arrastados por cima;
@@ -12137,6 +12528,22 @@ fn render_node(
                                 names,
                             }));
                         }
+                        // Arrastar comecou numa linha: a carga fica no egui
+                        // ate soltar (`App::handle_fs_drag`); so com a sessao
+                        // conectada e sem janela do colar aberta.
+                        if let (Some(items), Some(origin), false) = (out.drag, pane.origin.clone(), asking) {
+                            if matches!(pane.state, SessionState::Connected) {
+                                egui::DragAndDrop::set_payload(
+                                    ui.ctx(),
+                                    FsDrag {
+                                        origin,
+                                        src_pane: pane.id,
+                                        src_dir: exp.cur_path.clone(),
+                                        items,
+                                    },
+                                );
+                            }
+                        }
                     }
                     if footer_h > 0.0 {
                         let mut top = list_rect.max.y + 2.0;
@@ -12335,6 +12742,7 @@ impl eframe::App for App {
                 // atalhos; de novo apos drenar, para uma que chegou agora.
                 self.guard_host_key_keys(ctx);
                 self.handle_file_drop(ctx);
+                self.handle_fs_drag(ctx);
                 self.handle_session_keys(ctx);
                 self.drain_ssh_events();
                 self.guard_host_key_keys(ctx);
@@ -12461,9 +12869,11 @@ impl eframe::App for App {
             }
         }
 
-        // Realce do painel alvo enquanto arquivos sao arrastados sobre a janela.
+        // Realce do painel alvo enquanto arquivos sao arrastados sobre a
+        // janela, ou itens de um painel SFTP para outro.
         if matches!(self.screen, Screen::Session) {
             self.ui_drop_overlay(ctx);
+            self.ui_drag_overlay(ctx);
         }
 
         // Download pedido neste quadro: escolhe a pasta de destino. O dialogo
@@ -13125,11 +13535,13 @@ mod focus_tests {
         ctx.run(raw, |ctx| {
             app.guard_host_key_keys(ctx);
             app.handle_file_drop(ctx);
+            app.handle_fs_drag(ctx);
             app.handle_session_keys(ctx);
             app.drain_ssh_events();
             app.guard_host_key_keys(ctx);
             app.handle_help_keys(ctx);
             egui::CentralPanel::default().show(ctx, |ui| app.ui_session(ui));
+            app.ui_drag_overlay(ctx);
             app.ui_host_key_prompt(ctx);
         })
     }
@@ -14679,6 +15091,57 @@ mod focus_tests {
         assert!(HELP_ICON_CREDITS.contains("Simple Icons") && HELP_ICON_CREDITS.contains("README"));
     }
 
+    /// A coluna das teclas cabe em todos os rotulos (o mais largo e
+    /// "arrastar para outro painel"), entao as descricoes ficam alinhadas.
+    #[test]
+    fn help_key_column_fits_every_label() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        apply_dark_theme(&ctx);
+        let mut app = app();
+        app.show_help = true;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 2000.0));
+        let mut out = None;
+        for i in 0..4 {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(i as f64 * 0.1),
+                focused: true,
+                ..Default::default()
+            };
+            out = Some(ctx.run(raw, |ctx| app.ui_help(ctx)));
+        }
+        let texts = painted_galleys(out.as_ref().unwrap());
+        let rect_of = |t: &str| {
+            texts
+                .iter()
+                .find(|(_, f, _)| f == t)
+                .map(|(_, _, r)| *r)
+                .unwrap_or_else(|| panic!("nao achei {t:?}"))
+        };
+        for k in [
+            "arrastar para outro painel",
+            "Shift+clique, Shift+setas",
+            "Ctrl+L, clique no caminho",
+            "Enter, duplo clique",
+        ] {
+            let w = rect_of(k).width();
+            assert!(w <= 185.0, "{k:?} nao cabe na coluna das teclas: {w} px");
+        }
+        let xs: Vec<f32> = [
+            "copiar a seleção (cole com Ctrl+V)",
+            "recortar a seleção para mover",
+            "colar na pasta atual (copia ou move)",
+            "copiar a seleção para lá (também para outro servidor)",
+            "desistir de copiar/mover",
+            "selecionar um intervalo",
+        ]
+        .iter()
+        .map(|d| rect_of(d).min.x)
+        .collect();
+        assert!(xs.iter().all(|x| (x - xs[0]).abs() < 0.5), "descricoes desalinhadas: {xs:?}");
+    }
+
     // --- SO do servidor detectado em segundo plano (1.1.0) -----------------
 
     use crate::osinfo::OsInfo;
@@ -15359,11 +15822,13 @@ mod focus_tests {
         ctx.run(raw, |ctx| {
             app.guard_host_key_keys(ctx);
             app.handle_file_drop(ctx);
+            app.handle_fs_drag(ctx);
             app.handle_session_keys(ctx);
             app.drain_ssh_events();
             app.guard_host_key_keys(ctx);
             app.handle_help_keys(ctx);
             egui::CentralPanel::default().show(ctx, |ui| app.ui_session(ui));
+            app.ui_drag_overlay(ctx);
             app.ui_host_key_prompt(ctx);
         })
     }
@@ -17415,11 +17880,13 @@ mod focus_tests {
         ctx.run(light_raw(size, events), |ctx| {
             app.guard_host_key_keys(ctx);
             app.handle_file_drop(ctx);
+            app.handle_fs_drag(ctx);
             app.handle_session_keys(ctx);
             app.drain_ssh_events();
             app.guard_host_key_keys(ctx);
             app.handle_help_keys(ctx);
             egui::CentralPanel::default().show(ctx, |ui| app.ui_session(ui));
+            app.ui_drag_overlay(ctx);
             app.ui_host_key_prompt(ctx);
         })
     }
@@ -18265,5 +18732,413 @@ mod focus_tests {
         app.remember_file = None;
         let out = hosts_frame(&ctx, &mut app, min, vec![]);
         assert!(!painted_texts(&out).iter().any(|(t, _)| t == REMEMBER_LABEL));
+    }
+
+    // --- Arrastar entre dois paineis SFTP -----------------------------------
+
+    /// Lado "sessao" dos canais de teste de um painel SFTP.
+    type SftpEnd = (
+        tokio::sync::mpsc::UnboundedReceiver<crate::sftp::UiToSftp>,
+        std::sync::mpsc::Sender<crate::sftp::SftpToUi>,
+    );
+
+    fn drag_origin(host: &str, label: &str) -> SftpOrigin {
+        SftpOrigin {
+            host: host.into(),
+            port: 22,
+            user: "u".into(),
+            label: label.into(),
+        }
+    }
+
+    /// Painel SFTP conectado, listando `dir` com as entradas dadas.
+    fn drag_pane(handle: crate::sftp::SftpHandle, dir: &str, names: &[&str], origin: SftpOrigin) -> Pane {
+        let mut p = Pane::picker();
+        p.picking = false;
+        p.state = SessionState::Connected;
+        p.sftp = Some(handle);
+        let mut e = explorer_with(names);
+        e.cur_path = dir.into();
+        for n in &mut e.entries {
+            n.path = format!("{dir}/{}", n.name);
+        }
+        p.explorer = Some(e);
+        p.host_name = format!("{}  (SFTP)", origin.label);
+        p.origin = Some(origin);
+        p
+    }
+
+    /// App com dois paineis SFTP lado a lado: A (/srv com "a" e "b"; sessao
+    /// emprestavel quando `with_session`) e B (/dst com `dst_names`), da
+    /// mesma conexao (`same`) ou de servidores diferentes; o foco em A.
+    fn drag_app(same: bool, with_session: bool, dst_names: &[&str]) -> (App, SftpEnd, SftpEnd) {
+        let mut app = app();
+        let (ha, a_rx, a_tx) = if with_session {
+            crate::sftp::SftpHandle::test_pair_with_session(crate::sftp::SessionRef::fake())
+        } else {
+            crate::sftp::SftpHandle::test_pair()
+        };
+        let (hb, b_rx, b_tx) = crate::sftp::SftpHandle::test_pair();
+        let oa = drag_origin("alfa", "Alfa");
+        let ob = if same { oa.clone() } else { drag_origin("beta", "Beta") };
+        let a = drag_pane(ha, "/srv", &["a", "b"], oa);
+        let b = drag_pane(hb, "/dst", dst_names, ob);
+        app.root = Some(Node::Split {
+            dir: SplitDir::SideBySide,
+            children: vec![Node::Leaf(a), Node::Leaf(b)],
+        });
+        app.pending_focus = Some(vec![0]);
+        (app, (a_rx, a_tx), (b_rx, b_tx))
+    }
+
+    fn pane_at<'a>(app: &'a App, path: &[usize]) -> &'a Pane {
+        match app.root.as_ref().and_then(|r| node_at(r, path)) {
+            Some(Node::Leaf(p)) => p,
+            _ => panic!("sem painel em {path:?}"),
+        }
+    }
+
+    fn pane_rect(app: &App, path: &[usize]) -> egui::Rect {
+        app.pane_rects
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| panic!("sem retangulo do painel {path:?}"))
+    }
+
+    /// Centro do nome `name` pintado na listagem do painel `path`.
+    fn row_pos(ctx: &egui::Context, app: &mut App, path: &[usize], name: &str) -> egui::Pos2 {
+        let out = frame_session(ctx, app, vec![]);
+        let pane = pane_rect(app, path);
+        painted_texts(&out)
+            .into_iter()
+            .find(|(t, r)| t == name && pane.contains(r.center()))
+            .unwrap_or_else(|| panic!("linha {name:?} nao pintada no painel {path:?}"))
+            .1
+            .center()
+    }
+
+    /// Arrasta a linha `name` do painel A (aperta, move alem do limite do
+    /// clique, leva ate o centro do painel `to`) e solta la.
+    fn drag_row(ctx: &egui::Context, app: &mut App, name: &str, to: &[usize]) {
+        for _ in 0..2 {
+            frame_session(ctx, app, vec![]);
+        }
+        let from = row_pos(ctx, app, &[0], name);
+        frame_session(ctx, app, vec![egui::Event::PointerMoved(from), click(from, true)]);
+        frame_session(ctx, app, vec![egui::Event::PointerMoved(from + egui::vec2(24.0, 0.0))]);
+        assert!(egui::DragAndDrop::has_any_payload(ctx), "o arrasto nao comecou");
+        let dest = pane_rect(app, to).center();
+        frame_session(ctx, app, vec![egui::Event::PointerMoved(dest)]);
+        frame_session(ctx, app, vec![click(dest, false)]);
+        assert!(!egui::DragAndDrop::has_any_payload(ctx), "a carga ficou apos soltar");
+    }
+
+    /// Pedidos de copiar de outra sessao (`CopyFrom`) mandados ao painel.
+    fn copy_from_reqs(rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::sftp::UiToSftp>) -> Vec<(u64, paste::PasteRequest)> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let crate::sftp::UiToSftp::CopyFrom { id, req, .. } = m {
+                out.push((id, req));
+            }
+        }
+        out
+    }
+
+    /// Pedidos de colar na propria sessao (`Paste`) mandados ao painel.
+    fn paste_reqs(rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::sftp::UiToSftp>) -> Vec<(u64, paste::PasteRequest)> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let crate::sftp::UiToSftp::Paste { id, req, .. } = m {
+                out.push((id, req));
+            }
+        }
+        out
+    }
+
+    fn item_names(req: &paste::PasteRequest) -> Vec<&str> {
+        req.items.iter().map(|i| i.name.as_str()).collect()
+    }
+
+    fn paste_stage<'a>(app: &'a App, path: &[usize]) -> &'a PasteStage {
+        &pane_at(app, path).paste.as_ref().expect("painel sem colar").stage
+    }
+
+    /// Soltar num painel de outro servidor manda `CopyFrom` ao destino com a
+    /// sessao da origem; o fim do lote diz "copiado de X para Y".
+    #[test]
+    fn drag_between_servers_sends_copy_from() {
+        let ctx = light_ctx();
+        let (mut app, (mut a_rx, _a_tx), (mut b_rx, b_tx)) = drag_app(false, true, &[]);
+        drag_row(&ctx, &mut app, "a", &[1]);
+
+        let reqs = copy_from_reqs(&mut b_rx);
+        assert_eq!(reqs.len(), 1, "um CopyFrom em B");
+        let (id, req) = &reqs[0];
+        assert_eq!(req.op, paste::PasteOp::Copy);
+        assert_eq!(req.dest_dir, "/dst");
+        assert_eq!(item_names(req), ["a"]);
+        assert_eq!(req.items[0].src, "/srv/a");
+        assert!(!req.items[0].replace);
+        assert!(matches!(paste_stage(&app, &[1]), PasteStage::Running { .. }));
+        assert!(a_rx.try_recv().is_err(), "a origem nao recebe pedido");
+        // O painel que recebeu os itens fica com o foco.
+        frame_session(&ctx, &mut app, vec![]);
+        assert_eq!(app.focused_path, Some(vec![1]));
+
+        let report = paste::PasteReport {
+            id: *id,
+            op: Some(paste::PasteOp::Copy),
+            count: 1,
+            done: 1,
+            files: 1,
+            saved: 1,
+            last: "a".into(),
+            refresh: vec!["/dst".into()],
+            ..Default::default()
+        };
+        b_tx.send(crate::sftp::SftpToUi::Paste(paste::PasteEvent::Finished(Box::new(report))))
+            .unwrap();
+        frame_session(&ctx, &mut app, vec![]);
+        match paste_stage(&app, &[1]) {
+            PasteStage::Done { text, tone, .. } => {
+                assert_eq!(*tone, Tone::Ok, "{text}");
+                assert!(text.contains("copiado"), "{text}");
+                assert!(text.contains("Alfa"), "{text}");
+                assert!(!text.contains("colado"), "{text}");
+            }
+            _ => panic!("esperava o resultado"),
+        }
+        // O destino e re-listado; a origem (outro servidor) nao.
+        assert!(
+            matches!(b_rx.try_recv(), Ok(crate::sftp::UiToSftp::ListDir(p)) if p == "/dst"),
+            "B re-lista /dst"
+        );
+        assert!(a_rx.try_recv().is_err());
+    }
+
+    /// Arrastar uma linha marcada leva a selecao inteira, na ordem da lista.
+    #[test]
+    fn drag_whole_selection() {
+        let ctx = light_ctx();
+        let (mut app, _a, (mut b_rx, _b_tx)) = drag_app(false, true, &[]);
+        {
+            let e = explorer_at(&mut app, &[0]);
+            e.marked.insert("a".into());
+            e.marked.insert("b".into());
+        }
+        drag_row(&ctx, &mut app, "a", &[1]);
+        let reqs = copy_from_reqs(&mut b_rx);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(item_names(&reqs[0].1), ["a", "b"]);
+    }
+
+    /// Mesma conexao: e o colar comum (`Paste`) no painel de destino.
+    #[test]
+    fn drag_same_server_uses_plain_paste() {
+        let ctx = light_ctx();
+        let (mut app, (mut a_rx, _a_tx), (mut b_rx, _b_tx)) = drag_app(true, true, &[]);
+        drag_row(&ctx, &mut app, "b", &[1]);
+        let reqs = paste_reqs(&mut b_rx);
+        assert_eq!(reqs.len(), 1, "um Paste em B");
+        assert_eq!(reqs[0].1.op, paste::PasteOp::Copy);
+        assert_eq!(reqs[0].1.dest_dir, "/dst");
+        assert_eq!(item_names(&reqs[0].1), ["b"]);
+        assert!(copy_from_reqs(&mut b_rx).is_empty());
+        assert!(a_rx.try_recv().is_err());
+        assert!(matches!(paste_stage(&app, &[1]), PasteStage::Running { .. }));
+    }
+
+    /// Soltar no proprio painel de origem nao faz nada.
+    #[test]
+    fn drag_dropped_on_source_pane_does_nothing() {
+        let ctx = light_ctx();
+        let (mut app, (mut a_rx, _a_tx), (mut b_rx, _b_tx)) = drag_app(false, true, &[]);
+        drag_row(&ctx, &mut app, "a", &[0]);
+        assert!(a_rx.try_recv().is_err());
+        assert!(b_rx.try_recv().is_err());
+        assert!(pane_at(&app, &[0]).paste.is_none());
+        assert!(pane_at(&app, &[1]).paste.is_none());
+    }
+
+    /// Origem de outro servidor sem sessao emprestavel (ja encerrada): aviso
+    /// no destino e nada e mandado.
+    #[test]
+    fn drag_without_source_session_shows_notice() {
+        let ctx = light_ctx();
+        let (mut app, (mut a_rx, _a_tx), (mut b_rx, _b_tx)) = drag_app(false, false, &[]);
+        drag_row(&ctx, &mut app, "a", &[1]);
+        assert!(a_rx.try_recv().is_err());
+        assert!(b_rx.try_recv().is_err());
+        match paste_stage(&app, &[1]) {
+            PasteStage::Done { text, tone, .. } => {
+                assert_eq!(*tone, Tone::Error);
+                assert!(text.contains("origem"), "{text}");
+            }
+            _ => panic!("esperava o aviso"),
+        }
+    }
+
+    /// Nome ja existente no destino: o dialogo de conflito abre antes de
+    /// mandar; "Substituir" manda o lote com `replace`.
+    #[test]
+    fn drag_conflict_opens_dialog() {
+        let ctx = light_ctx();
+        let (mut app, _a, (mut b_rx, _b_tx)) = drag_app(false, true, &["a"]);
+        drag_row(&ctx, &mut app, "a", &[1]);
+        assert!(matches!(paste_stage(&app, &[1]), PasteStage::Asking(_)));
+        assert!(b_rx.try_recv().is_err(), "nada mandado antes da resposta");
+        click_text(&ctx, &mut app, "Substituir");
+        let reqs = copy_from_reqs(&mut b_rx);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(item_names(&reqs[0].1), ["a"]);
+        assert!(reqs[0].1.items[0].replace);
+        assert!(matches!(paste_stage(&app, &[1]), PasteStage::Running { .. }));
+    }
+
+    /// Apertar e soltar sem mover continua sendo um clique: seleciona a
+    /// linha, sem carga de arrasto nem pedido a sessao.
+    #[test]
+    fn click_still_selects_without_drag() {
+        let ctx = light_ctx();
+        let (mut app, (mut a_rx, _a_tx), (mut b_rx, _b_tx)) = drag_app(false, true, &[]);
+        for _ in 0..2 {
+            frame_session(&ctx, &mut app, vec![]);
+        }
+        let pos = row_pos(&ctx, &mut app, &[0], "b");
+        frame_session(&ctx, &mut app, vec![egui::Event::PointerMoved(pos), click(pos, true)]);
+        frame_session(&ctx, &mut app, vec![click(pos, false)]);
+        assert!(!egui::DragAndDrop::has_any_payload(&ctx));
+        let marked: Vec<&str> = explorer_at(&mut app, &[0]).marked.iter().map(String::as_str).collect();
+        assert_eq!(marked, ["b"]);
+        assert!(a_rx.try_recv().is_err());
+        assert!(b_rx.try_recv().is_err());
+        assert!(pane_at(&app, &[1]).paste.is_none());
+    }
+
+    /// Segurar o botao parado por mais de 0,8 s (o egui passa a "decidir"
+    /// que e arrasto) nao comeca arrasto nem mexe na selecao.
+    #[test]
+    fn long_press_without_moving_keeps_selection() {
+        let ctx = light_ctx();
+        let (mut app, (mut a_rx, _a_tx), (mut b_rx, _b_tx)) = drag_app(false, true, &[]);
+        explorer_at(&mut app, &[0]).marked.insert("a".into());
+        for _ in 0..2 {
+            frame_session(&ctx, &mut app, vec![]);
+        }
+        let pos = row_pos(&ctx, &mut app, &[0], "b");
+        frame_session(&ctx, &mut app, vec![egui::Event::PointerMoved(pos), click(pos, true)]);
+        // Sem `time` no RawInput cada quadro avanca 1/60 s: 60 quadros = 1 s.
+        let mut payload_seen = false;
+        for _ in 0..60 {
+            frame_session(&ctx, &mut app, vec![]);
+            payload_seen |= egui::DragAndDrop::has_any_payload(&ctx);
+        }
+        frame_session(&ctx, &mut app, vec![click(pos, false)]);
+        assert!(!payload_seen, "aperto longo parado virou arrasto");
+        let marked: Vec<&str> = explorer_at(&mut app, &[0]).marked.iter().map(String::as_str).collect();
+        assert_eq!(marked, ["a"]);
+        assert!(a_rx.try_recv().is_err());
+        assert!(b_rx.try_recv().is_err());
+        assert!(pane_at(&app, &[1]).paste.is_none());
+    }
+
+    /// A origem fecha no meio do arrasto (a conexao caiu) e o irmao seguinte
+    /// herda o caminho dela na arvore: ele nao e tomado pela origem, mostra o
+    /// realce, aceita a soltura e a copia sai pela sessao de outro painel da
+    /// mesma conexao.
+    #[test]
+    fn drag_survives_source_pane_closing() {
+        let ctx = light_ctx();
+        let mut app = app();
+        let (ha, _a_rx, a_tx) =
+            crate::sftp::SftpHandle::test_pair_with_session(crate::sftp::SessionRef::fake());
+        let (hb, mut b_rx, _b_tx) = crate::sftp::SftpHandle::test_pair();
+        let (hd, mut d_rx, _d_tx) =
+            crate::sftp::SftpHandle::test_pair_with_session(crate::sftp::SessionRef::fake());
+        let a = drag_pane(ha, "/srv", &["a", "b"], drag_origin("alfa", "Alfa"));
+        let b = drag_pane(hb, "/dst", &[], drag_origin("beta", "Beta"));
+        let d = drag_pane(hd, "/other", &[], drag_origin("alfa", "Alfa"));
+        let b_id = b.id;
+        app.root = Some(Node::Split {
+            dir: SplitDir::SideBySide,
+            children: vec![Node::Leaf(a), Node::Leaf(b), Node::Leaf(d)],
+        });
+        app.pending_focus = Some(vec![0]);
+        for _ in 0..2 {
+            frame_session(&ctx, &mut app, vec![]);
+        }
+        let from = row_pos(&ctx, &mut app, &[0], "a");
+        frame_session(&ctx, &mut app, vec![egui::Event::PointerMoved(from), click(from, true)]);
+        frame_session(&ctx, &mut app, vec![egui::Event::PointerMoved(from + egui::vec2(24.0, 0.0))]);
+        assert!(egui::DragAndDrop::has_any_payload(&ctx), "o arrasto nao comecou");
+
+        // A sessao de A encerra: o painel fecha e B passa a ser o [0].
+        a_tx.send(crate::sftp::SftpToUi::Closed).unwrap();
+        frame_session(&ctx, &mut app, vec![]);
+        assert_eq!(pane_at(&app, &[0]).id, b_id, "B nao herdou o caminho de A");
+        assert!(egui::DragAndDrop::has_any_payload(&ctx), "a carga sumiu ao fechar a origem");
+
+        let dest = pane_rect(&app, &[0]).center();
+        let out = frame_session(&ctx, &mut app, vec![egui::Event::PointerMoved(dest)]);
+        assert!(
+            painted_texts(&out).iter().any(|(t, _)| t.starts_with("Solte para copiar de")),
+            "sem realce sobre B"
+        );
+        frame_session(&ctx, &mut app, vec![click(dest, false)]);
+        assert!(!egui::DragAndDrop::has_any_payload(&ctx));
+        let reqs = copy_from_reqs(&mut b_rx);
+        assert_eq!(reqs.len(), 1, "um CopyFrom em B");
+        assert_eq!(reqs[0].1.dest_dir, "/dst");
+        assert_eq!(item_names(&reqs[0].1), ["a"]);
+        assert!(matches!(paste_stage(&app, &[0]), PasteStage::Running { .. }));
+        assert!(d_rx.try_recv().is_err(), "o painel que emprestou a sessao nao recebe pedido");
+    }
+
+    /// Painel cuja sessao encerrou (ou falhou ao conectar) fica aberto com o
+    /// erro: a dica do arrasto diz isso em vez de prometer a pasta, e soltar
+    /// la nao manda nada nem deixa aviso.
+    #[test]
+    fn drag_over_disconnected_pane_says_so() {
+        let ctx = light_ctx();
+        let (mut app, (mut a_rx, _a_tx), (mut b_rx, _b_tx)) = drag_app(false, true, &[]);
+        let drag = FsDrag {
+            origin: drag_origin("alfa", "Alfa"),
+            src_pane: 0,
+            src_dir: "/srv".into(),
+            items: vec![],
+        };
+        let set_state = |app: &mut App, state: SessionState| {
+            if let Some(Node::Leaf(p)) = app.root.as_mut().and_then(|r| node_at_mut(r, &[1])) {
+                p.state = state;
+            }
+        };
+        set_state(&mut app, SessionState::Closed);
+        assert_eq!(
+            drag_hint(pane_at(&app, &[1]), &drag, true),
+            ("Este painel não está conectado".to_string(), false)
+        );
+        set_state(&mut app, SessionState::Error("sessão encerrada".into()));
+        assert_eq!(
+            drag_hint(pane_at(&app, &[1]), &drag, true),
+            ("Este painel não está conectado".to_string(), false)
+        );
+
+        for _ in 0..2 {
+            frame_session(&ctx, &mut app, vec![]);
+        }
+        let from = row_pos(&ctx, &mut app, &[0], "a");
+        frame_session(&ctx, &mut app, vec![egui::Event::PointerMoved(from), click(from, true)]);
+        frame_session(&ctx, &mut app, vec![egui::Event::PointerMoved(from + egui::vec2(24.0, 0.0))]);
+        assert!(egui::DragAndDrop::has_any_payload(&ctx), "o arrasto nao comecou");
+        let dest = pane_rect(&app, &[1]).center();
+        let out = frame_session(&ctx, &mut app, vec![egui::Event::PointerMoved(dest)]);
+        let texts = painted_texts(&out);
+        assert!(texts.iter().any(|(t, _)| t == "Este painel não está conectado"), "{texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t == "Aguarde a pasta carregar"), "{texts:?}");
+        frame_session(&ctx, &mut app, vec![click(dest, false)]);
+        assert!(a_rx.try_recv().is_err());
+        assert!(b_rx.try_recv().is_err());
+        assert!(pane_at(&app, &[1]).paste.is_none());
     }
 }
