@@ -564,10 +564,10 @@ where
     let mut name_to_uid: HashMap<String, u32> = HashMap::new();
     let mut gid_to_name: HashMap<u32, String> = HashMap::new();
     let mut name_to_gid: HashMap<String, u32> = HashMap::new();
-    if let Ok(data) = sftp.read("/etc/passwd").await {
+    if let Some(data) = read_whole(&sftp, "/etc/passwd").await {
         parse_id_db(&data, &mut uid_to_name, &mut name_to_uid);
     }
-    if let Ok(data) = sftp.read("/etc/group").await {
+    if let Some(data) = read_whole(&sftp, "/etc/group").await {
         parse_id_db(&data, &mut gid_to_name, &mut name_to_gid);
     }
 
@@ -1645,6 +1645,19 @@ async fn view_task(
     }
 }
 
+/// Le um arquivo remoto inteiro (o /etc/passwd e o /etc/group ao conectar)
+/// e o fecha esperando o CLOSE: o `SftpSession::read` do russh-sftp so solta
+/// o arquivo, sem descontar o handle (ver `download::close_remote`). `None`
+/// se nao deu para ler; num erro de leitura fica so o drop (a conexao pode
+/// ter caido).
+async fn read_whole(sftp: &SftpSession, path: &str) -> Option<Vec<u8>> {
+    let mut file = sftp.open(path.to_string()).await.ok()?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data).await.ok()?;
+    let _ = tokio::time::timeout(download::PROBE_TIMEOUT, file.shutdown()).await;
+    Some(data)
+}
+
 /// Faz o parse de um arquivo no formato `/etc/passwd` ou `/etc/group`
 /// (`nome:x:id:...`) preenchendo os mapas id->nome e nome->id.
 fn parse_id_db(
@@ -2231,6 +2244,9 @@ mod tests {
         fs: Arc<FakeFs>,
         /// Pastas abertas (handle -> ja listou).
         listed: HashMap<String, bool>,
+        /// Anuncia limits@openssh.com com este maximo de handles abertos
+        /// (o OpenSSH anuncia uns mil; o cliente passa a contar os seus).
+        max_handles: Option<u64>,
     }
 
     fn ok_status(id: u32) -> Status {
@@ -2247,6 +2263,47 @@ mod tests {
 
         fn unimplemented(&self) -> StatusCode {
             StatusCode::OpUnsupported
+        }
+
+        fn init(
+            &mut self,
+            _version: u32,
+            _extensions: HashMap<String, String>,
+        ) -> impl Future<Output = Result<russh_sftp::protocol::Version, StatusCode>> + Send {
+            let mut v = russh_sftp::protocol::Version::new();
+            if self.max_handles.is_some() {
+                v.extensions
+                    .insert(russh_sftp::extensions::LIMITS.into(), "1".into());
+            }
+            async move { Ok(v) }
+        }
+
+        fn extended(
+            &mut self,
+            id: u32,
+            request: String,
+            _data: Vec<u8>,
+        ) -> impl Future<Output = Result<russh_sftp::protocol::Packet, StatusCode>> + Send {
+            let max = self.max_handles;
+            async move {
+                match max {
+                    Some(h) if request == russh_sftp::extensions::LIMITS => {
+                        let limits = russh_sftp::extensions::LimitsExtension {
+                            max_packet_len: 0,
+                            max_read_len: 0,
+                            max_write_len: 0,
+                            max_open_handles: h,
+                        };
+                        let data = russh_sftp::ser::to_bytes(&limits)
+                            .map_err(|_| StatusCode::Failure)?
+                            .to_vec();
+                        Ok(russh_sftp::protocol::Packet::ExtendedReply(
+                            russh_sftp::protocol::ExtendedReply { id, data },
+                        ))
+                    }
+                    _ => Err(StatusCode::OpUnsupported),
+                }
+            }
         }
 
         fn opendir(&mut self, id: u32, path: String) -> impl Future<Output = Result<Handle, StatusCode>> + Send {
@@ -2372,10 +2429,16 @@ mod tests {
 
     /// Sessao SFTP ligada a um servidor falso (canal proprio, em memoria).
     async fn fake_session(fs: &Arc<FakeFs>) -> SftpSession {
+        fake_session_with(fs, None).await
+    }
+
+    /// Como `fake_session`, com o limite de handles anunciado pelo servidor.
+    async fn fake_session_with(fs: &Arc<FakeFs>, max_handles: Option<u64>) -> SftpSession {
         let (client, server) = tokio::io::duplex(1 << 20);
         let handler = FakeServer {
             fs: Arc::clone(fs),
             listed: HashMap::new(),
+            max_handles,
         };
         russh_sftp::server::run(server, handler).await;
         start_session(client).await.expect("sessao falsa")
@@ -2664,6 +2727,128 @@ mod tests {
         let r = rt.block_on(fake.session().canonicalize("."));
         assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
         assert!(r.is_err(), "um pedido na sessao falsa respondeu");
+    }
+
+    // --- Handles fechados de verdade -----------------------------------------
+    //
+    // O drop do `File` do russh-sftp manda o CLOSE sem esperar e o crate
+    // nunca desconta esse handle; com o limite que o OpenSSH anuncia
+    // (limits@openssh.com), a sessao parava de abrir arquivos ("handle limit
+    // reached") depois de tantos arquivos soltos assim. O servidor falso
+    // anuncia um limite pequeno e cada teste abre mais arquivos que ele.
+
+    const FEW_HANDLES: u64 = 3;
+
+    /// /n com `text` arquivos de texto e `bin` binarios de 16 KiB (so NUL:
+    /// o visualizador os recusa ja no meio da leitura).
+    fn many_files(text: usize, bin: usize) -> Arc<FakeFs> {
+        let mut fs = FakeFs::default();
+        fs.add("/n", dir_node());
+        for i in 0..text {
+            fs.add(&format!("/n/t{i}.txt"), file_node(format!("texto {i}\n").as_bytes()));
+        }
+        for i in 0..bin {
+            fs.add(&format!("/n/b{i}.bin"), file_node(&[0u8; 16 * 1024]));
+        }
+        Arc::new(fs)
+    }
+
+    fn test_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// Um lote de download maior que o limite de handles baixa tudo.
+    #[test]
+    fn download_closes_every_remote_file() {
+        struct Rm(PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dest = std::env::temp_dir().join(format!("sagu-handles-dl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+        let _rm = Rm(dest.clone());
+        let n = FEW_HANDLES as usize * 2;
+        let report = test_rt().block_on(async {
+            let fs = many_files(n, 0);
+            let s = Arc::new(fake_session_with(&fs, Some(FEW_HANDLES)).await);
+            let items = (0..n)
+                .map(|i| DownloadItem {
+                    remote: format!("/n/t{i}.txt"),
+                    name: format!("t{i}.txt"),
+                    local: format!("t{i}.txt"),
+                    replace: false,
+                })
+                .collect();
+            let (_cancel, rx) = download::cancel_pair();
+            let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+            download::run(s, 1, dest.clone(), items, rx, tx).await;
+            let mut report = None;
+            while let Ok(ev) = events.try_recv() {
+                if let DownloadEvent::Finished(r) = ev {
+                    report = Some(*r);
+                }
+            }
+            report.expect("download sem Finished")
+        });
+        assert!(report.failed.is_empty() && report.fatal.is_none(), "{report:?}");
+        assert_eq!((report.saved, report.files), (n, n), "{report:?}");
+        for i in 0..n {
+            let got = std::fs::read_to_string(dest.join(format!("t{i}.txt"))).unwrap();
+            assert_eq!(got, format!("texto {i}\n"));
+        }
+    }
+
+    /// Abrir no visualizador mais arquivos que o limite (binarios recusados
+    /// no meio da leitura e textos) continua funcionando.
+    #[test]
+    fn viewer_closes_every_remote_file() {
+        test_rt().block_on(async {
+            let n = FEW_HANDLES as usize;
+            let fs = many_files(n + 1, n);
+            let s = Arc::new(fake_session_with(&fs, Some(FEW_HANDLES)).await);
+            let paths = (0..n)
+                .map(|i| format!("/n/b{i}.bin"))
+                .chain((0..=n).map(|i| format!("/n/t{i}.txt")));
+            for (k, p) in paths.enumerate() {
+                let (_cancel, rx) = download::cancel_pair();
+                let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+                viewer::load(Arc::clone(&s), k as u64, p.clone(), rx, tx).await;
+                let result = loop {
+                    match events.try_recv() {
+                        Ok(ViewEvent::Done { result, .. }) => break result,
+                        Ok(_) => continue,
+                        Err(_) => panic!("sem Done para {p}"),
+                    }
+                };
+                if p.ends_with(".bin") {
+                    assert_eq!(result.err(), Some(viewer::ViewError::Binary), "{p}");
+                } else {
+                    assert!(result.is_ok(), "{p}: {:?}", result.err());
+                }
+            }
+        });
+    }
+
+    /// As leituras inteiras ao conectar (/etc/passwd e /etc/group) tambem
+    /// fecham o arquivo.
+    #[test]
+    fn read_whole_closes_the_file() {
+        test_rt().block_on(async {
+            let n = FEW_HANDLES as usize;
+            let fs = many_files(n, 0);
+            let s = fake_session_with(&fs, Some(FEW_HANDLES)).await;
+            for k in 0..n * 2 {
+                let i = k % n;
+                let got = read_whole(&s, &format!("/n/t{i}.txt")).await;
+                assert_eq!(got.as_deref(), Some(format!("texto {i}\n").as_bytes()), "leitura {k}");
+            }
+        });
     }
 
     // --- Ponta a ponta contra um sshd real (ignorados) ---------------------

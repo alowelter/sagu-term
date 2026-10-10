@@ -21,6 +21,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use russh_sftp::client::fs::File;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -704,6 +705,18 @@ pub(crate) async fn unless_cancelled<T>(
     }
 }
 
+/// Fecha um arquivo remoto lido esperando a resposta do CLOSE. O drop do
+/// `File` do russh-sftp so manda o CLOSE, sem esperar, e o crate nunca
+/// desconta esse handle: com o limite que o OpenSSH anuncia
+/// (limits@openssh.com, uns mil handles), a sessao parava de abrir arquivos
+/// ("handle limit reached") depois de tantos arquivos soltos assim. Prazo
+/// curto e o Cancelar valendo; numa conexao caida ou presa fica so o drop
+/// (o CLOSE esperaria atras do pedido preso). Usada tambem pelo colar e
+/// pelo visualizador.
+pub(crate) async fn close_remote(mut file: File, cancel: &mut watch::Receiver<bool>) {
+    let _ = unless_cancelled(cancel, tokio::time::timeout(PROBE_TIMEOUT, file.shutdown())).await;
+}
+
 /// Pastas que falharam na copia, e as de dentro delas. O plano traz cada
 /// pasta antes do seu conteudo, entao basta olhar a pasta-mae: uma consulta
 /// por entrada, mesmo com milhares de subpastas puladas.
@@ -1345,6 +1358,8 @@ impl Job<'_> {
                 break;
             }
             if let Err(err) = out.write_all(&buf[..n]).await {
+                // O servidor esta bem: fecha o handle de verdade antes de parar.
+                close_remote(src, &mut self.cancel).await;
                 return Err(self.local_problem(LocalErr::Io(err)));
             }
             got += n as u64;
@@ -1359,8 +1374,9 @@ impl Job<'_> {
                 });
             }
         }
-        // Fecha o handle remoto sem esperar a resposta (close_nowait).
-        drop(src);
+        // Fecha o handle remoto esperando o CLOSE (ver `close_remote`). Num
+        // cancelamento ou erro de leitura acima fica so o drop.
+        close_remote(src, &mut self.cancel).await;
         if let Err(err) = out.flush().await {
             return Err(self.local_problem(LocalErr::Io(err)));
         }

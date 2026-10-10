@@ -914,6 +914,7 @@ impl Load<'_> {
         let mut size = attrs.size;
         if let Ok(fa) = self.ask(file.metadata()).await? {
             if fa.permissions.is_some() && sftp::raw_kind(fa.permissions) != RawKind::File {
+                download::close_remote(file, &mut self.cancel).await;
                 return fail(ViewError::Special);
             }
             if fa.size.is_some() {
@@ -925,6 +926,7 @@ impl Load<'_> {
         let max = MAX_VIEW_BYTES;
         let mut data: Vec<u8> = Vec::new();
         let mut sniffed = false;
+        let mut binary = false;
         let mut timed_out = false;
         let mut last = std::time::Instant::now();
         while data.len() <= max {
@@ -950,7 +952,8 @@ impl Load<'_> {
             if !sniffed && data.len() >= SNIFF_BYTES {
                 sniffed = true;
                 if sniff(&data) == Sniff::Binary {
-                    return fail(ViewError::Binary);
+                    binary = true;
+                    break;
                 }
             }
             if last.elapsed() >= PROGRESS_EVERY {
@@ -974,9 +977,16 @@ impl Load<'_> {
                 }
             }
         }
-        // Fecha o handle sem esperar a resposta (close_nowait).
-        drop(file);
-        if !sniffed && sniff(&data) == Sniff::Binary {
+        // Fecha o handle esperando o CLOSE (ver `download::close_remote`),
+        // salvo se a leitura estourou o prazo: o CLOSE ficaria atras do
+        // pedido preso (o canal e descartado). Num cancelamento ou erro de
+        // leitura acima fica so o drop.
+        if timed_out {
+            drop(file);
+        } else {
+            download::close_remote(file, &mut self.cancel).await;
+        }
+        if binary || (!sniffed && sniff(&data) == Sniff::Binary) {
             return fail(ViewError::Binary);
         }
         // f) Corte.

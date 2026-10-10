@@ -41,7 +41,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch;
 
 use crate::download::{
-    clip, text_cost, unless_cancelled, ConflictChoice, CHUNK, F_CONNECTION, F_DEST_GONE,
+    clip, close_remote, text_cost, unless_cancelled, ConflictChoice, CHUNK, F_CONNECTION, F_DEST_GONE,
     MAX_DEPTH, MAX_ENTRIES, MAX_REMOTE_MSG, MAX_REMOTE_NAME, MAX_SCAN_BYTES, PROBE_TIMEOUT,
     PROGRESS_EVERY, R_BAD_ENCODING, R_DIR_EXISTS, R_EXISTS, R_FILE_EXISTS, R_INVALID, R_NO_TEMP,
     R_SKIPPED_EXISTING, R_SPECIAL, R_TOO_DEEP, R_TOO_LONG, TEMP_SUFFIX,
@@ -1701,15 +1701,14 @@ impl Job<'_> {
             got += n as u64;
             self.progress(PastePhase::Copying, p.index, p.count, &e.shown, p.done + got, p.total, false);
         };
-        // Fecha a origem de verdade (CLOSE com resposta): o drop so manda o
-        // pedido sem esperar e o russh-sftp nunca desconta esse handle; com
-        // milhares de arquivos o servidor pararia de abrir ("handle limit
-        // reached"). Numa falha ou cancelamento fica so o drop (a conexao
-        // pode ter caido, e o CLOSE esperaria o prazo).
+        // Fecha a origem esperando o CLOSE (ver `download::close_remote`).
+        // Numa falha ou cancelamento fica so o drop (a conexao pode ter
+        // caido, e o CLOSE esperaria o prazo).
         if failure.is_none() {
-            let _ = unless_cancelled(&mut self.cancel, tokio::time::timeout(PROBE_TIMEOUT, src.shutdown())).await;
+            close_remote(src, &mut self.cancel).await;
+        } else {
+            drop(src);
         }
-        drop(src);
         if let Some(step) = failure {
             drop(out);
             self.discard(&tmp).await;
