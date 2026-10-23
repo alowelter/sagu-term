@@ -29,9 +29,10 @@ MIT), mantido por Marcelo Welter ("o desenvolvedor").
   cartão da conexão. Isso pode ser desligado em cada conexão (seções 2 e 4).
 - Com a tela **Monitoramento** aberta, o app executa a cada minuto, em cada servidor
   cadastrado com a detecção do sistema ligada, um comando fixo que só lê o uso de CPU,
-  memória, swap e disco, a carga, o tempo ligado e o número de processos e de CPUs, para
-  mostrá-los na tela. Isso pode ser desligado em cada conexão, e nada disso é gravado
-  (seções 2 e 4).
+  memória, swap, disco e rede, a carga, o tempo ligado e o número de processos e de CPUs,
+  para mostrá-los na tela, e, uma vez por conexão, outro comando fixo que só confere se há
+  um kernel mais novo instalado ou nos repositórios do servidor, sem instalar nada. Isso
+  pode ser desligado em cada conexão, e nada disso é gravado (seções 2 e 4).
 - O app só se conecta aos **servidores que você cadastra**. Ele não acessa a internet por
   conta própria: não procura atualizações e não consulta o GitHub nem nenhum outro servidor
   do desenvolvedor.
@@ -269,22 +270,45 @@ Do servidor, o app lê apenas o necessário para as funções que você usa:
   ou desliga a detecção, aceita ou esquece a chave de um servidor):
 
   ```text
-  echo SAGUMON.load; cat /proc/loadavg; echo SAGUMON.cpus; getconf _NPROCESSORS_ONLN; nproc; echo SAGUMON.mem; cat /proc/meminfo; echo SAGUMON.up; cat /proc/uptime; echo SAGUMON.stat; head -n 1 /proc/stat; sleep 1; head -n 1 /proc/stat; echo SAGUMON.df; env LC_ALL=C timeout -s KILL 5 df -P -k; env LC_ALL=C timeout -t 5 -s KILL df -P -k; echo SAGUMON.end
+  echo SAGUMON.load; cat /proc/loadavg; echo SAGUMON.cpus; getconf _NPROCESSORS_ONLN; nproc; echo SAGUMON.mem; cat /proc/meminfo; echo SAGUMON.up; cat /proc/uptime; echo SAGUMON.stat; head -n 1 /proc/stat; echo SAGUMON.net; cat /proc/net/dev; sleep 1; echo SAGUMON.stat; head -n 1 /proc/stat; echo SAGUMON.up2; cat /proc/uptime; echo SAGUMON.net2; cat /proc/net/dev; echo SAGUMON.nic; ls -l /sys/class/net; echo SAGUMON.df; env LC_ALL=C timeout -s KILL 5 df -P -k; env LC_ALL=C timeout -t 5 -s KILL df -P -k; echo SAGUMON.end
   ```
 
   Esse comando só lê a carga do sistema e o número de processos (`/proc/loadavg`), o
   número de CPUs (`getconf` ou `nproc`), o uso de memória e de swap (`/proc/meminfo`), o
   tempo ligado (`/proc/uptime`), os contadores de uso de CPU (a primeira linha do
-  `/proc/stat`, duas vezes, com 1 segundo entre elas) e o espaço dos sistemas de arquivos
-  montados (`df -P -k`, em inglês por causa do `LC_ALL=C` e encerrado pelo `timeout` se
-  passar de 5 segundos, como num compartilhamento de rede fora do ar; ele aparece duas
-  vezes, uma em cada forma de escrever o `timeout`, e a que o servidor não entende falha
-  na hora, sem rodar o `df`). Os `echo SAGUMON...` só marcam onde começa cada parte da
-  resposta. A resposta não aparece em nenhum terminal; o app lê no máximo 1 MiB dela,
-  mostra os números na tela e guarda só na memória a última leitura (com os contadores de
-  CPU, para calcular o uso médio até a coleta seguinte, e a última lista de discos, para
-  quando o `df` não responder) e o histórico de CPU e memória da última hora, descartados
-  quando você fecha a tela. Nada vai para o cofre nem para o disco. A conexão fica aberta
+  `/proc/stat`) e os contadores de bytes recebidos e enviados por cada interface de rede
+  (`/proc/net/dev`), esses três duas vezes, com 1 segundo entre elas, a lista das
+  interfaces de rede com o dispositivo de cada uma (`ls -l /sys/class/net`, para somar só
+  as placas físicas e não contar duas vezes o tráfego de bridges, contêineres e VPNs) e o
+  espaço dos sistemas de arquivos montados (`df -P -k`, em inglês por causa do `LC_ALL=C`
+  e encerrado pelo `timeout` se passar de 5 segundos, como num compartilhamento de rede
+  fora do ar; ele aparece duas vezes, uma em cada forma de escrever o `timeout`, e a que o
+  servidor não entende falha na hora, sem rodar o `df`). Os `echo SAGUMON...` só marcam
+  onde começa cada parte da resposta. A resposta não aparece em nenhum terminal; o app lê
+  no máximo 1 MiB dela, mostra os números na tela e guarda só na memória a última leitura
+  (com os contadores de CPU e de rede, para calcular o uso e o tráfego médios até a coleta
+  seguinte, e a última lista de discos, para quando o `df` não responder) e o histórico de
+  CPU e memória da última hora, descartados quando você fecha a tela. Nada vai para o
+  cofre nem para o disco.
+
+  Uma vez por conexão, logo depois da primeira coleta (em geral, uma vez por abertura da
+  tela, e de novo se a conexão cair e voltar, como depois de reiniciar o servidor), o app
+  executa também, do mesmo jeito, este outro comando fixo:
+
+  ```text
+  echo SAGUMON.kver; uname -r; echo SAGUMON.kmods; ls /lib/modules; echo SAGUMON.kboot; cat /var/run/reboot-required.pkgs; echo SAGUMON.kpkg; env LC_ALL=C timeout -s KILL 20 dnf -C -q check-update kernel kernel-core kernel-uek; env LC_ALL=C timeout -s KILL 20 apt list --upgradable; echo SAGUMON.end
+  ```
+
+  Ele só lê a versão do kernel em uso (`uname -r`), a lista dos kernels instalados (as
+  pastas de `/lib/modules`) e, se existir, a lista de pacotes que pedem reinicialização
+  (`/var/run/reboot-required.pkgs`, do Debian e do Ubuntu), e pergunta ao gerenciador de
+  pacotes se há um kernel mais novo: o `dnf -C` usa só o cache que o servidor já tem, sem
+  baixar nada, e o `apt list --upgradable` só lê as listas de pacotes já baixadas; cada
+  um é encerrado pelo `timeout` se passar de 20 segundos, e o que não existe no servidor
+  falha na hora. Nada é instalado nem atualizado. A resposta também não aparece em nenhum
+  terminal; o app lê no máximo 1 MiB dela, mostra no cartão se há um kernel mais novo (o
+  ícone do Linux em laranja, com as versões na dica) e guarda isso só na memória até você
+  fechar a tela. A conexão fica aberta
   enquanto a tela estiver aberta e cai quando você a fecha: em geral, um login por
   abertura da tela, não um por minuto. Se a conexão cair, o app conecta de novo na coleta
   seguinte. Se o servidor recusar as credenciais, o app não tenta de novo sozinho, para
@@ -293,11 +317,11 @@ Do servidor, o app lê apenas o necessário para as funções que você usa:
   do servidor ainda não foi confirmada, ou se mudou, o app desiste antes de enviar o
   usuário, a senha ou a assinatura da chave, e o cartão pede que você conecte pelo
   terminal. Em servidores Windows e equipamentos de rede (reconhecidos pela identificação
-  do item anterior), o comando não é executado. Como qualquer comando executado por SSH,
-  ele pode ficar registrado nos logs do servidor, e o servidor pode carregar antes os
-  arquivos de inicialização do seu shell. **Se o servidor força um comando**
+  do item anterior), os comandos não são executados. Como qualquer comando executado por
+  SSH, eles podem ficar registrados nos logs do servidor, e o servidor pode carregar antes
+  os arquivos de inicialização do seu shell. **Se o servidor força um comando**
   (`ForceCommand` no `sshd_config` ou `command="..."` no `authorized_keys`), é esse
-  comando do servidor que roda no lugar do comando acima, a cada coleta, e os scripts
+  comando do servidor que roda no lugar dos comandos acima, a cada coleta, e os scripts
   `~/.ssh/rc` e `/etc/ssh/sshrc`, se existirem, também rodam a cada coleta; nesses
   servidores, desmarque **Detectar o sistema do servidor** (seção 4);
 - ao soltar arquivos num terminal SSH, o app executa nesse servidor, com o seu usuário, um
@@ -352,7 +376,7 @@ você pede, para os servidores que você cadastra.
   da conexão, escolha **Editar**, desmarque **Detectar o sistema do servidor** e clique em
   **Salvar**. O sistema já detectado dessa conexão é apagado, e o cartão volta ao ícone de
   servidor.
-- **Monitoramento:** o comando só roda com a tela **Monitoramento** aberta; feche o painel
+- **Monitoramento:** os comandos só rodam com a tela **Monitoramento** aberta; feche o painel
   para parar as coletas e encerrar as conexões dela. Para deixar um servidor de fora,
   desmarque **Detectar o sistema do servidor** no editor da conexão.
 - **Bloquear o cofre:** `Ctrl+L` na tela de conexões ou o botão **Bloquear cofre**. Com
@@ -446,8 +470,10 @@ Portuguese version prevails.
   connection card. This can be turned off for each connection (sections 2 and 4).
 - While the **Monitoramento** (Monitoring) screen is open, the app runs every minute, on
   each registered server with system detection on, a fixed command that only reads CPU,
-  memory, swap and disk usage, the load, the uptime and the number of processes and CPUs,
-  to show them on screen. This can be turned off for each connection, and none of it is
+  memory, swap, disk and network usage, the load, the uptime and the number of processes
+  and CPUs, to show them on screen, and, once per connection, another fixed command that
+  only checks whether a newer kernel is installed or in the server's repositories, without
+  installing anything. This can be turned off for each connection, and none of it is
   saved (sections 2 and 4).
 - The app only connects to the **servers you register**. It does not access the internet
   on its own: it does not check for updates and does not contact GitHub or any other server
@@ -687,22 +713,45 @@ From the server, the app reads only what the features you use need:
   user, password or key, turn detection on or off, accept or forget a server's key):
 
   ```text
-  echo SAGUMON.load; cat /proc/loadavg; echo SAGUMON.cpus; getconf _NPROCESSORS_ONLN; nproc; echo SAGUMON.mem; cat /proc/meminfo; echo SAGUMON.up; cat /proc/uptime; echo SAGUMON.stat; head -n 1 /proc/stat; sleep 1; head -n 1 /proc/stat; echo SAGUMON.df; env LC_ALL=C timeout -s KILL 5 df -P -k; env LC_ALL=C timeout -t 5 -s KILL df -P -k; echo SAGUMON.end
+  echo SAGUMON.load; cat /proc/loadavg; echo SAGUMON.cpus; getconf _NPROCESSORS_ONLN; nproc; echo SAGUMON.mem; cat /proc/meminfo; echo SAGUMON.up; cat /proc/uptime; echo SAGUMON.stat; head -n 1 /proc/stat; echo SAGUMON.net; cat /proc/net/dev; sleep 1; echo SAGUMON.stat; head -n 1 /proc/stat; echo SAGUMON.up2; cat /proc/uptime; echo SAGUMON.net2; cat /proc/net/dev; echo SAGUMON.nic; ls -l /sys/class/net; echo SAGUMON.df; env LC_ALL=C timeout -s KILL 5 df -P -k; env LC_ALL=C timeout -t 5 -s KILL df -P -k; echo SAGUMON.end
   ```
 
   This command only reads the system load and the number of processes (`/proc/loadavg`),
   the number of CPUs (`getconf` or `nproc`), memory and swap usage (`/proc/meminfo`), the
-  uptime (`/proc/uptime`), the CPU usage counters (the first line of `/proc/stat`, twice,
-  1 second apart) and the space of the mounted file systems (`df -P -k`, in English
-  because of `LC_ALL=C`, and stopped by `timeout` if it takes more than 5 seconds, as with
-  a network share that is down; it appears twice, once in each way of writing `timeout`,
-  and the one the server does not understand fails right away without running `df`). The
-  `echo SAGUMON...` lines only mark where each part of the answer starts. The answer does
-  not appear in any terminal; the app reads at most 1 MiB of it, shows the numbers on
-  screen and keeps, in memory only, the latest reading (with the CPU counters, to compute
-  the average usage until the next collection, and the last list of disks, for when `df`
-  does not answer) and the last hour of CPU and memory history, discarded when you close
-  the screen. Nothing goes to the vault or to disk. The connection stays open while the
+  uptime (`/proc/uptime`), the CPU usage counters (the first line of `/proc/stat`) and the
+  bytes received and sent by each network interface (`/proc/net/dev`), these three twice,
+  1 second apart, the list of network interfaces with the device of each one
+  (`ls -l /sys/class/net`, to add up only the physical cards and not count the traffic of
+  bridges, containers and VPNs twice) and the space of the mounted file systems (`df -P -k`, in
+  English because of `LC_ALL=C`, and stopped by `timeout` if it takes more than 5 seconds,
+  as with a network share that is down; it appears twice, once in each way of writing
+  `timeout`, and the one the server does not understand fails right away without running
+  `df`). The `echo SAGUMON...` lines only mark where each part of the answer starts. The
+  answer does not appear in any terminal; the app reads at most 1 MiB of it, shows the
+  numbers on screen and keeps, in memory only, the latest reading (with the CPU and network
+  counters, to compute the average usage and traffic until the next collection, and the
+  last list of disks, for when `df` does not answer) and the last hour of CPU and memory
+  history, discarded when you close the screen. Nothing goes to the vault or to disk.
+
+  Once per connection, right after the first collection (usually once per opening of the
+  screen, and again if the connection drops and comes back, as after the server restarts),
+  the app also runs, in the same way, this other fixed command:
+
+  ```text
+  echo SAGUMON.kver; uname -r; echo SAGUMON.kmods; ls /lib/modules; echo SAGUMON.kboot; cat /var/run/reboot-required.pkgs; echo SAGUMON.kpkg; env LC_ALL=C timeout -s KILL 20 dnf -C -q check-update kernel kernel-core kernel-uek; env LC_ALL=C timeout -s KILL 20 apt list --upgradable; echo SAGUMON.end
+  ```
+
+  It only reads the running kernel's version (`uname -r`), the list of installed kernels
+  (the folders in `/lib/modules`) and, if present, the list of packages that ask for a
+  restart (`/var/run/reboot-required.pkgs`, on Debian and Ubuntu), and asks the package
+  manager whether there is a newer kernel: `dnf -C` only uses the cache the server already
+  has, without downloading anything, and `apt list --upgradable` only reads the package
+  lists already downloaded; each one is stopped by `timeout` if it takes more than 20
+  seconds, and the one that does not exist on the server fails right away. Nothing is
+  installed or updated. The answer does not appear in any terminal either; the app reads at
+  most 1 MiB of it, shows on the card whether there is a newer kernel (the Linux icon in
+  orange, with the versions in the tooltip) and keeps that in memory only until you close
+  the screen. The connection stays open while the
   screen is open and is closed when you close it: usually one login per opening of the
   screen, not one per minute. If the connection drops, the app connects again at the next
   collection. If the server rejects the credentials, the app does not try again on its
@@ -711,11 +760,11 @@ From the server, the app reads only what the features you use need:
   connection. If the server's key has not been confirmed yet, or has changed, the app gives
   up before sending the user name, the password or the key signature, and the card asks
   you to connect through the terminal. On Windows servers and network devices (recognized
-  by the identification in the previous item) the command is not run. Like any command run
-  over SSH, it may be recorded in the server's logs, and the server may first load your
-  shell's startup files. **If the server forces a command** (`ForceCommand` in
+  by the identification in the previous item) the commands are not run. Like any command
+  run over SSH, they may be recorded in the server's logs, and the server may first load
+  your shell's startup files. **If the server forces a command** (`ForceCommand` in
   `sshd_config` or `command="..."` in `authorized_keys`), that server command runs instead
-  of the command above, at each collection, and the `~/.ssh/rc` and `/etc/ssh/sshrc`
+  of the commands above, at each collection, and the `~/.ssh/rc` and `/etc/ssh/sshrc`
   scripts, if present, also run at each collection; on such servers, uncheck **Detectar o
   sistema do servidor** (Detect the server's system) (section 4);
 - when you drop files onto an SSH terminal, the app runs on that server, as your user, a
@@ -769,7 +818,7 @@ ones you ask for, to the servers you register.
   server, right-click the connection card, choose **Editar** (Edit), uncheck **Detectar o
   sistema do servidor** (Detect the server's system) and click **Salvar** (Save). The system
   already detected for that connection is deleted, and the card goes back to the server icon.
-- **Monitoring:** the command only runs while the **Monitoramento** (Monitoring) screen is
+- **Monitoring:** the commands only run while the **Monitoramento** (Monitoring) screen is
   open; close the pane to stop collecting and close its connections. To leave a server out,
   uncheck **Detectar o sistema do servidor** (Detect the server's system) in the
   connection's editor.

@@ -17,6 +17,10 @@
 //!   bloquear o IP do usuario): so com "Atualizar agora" ou editando o host.
 //! - Tudo o que vem do servidor e hostil: numeros com conta saturada, pontos
 //!   de montagem saneados (`osinfo::clean`) e quantidade limitada.
+//! - Uma vez por conexao, depois da primeira coleta que deu certo, um segundo
+//!   comando constante ([`KERNEL_COMMAND`]) procura um kernel mais novo que o
+//!   em uso: instalado (falta reiniciar) ou nos repositorios, pelo cache que o
+//!   servidor ja tem (sem baixar nada). O resultado vem por `Event::Kernel`.
 //! - Fechar a tela derruba o canal de comandos: a thread termina e as
 //!   conexoes caem junto com as tarefas.
 
@@ -52,11 +56,33 @@ pub const INTERVAL: Duration = Duration::from_secs(60);
 ///   BusyBox antigo, com `-t`): a errada falha na hora, sem rodar o `df`.
 /// - `LC_ALL=C` no `df`: com o servidor em portugues, o cabecalho sairia
 ///   traduzido ("Sist. Arq.").
+/// - Rede: o `/proc/net/dev` dos dois lados do `sleep 1`, cada um com a hora
+///   pelo relogio do servidor (`/proc/uptime`), como a CPU (ver `Carry`). O
+///   `ls -l /sys/class/net` separa as interfaces fisicas das virtuais (lo,
+///   bridge, veth, docker, bond, VLAN, tun), que contariam o mesmo trafego de
+///   novo.
 pub const COMMAND: &str = "echo SAGUMON.load; cat /proc/loadavg; \
 echo SAGUMON.cpus; getconf _NPROCESSORS_ONLN; nproc; echo SAGUMON.mem; cat /proc/meminfo; \
-echo SAGUMON.up; cat /proc/uptime; echo SAGUMON.stat; head -n 1 /proc/stat; sleep 1; \
-head -n 1 /proc/stat; echo SAGUMON.df; env LC_ALL=C timeout -s KILL 5 df -P -k; \
-env LC_ALL=C timeout -t 5 -s KILL df -P -k; echo SAGUMON.end";
+echo SAGUMON.up; cat /proc/uptime; echo SAGUMON.stat; head -n 1 /proc/stat; \
+echo SAGUMON.net; cat /proc/net/dev; sleep 1; echo SAGUMON.stat; head -n 1 /proc/stat; \
+echo SAGUMON.up2; cat /proc/uptime; echo SAGUMON.net2; cat /proc/net/dev; \
+echo SAGUMON.nic; ls -l /sys/class/net; echo SAGUMON.df; \
+env LC_ALL=C timeout -s KILL 5 df -P -k; env LC_ALL=C timeout -t 5 -s KILL df -P -k; \
+echo SAGUMON.end";
+
+/// Verificacao do kernel, uma vez por conexao (mesmas regras do [`COMMAND`]):
+/// - `uname -r` e `/lib/modules` (uma pasta por kernel instalado): um kernel
+///   mais novo instalado que o em uso espera um reboot. Debian e Ubuntu
+///   tambem anotam o pacote do kernel atualizado em
+///   `/var/run/reboot-required.pkgs` (ate com a mesma versao).
+/// - `dnf -C` (so o cache do sistema, sem baixar nada; um usuario comum le o
+///   cache do root) e `apt list --upgradable` (as listas que o servidor ja
+///   tem): kernel mais novo nos repositorios. O que nao existe no servidor
+///   falha na hora; o `timeout` corta um `dnf` preso numa trava do rpm.
+pub const KERNEL_COMMAND: &str = "echo SAGUMON.kver; uname -r; echo SAGUMON.kmods; \
+ls /lib/modules; echo SAGUMON.kboot; cat /var/run/reboot-required.pkgs; echo SAGUMON.kpkg; \
+env LC_ALL=C timeout -s KILL 20 dnf -C -q check-update kernel kernel-core kernel-uek; \
+env LC_ALL=C timeout -s KILL 20 apt list --upgradable; echo SAGUMON.end";
 
 /// Prazo para conectar e autenticar.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -64,6 +90,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Prazo para o comando responder (inclui o `sleep 1` e o prazo do `df`).
 const RUN_TIMEOUT: Duration = Duration::from_secs(15);
+/// Prazo da verificacao do kernel (os dois `timeout` de 20 s e o resto).
+const KERNEL_TIMEOUT: Duration = Duration::from_secs(45);
 /// Saida maior que isto: para de ler e usa o que ja chegou (um no de
 /// Kubernetes lista centenas de montagens de conteineres no `df`).
 const MAX_OUTPUT: usize = 1024 * 1024;
@@ -71,6 +99,18 @@ const MAX_OUTPUT: usize = 1024 * 1024;
 const MAX_DISKS: usize = 32;
 /// Tamanho maximo do nome de um ponto de montagem.
 const MAX_MOUNT: usize = 128;
+/// Interfaces de rede contadas por servidor.
+const MAX_IFACES: usize = 64;
+/// Tamanho maximo do nome de uma interface (o Linux aceita 15).
+const MAX_IFNAME: usize = 32;
+/// Linhas lidas da lista de kernels instalados e da de pacotes com
+/// atualizacao (um `apt list` pode listar milhares).
+const MAX_KERNEL_LINES: usize = 10_000;
+/// Tamanho maximo de uma versao de kernel ou nome de pacote.
+const MAX_RELEASE: usize = 96;
+/// Pacotes do kernel no `dnf` (o `kernel` e so o metapacote, que nem sempre
+/// esta instalado; o UEK e o do Oracle Linux).
+const DNF_KERNELS: [&str; 3] = ["kernel", "kernel-core", "kernel-uek"];
 
 const MARK: &str = "SAGUMON.";
 const END: &[u8] = b"SAGUMON.end";
@@ -158,6 +198,68 @@ impl Disk {
     }
 }
 
+/// Trafego de rede somado das interfaces contadas, em bytes por segundo.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetRate {
+    /// Recebido pelo servidor (download).
+    pub rx: f64,
+    /// Enviado pelo servidor (upload).
+    pub tx: f64,
+    /// Periodo da media, em segundos.
+    pub secs: f64,
+}
+
+/// Uma leitura do `/proc/net/dev`: hora pelo relogio do servidor (segundos
+/// desde o boot) e, por interface contada, os bytes recebidos e enviados.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetReading {
+    pub at: f64,
+    pub ifaces: Vec<(String, u64, u64)>,
+}
+
+/// Trafego entre duas leituras, pelas interfaces presentes nas duas; `None`
+/// se o relogio nao andou ou voltou (reboot), ou se nenhum contador andou
+/// para a frente (contador zerado).
+fn net_between(a: &NetReading, b: &NetReading) -> Option<NetRate> {
+    let secs = b.at - a.at;
+    if secs.is_nan() || secs < 0.2 {
+        return None;
+    }
+    let (mut rx, mut tx, mut n) = (0u64, 0u64, 0usize);
+    for (name, r1, t1) in &b.ifaces {
+        let Some((_, r0, t0)) = a.ifaces.iter().find(|(n0, ..)| n0 == name) else {
+            continue;
+        };
+        if let (Some(dr), Some(dt)) = (r1.checked_sub(*r0), t1.checked_sub(*t0)) {
+            rx = rx.saturating_add(dr);
+            tx = tx.saturating_add(dt);
+            n += 1;
+        }
+    }
+    (n > 0).then(|| NetRate {
+        rx: rx as f64 / secs,
+        tx: tx as f64 / secs,
+        secs,
+    })
+}
+
+/// Resultado da verificacao do kernel (ver [`KERNEL_COMMAND`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KernelCheck {
+    /// Kernel em uso (`uname -r`).
+    pub running: String,
+    /// Kernel mais novo que o em uso ja instalado: falta reiniciar.
+    pub installed: Option<String>,
+    /// Pacote do kernel com versao mais nova nos repositorios (nome e versao).
+    pub available: Option<(String, String)>,
+}
+
+impl KernelCheck {
+    pub fn has_update(&self) -> bool {
+        self.installed.is_some() || self.available.is_some()
+    }
+}
+
 fn pct(part: u64, whole: u64) -> f32 {
     if whole == 0 {
         0.0
@@ -190,6 +292,11 @@ pub struct Sample {
     /// O `df` desta coleta nao respondeu (travado e morto, ou ausente):
     /// `disks` e a leitura anterior (ou vazio, se nunca houve uma).
     pub disks_stale: bool,
+    /// Trafego de rede: media desde a coleta anterior; na primeira (ou
+    /// depois de um reboot), a do ultimo segundo.
+    pub net: Option<NetRate>,
+    /// Ultima leitura dos contadores de rede, para a media da proxima coleta.
+    pub net_counters: Option<NetReading>,
 }
 
 impl Sample {
@@ -328,6 +435,29 @@ pub struct MonitorEvent {
     pub replayed: bool,
 }
 
+/// Verificacao do kernel de um host para a UI (uma por conexao).
+#[derive(Debug)]
+pub struct KernelEvent {
+    pub host_id: uuid::Uuid,
+    /// Como em `MonitorEvent::target`.
+    pub target: Target,
+    /// `None`: o servidor nao respondeu ao comando.
+    pub check: Option<KernelCheck>,
+}
+
+/// O que a tarefa de um host manda para a UI.
+#[derive(Debug)]
+pub enum Event {
+    Sample(MonitorEvent),
+    Kernel(KernelEvent),
+}
+
+impl From<MonitorEvent> for Event {
+    fn from(ev: MonitorEvent) -> Self {
+        Event::Sample(ev)
+    }
+}
+
 /// Pedido de coleta da UI.
 #[derive(Debug)]
 pub struct Request {
@@ -361,7 +491,7 @@ pub fn target(h: &Host) -> Target {
 /// Lado da UI do monitoramento. Soltar o handle encerra a thread e as conexoes.
 pub struct MonitorHandle {
     tx: UnboundedSender<Request>,
-    pub rx: std::sync::mpsc::Receiver<MonitorEvent>,
+    pub rx: std::sync::mpsc::Receiver<Event>,
 }
 
 impl MonitorHandle {
@@ -379,7 +509,7 @@ impl MonitorHandle {
 pub fn test_handle() -> (
     MonitorHandle,
     UnboundedReceiver<Request>,
-    std::sync::mpsc::Sender<MonitorEvent>,
+    std::sync::mpsc::Sender<Event>,
 ) {
     let (tx, cmds) = tokio::sync::mpsc::unbounded_channel();
     let (events, rx) = std::sync::mpsc::channel();
@@ -393,7 +523,7 @@ where
     F: Fn() + Send + Sync + 'static,
 {
     let (tx, cmds) = tokio::sync::mpsc::unbounded_channel::<Request>();
-    let (events, rx) = std::sync::mpsc::channel::<MonitorEvent>();
+    let (events, rx) = std::sync::mpsc::channel::<Event>();
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -418,7 +548,7 @@ type Repaint = Arc<dyn Fn() + Send + Sync>;
 
 async fn run(
     mut cmds: UnboundedReceiver<Request>,
-    events: std::sync::mpsc::Sender<MonitorEvent>,
+    events: std::sync::mpsc::Sender<Event>,
     repaint: Repaint,
 ) {
     let mut tasks: JoinSet<()> = JoinSet::new();
@@ -484,17 +614,21 @@ pub fn same_target(a: &Host, b: &Host) -> bool {
         && a.host_key == b.host_key
 }
 
-/// Laco de um host: uma coleta por aviso da UI, na mesma conexao.
+/// Laco de um host: uma coleta por aviso da UI, na mesma conexao, e a
+/// verificacao do kernel logo depois da primeira coleta que deu certo em
+/// cada conexao (um reboot derruba a conexao: a seguinte verifica de novo).
 async fn watch(
     host: Host,
     mut ticks: UnboundedReceiver<Tick>,
-    events: std::sync::mpsc::Sender<MonitorEvent>,
+    events: std::sync::mpsc::Sender<Event>,
     repaint: Repaint,
 ) {
     let mut conn: Option<client::Handle<Client>> = None;
     // Falha que nao adianta repetir a cada minuto (ver `blocks`).
     let mut blocked: Option<Failure> = None;
     let mut carry = Carry::default();
+    // Conexao aberta ainda sem a verificacao do kernel.
+    let mut kernel_due = false;
     while let Some(mut tick) = ticks.recv().await {
         // Avisos acumulados durante uma coleta lenta valem uma coleta so.
         while let Ok(t) = ticks.try_recv() {
@@ -508,7 +642,12 @@ async fn watch(
             .is_some_and(|f| f.kind == FailKind::Unsupported || !tick.force);
         let result = match &blocked {
             Some(f) if replayed => Err(f.clone()),
-            _ => sample(&host, &mut conn).await,
+            _ => {
+                let fresh = conn.as_ref().is_none_or(|c| c.is_closed());
+                let r = sample(&host, &mut conn).await;
+                kernel_due |= fresh && conn.is_some();
+                r
+            }
         };
         let result = match result {
             // Ja respondeu antes: e um problema passageiro, nao falta de
@@ -527,20 +666,38 @@ async fn watch(
             carry.apply(&mut s);
             s
         });
-        if events
-            .send(MonitorEvent {
-                host_id: host.id,
-                target: target(&host),
-                seq: tick.seq,
-                result,
-                replayed,
-            })
-            .is_err()
-        {
+        let ok = result.is_ok();
+        let ev = MonitorEvent {
+            host_id: host.id,
+            target: target(&host),
+            seq: tick.seq,
+            result,
+            replayed,
+        };
+        if events.send(ev.into()).is_err() {
             break;
         }
         repaint();
+        // Depois de mandar a coleta: o cartao nao espera pelo `dnf`.
+        if let (true, true, Some(session)) = (ok, kernel_due, conn.as_ref()) {
+            kernel_due = false;
+            let ev = KernelEvent {
+                host_id: host.id,
+                target: target(&host),
+                check: check_kernel(session).await,
+            };
+            if events.send(Event::Kernel(ev)).is_err() {
+                break;
+            }
+            repaint();
+        }
     }
+}
+
+/// Roda o [`KERNEL_COMMAND`]; `None` se nada chegou.
+async fn check_kernel(session: &client::Handle<Client>) -> Option<KernelCheck> {
+    let reply = run_command(session, KERNEL_COMMAND, KERNEL_TIMEOUT).await?;
+    parse_kernel(whole_lines(&reply.out, reply.size_cut))
 }
 
 /// Falhas que a tarefa nao repete sozinha: servidor sem suporte (nunca
@@ -588,7 +745,7 @@ async fn sample(
     let Some(session) = conn.as_ref() else {
         return Err(Failure::new(FailKind::Error, NO_ANSWER));
     };
-    let Some(reply) = run_command(session).await else {
+    let Some(reply) = run_command(session, COMMAND, RUN_TIMEOUT).await else {
         // Exec recusado, nada no stdout ou prazo esgotado. A conexao so e
         // refeita se caiu (um login novo por minuto num servidor que nunca
         // responde ao comando encheria o log dele).
@@ -614,6 +771,8 @@ struct Carry {
     ticks: Option<(u64, u64)>,
     /// Discos da ultima coleta em que o `df` respondeu.
     disks: Option<Vec<Disk>>,
+    /// Contadores de rede da coleta anterior.
+    net: Option<NetReading>,
 }
 
 impl Carry {
@@ -621,7 +780,8 @@ impl Carry {
     /// segundo de cada minuto coincidiria com um cron (`* * * * *`) e
     /// acusaria critico a cada coleta, ou nunca o veria. Sem `df` nesta
     /// coleta, os discos da anterior continuam valendo (marcados): sumir com
-    /// eles tiraria o disco da conta da saude.
+    /// eles tiraria o disco da conta da saude. A rede segue a mesma media da
+    /// CPU.
     fn apply(&mut self, s: &mut Sample) {
         self.seen = true;
         if let (Some(prev), Some(cur)) = (self.ticks, s.cpu_ticks) {
@@ -631,6 +791,14 @@ impl Carry {
         }
         if s.cpu_ticks.is_some() {
             self.ticks = s.cpu_ticks;
+        }
+        if let (Some(prev), Some(cur)) = (&self.net, &s.net_counters) {
+            if let Some(r) = net_between(prev, cur) {
+                s.net = Some(r);
+            }
+        }
+        if s.net_counters.is_some() {
+            self.net = s.net_counters.clone();
         }
         if s.disks_stale {
             s.disks = self.disks.clone().unwrap_or_default();
@@ -665,14 +833,19 @@ struct Reply {
     /// Parou de ler por `MAX_OUTPUT`: o que chegou e valido, so incompleto
     /// (diferente de um corte pelo prazo, em que o `df` nao respondeu).
     size_cut: bool,
-    /// Parou pelo prazo (`RUN_TIMEOUT`).
+    /// Parou pelo prazo.
     timed_out: bool,
 }
 
-/// Roda `COMMAND` num canal proprio. Devolve o stdout ate o marcador final,
-/// o fim do canal, o prazo ou `MAX_OUTPUT` (o que vier antes); `None` se o
-/// canal nao abriu, o exec foi recusado ou nada chegou.
-async fn run_command(session: &client::Handle<Client>) -> Option<Reply> {
+/// Roda `command` ([`COMMAND`] ou [`KERNEL_COMMAND`]) num canal proprio.
+/// Devolve o stdout ate o marcador final, o fim do canal, o prazo `limit` ou
+/// `MAX_OUTPUT` (o que vier antes); `None` se o canal nao abriu, o exec foi
+/// recusado ou nada chegou.
+async fn run_command(
+    session: &client::Handle<Client>,
+    command: &str,
+    limit: Duration,
+) -> Option<Reply> {
     let channel = timeout(OPEN_TIMEOUT, session.channel_open_session())
         .await
         .ok()?
@@ -680,8 +853,8 @@ async fn run_command(session: &client::Handle<Client>) -> Option<Reply> {
     let (mut rd, wr) = channel.split();
     let mut out = Vec::new();
     let mut size_cut = false;
-    let done = timeout(RUN_TIMEOUT, async {
-        wr.exec(true, COMMAND).await.ok()?;
+    let done = timeout(limit, async {
+        wr.exec(true, command).await.ok()?;
         // Stdin fechado: um programa que espere entrada recebe EOF e sai.
         wr.eof().await.ok()?;
         loop {
@@ -739,7 +912,18 @@ struct Sections {
     mem: Vec<String>,
     up: Vec<String>,
     stat: Vec<String>,
+    /// `/proc/net/dev` antes e depois do `sleep 1`, e a hora da segunda.
+    net: Vec<String>,
+    up2: Vec<String>,
+    net2: Vec<String>,
+    /// `ls -l /sys/class/net`.
+    nic: Vec<String>,
     df: Vec<String>,
+    // Verificacao do kernel (`KERNEL_COMMAND`).
+    kver: Vec<String>,
+    kmods: Vec<String>,
+    kboot: Vec<String>,
+    kpkg: Vec<String>,
     /// O marcador final chegou (a resposta nao foi cortada pelo prazo).
     end: bool,
 }
@@ -757,7 +941,15 @@ fn split_sections(out: &[u8]) -> Sections {
                 "mem" => Some(&mut s.mem),
                 "up" => Some(&mut s.up),
                 "stat" => Some(&mut s.stat),
+                "net" => Some(&mut s.net),
+                "up2" => Some(&mut s.up2),
+                "net2" => Some(&mut s.net2),
+                "nic" => Some(&mut s.nic),
                 "df" => Some(&mut s.df),
+                "kver" => Some(&mut s.kver),
+                "kmods" => Some(&mut s.kmods),
+                "kboot" => Some(&mut s.kboot),
+                "kpkg" => Some(&mut s.kpkg),
                 "end" => {
                     s.end = true;
                     None
@@ -779,25 +971,37 @@ fn parse_output(out: &[u8]) -> Option<Sample> {
     parse_reply(out, false)
 }
 
-/// Le a saida do `COMMAND`. `None` se nao veio nada reconhecivel (sem load
-/// nem memoria: provavelmente nao e Linux). `size_cut` = a leitura parou por
-/// `MAX_OUTPUT` (a ultima linha, talvez pela metade, e descartada e o resto
-/// vale).
-fn parse_reply(out: &[u8], size_cut: bool) -> Option<Sample> {
-    let out = if size_cut {
+/// Saida cortada por `MAX_OUTPUT` (`size_cut`): sem a ultima linha, talvez
+/// pela metade.
+fn whole_lines(out: &[u8], size_cut: bool) -> &[u8] {
+    if size_cut {
         out.iter()
             .rposition(|&b| b == b'\n')
             .map_or(&out[..0], |i| &out[..=i])
     } else {
         out
-    };
-    let s = split_sections(out);
+    }
+}
+
+/// Le a saida do `COMMAND`. `None` se nao veio nada reconhecivel (sem load
+/// nem memoria: provavelmente nao e Linux). `size_cut` = a leitura parou por
+/// `MAX_OUTPUT` (a ultima linha, talvez pela metade, e descartada e o resto
+/// vale).
+fn parse_reply(out: &[u8], size_cut: bool) -> Option<Sample> {
+    let s = split_sections(whole_lines(out, size_cut));
     let rows = df_rows(&s.df);
     let (load, procs) = parse_loadavg(&s.load);
     let (mem, swap) = parse_meminfo(&s.mem);
     if load.is_none() && mem.is_none() {
         return None;
     }
+    let phys = physical_ifaces(&s.nic);
+    let net0 = net_reading(&s.net, parse_uptime(&s.up), &phys);
+    let net1 = net_reading(&s.net2, parse_uptime(&s.up2), &phys);
+    let net = match (&net0, &net1) {
+        (Some(a), Some(b)) => net_between(a, b),
+        _ => None,
+    };
     Some(Sample {
         load,
         procs,
@@ -810,19 +1014,79 @@ fn parse_reply(out: &[u8], size_cut: bool) -> Option<Sample> {
         cpu_ticks: stat_ticks(&s.stat).last().copied(),
         mem,
         swap,
-        uptime_secs: s.up.first().and_then(|l| {
-            let secs = l.split_whitespace().next()?.parse::<f64>().ok()?;
-            (secs.is_finite() && secs >= 0.0).then_some(secs as u64)
-        }),
+        uptime_secs: parse_uptime(&s.up).map(|secs| secs as u64),
         // Sem o cabecalho do `df` ate o marcador final (ou ate o corte por
         // tamanho), ele nao respondeu.
         disks_stale: !((s.end || size_cut) && rows.is_some()),
         disks: rows.map(parse_df).unwrap_or_default(),
+        net,
+        net_counters: net1.or(net0),
     })
 }
 
 fn finite(v: f32) -> Option<f32> {
     (v.is_finite() && v >= 0.0).then_some(v)
+}
+
+/// `/proc/uptime` (`93784.52 180000.00`): segundos desde o boot.
+fn parse_uptime(lines: &[String]) -> Option<f64> {
+    let secs = lines.first()?.split_whitespace().next()?.parse::<f64>().ok()?;
+    (secs.is_finite() && secs >= 0.0).then_some(secs)
+}
+
+/// Interfaces fisicas pelo `ls -l /sys/class/net`: cada uma e um link para o
+/// dispositivo, e as virtuais (lo, bridge, veth, docker, bond, VLAN, tun,
+/// wireguard) apontam para `devices/virtual`. Contar so as fisicas evita somar
+/// o mesmo trafego duas vezes (a bridge e a placa por baixo dela, o bond e
+/// as placas dele).
+fn physical_ifaces(lines: &[String]) -> Vec<&str> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let (left, dest) = l.split_once(" -> ")?;
+            let name = left.split_whitespace().last()?;
+            (!dest.contains("/virtual/")).then_some(name)
+        })
+        .collect()
+}
+
+/// Uma leitura do `/proc/net/dev` (`  eth0: 1234 56 0 0 0 0 0 0 7890 ...`:
+/// bytes recebidos no 1o numero, enviados no 9o), so com as interfaces de
+/// `phys`. Sem nenhuma fisica (conteiner, em que a placa e um veth; ou sem o
+/// `/sys`), todas menos a `lo`.
+fn net_reading(lines: &[String], at: Option<f64>, phys: &[&str]) -> Option<NetReading> {
+    let at = at?;
+    let mut ifaces: Vec<(String, u64, u64)> = Vec::new();
+    for l in lines {
+        let Some((name, rest)) = l.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let counted = if phys.is_empty() {
+            name != "lo"
+        } else {
+            phys.contains(&name)
+        };
+        if !counted {
+            continue;
+        }
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let num = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok());
+        let (Some(rx), Some(tx)) = (num(0), num(8)) else {
+            continue;
+        };
+        let Some(name) = osinfo::clean(name, MAX_IFNAME) else {
+            continue;
+        };
+        if ifaces.iter().any(|(n, ..)| *n == name) {
+            continue;
+        }
+        ifaces.push((name, rx, tx));
+        if ifaces.len() >= MAX_IFACES {
+            break;
+        }
+    }
+    (!ifaces.is_empty()).then_some(NetReading { at, ifaces })
 }
 
 /// `0.52 0.58 0.59 1/389 12345`.
@@ -961,6 +1225,130 @@ fn parse_df(lines: &[String]) -> Vec<Disk> {
     disks.sort_by(|a, b| b.pct().total_cmp(&a.pct()));
     disks.truncate(MAX_DISKS);
     disks
+}
+
+// ------------------------------------------------------------------ kernel
+
+/// Versao de um kernel (`uname -r`) para comparar: os numeros do comeco
+/// (`4.18.0-553.22.1` em `4.18.0-553.22.1.el8_10.x86_64`) e o "sabor", as
+/// letras do resto (`elx`). So kernels do mesmo sabor se comparam: o de
+/// depuracao (`+debug`), o `-lowlatency` e o do WSL nao sao atualizacao do
+/// kernel em uso, e o numero da versao do RHEL (`el8_9`, `el8_10`) nao conta.
+#[derive(Debug, PartialEq, Eq)]
+struct KernelVer {
+    nums: Vec<u64>,
+    flavor: String,
+}
+
+impl KernelVer {
+    fn parse(release: &str) -> Option<KernelVer> {
+        let mut nums = Vec::new();
+        let mut rest = "";
+        let mut pos = 0;
+        for tok in release.split(['.', '-', '_', '+', '~']) {
+            if tok.is_empty() || !tok.bytes().all(|b| b.is_ascii_digit()) {
+                rest = &release[pos..];
+                break;
+            }
+            nums.push(tok.parse::<u64>().ok()?);
+            pos = (pos + tok.len() + 1).min(release.len());
+        }
+        let flavor = rest
+            .chars()
+            .filter(char::is_ascii_alphabetic)
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        (nums.len() >= 2).then_some(KernelVer { nums, flavor })
+    }
+
+    /// Mesmo sabor e numeros maiores (`4.18.0-553.22.1` > `4.18.0-553`).
+    fn newer_than(&self, other: &KernelVer) -> bool {
+        self.flavor == other.flavor && self.nums > other.nums
+    }
+}
+
+/// Versao ou nome de pacote vindo do servidor: so letras, digitos e
+/// `.-_+~:`, ate `MAX_RELEASE`.
+fn clean_release(s: &str) -> Option<String> {
+    let s = s.trim();
+    let ok = !s.is_empty()
+        && s.len() <= MAX_RELEASE
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_+~:".contains(&b));
+    ok.then(|| s.to_string())
+}
+
+/// Le a saida do `KERNEL_COMMAND`. `None` sem o `uname -r`.
+fn parse_kernel(out: &[u8]) -> Option<KernelCheck> {
+    let s = split_sections(out);
+    let running = s.kver.iter().find_map(|l| clean_release(l))?;
+    let mut check = KernelCheck {
+        running,
+        ..Default::default()
+    };
+    let Some(run) = KernelVer::parse(&check.running) else {
+        return Some(check);
+    };
+    let mods: Vec<&str> = s.kmods.iter().take(MAX_KERNEL_LINES).map(|l| l.trim()).collect();
+    // Sem a pasta do kernel em uso, ele nao e um dos instalados: num
+    // conteiner (LXC, OpenVZ) o kernel e o do hospedeiro, e os pacotes de
+    // kernel la dentro nao sao os que rodam.
+    if !mods.contains(&check.running.as_str()) {
+        return Some(check);
+    }
+    check.installed = mods
+        .iter()
+        .filter_map(|m| Some((KernelVer::parse(m)?, clean_release(m)?)))
+        .filter(|(v, _)| v.newer_than(&run))
+        .max_by(|a, b| a.0.nums.cmp(&b.0.nums))
+        .map(|(_, m)| m);
+    if check.installed.is_none() {
+        // Debian/Ubuntu: `linux-image-6.1.0-13-amd64`, ate com a mesma versao
+        // do em uso (pacote atualizado sem mudar o nome).
+        check.installed = s
+            .kboot
+            .iter()
+            .take(MAX_KERNEL_LINES)
+            .filter_map(|l| l.trim().strip_prefix("linux-image-"))
+            .filter(|r| KernelVer::parse(r).is_some_and(|v| v.flavor == run.flavor && v.nums >= run.nums))
+            .find_map(clean_release);
+    }
+    check.available = parse_pkg_update(&s.kpkg, &run);
+    Some(check)
+}
+
+/// Pacote do kernel com versao nova nos repositorios, pela saida do `dnf
+/// check-update` (`kernel-core.x86_64  4.18.0-553.22.1.el8_10  baseos`, so se
+/// for do sabor do kernel em uso e mais novo que ele) ou do `apt list
+/// --upgradable` (`linux-image-generic/jammy-updates 5.15.0.92.89 amd64
+/// [upgradable from: 5.15.0.91.88]`: a versao do metapacote nao e a do
+/// `uname -r`, nao ha o que comparar).
+fn parse_pkg_update(lines: &[String], run: &KernelVer) -> Option<(String, String)> {
+    for l in lines.iter().take(MAX_KERNEL_LINES) {
+        // dnf: o pacote instalado que um outro torna obsoleto vem recuado.
+        if l.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let (Some(&pkg), Some(ver)) = (f.first(), f.get(1).and_then(|v| clean_release(v))) else {
+            continue;
+        };
+        let found = if let Some((name, arch)) =
+            pkg.rsplit_once('.').filter(|(n, _)| DNF_KERNELS.contains(n))
+        {
+            let release = format!("{}.{arch}", ver.split_once(':').map_or(ver.as_str(), |(_, v)| v));
+            KernelVer::parse(&release)
+                .is_some_and(|v| v.newer_than(run))
+                .then_some(name)
+        } else {
+            pkg.split_once('/')
+                .map(|(name, _)| name)
+                .filter(|name| name.starts_with("linux-image-") && l.contains("[upgradable from"))
+        };
+        if let Some(name) = found.and_then(clean_release) {
+            return Some((name, ver));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1190,6 +1578,217 @@ Filesystem 1024-blocks Used Available Capacity Mounted on\n",
         assert!(s5.disks.is_empty() && s5.disks_stale);
     }
 
+    /// Linha do `/proc/net/dev` com bytes recebidos e enviados.
+    fn dev(name: &str, rx: u64, tx: u64) -> String {
+        format!("{name:>6}: {rx} 10 0 0 0 0 0 0 {tx} 10 0 0 0 0 0 0\n")
+    }
+
+    fn link(name: &str, dest: &str) -> String {
+        format!("lrwxrwxrwx 1 root root 0 Oct 23 06:16 {name} -> ../../devices/{dest}/net/{name}\n")
+    }
+
+    /// Resposta com as duas leituras da rede (`t0`/`t1`: hora de cada uma).
+    fn net_out(t0: &str, a: &[(&str, u64, u64)], t1: &str, b: &[(&str, u64, u64)], nic: &str) -> String {
+        let header = "Inter-|   Receive                                                |  Transmit\n \
+face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo \
+colls carrier compressed\n";
+        let rows = |v: &[(&str, u64, u64)]| v.iter().map(|(n, r, t)| dev(n, *r, *t)).collect::<String>();
+        format!(
+            "SAGUMON.mem\nMemTotal: 1000 kB\nSAGUMON.up\n{t0} 50.00\nSAGUMON.net\n{header}{}\
+SAGUMON.up2\n{t1} 51.00\nSAGUMON.net2\n{header}{}SAGUMON.nic\ntotal 0\n{nic}SAGUMON.end\n",
+            rows(a),
+            rows(b)
+        )
+    }
+
+    /// So as placas fisicas contam: a bridge e o veth do conteiner repetiriam
+    /// o trafego da placa.
+    #[test]
+    fn network_counts_physical_interfaces() {
+        let nic = [
+            link("br0", "virtual"),
+            link("eth0", "pci0000:00/0000:00:03.0/virtio0"),
+            link("lo", "virtual"),
+            link("veth12ab", "virtual"),
+        ]
+        .concat();
+        let out = net_out(
+            "100.00",
+            &[("lo", 5_000, 5_000), ("eth0", 1_000_000, 2_000_000), ("br0", 900_000, 1_900_000), ("veth12ab", 0, 0)],
+            "102.00",
+            &[("lo", 9_000, 9_000), ("eth0", 1_250_000, 2_100_000), ("br0", 1_150_000, 2_000_000), ("veth12ab", 99, 99)],
+            &nic,
+        );
+        let s = parse_output(out.as_bytes()).unwrap();
+        assert_eq!(s.net, Some(NetRate { rx: 125_000.0, tx: 50_000.0, secs: 2.0 }));
+        let c = s.net_counters.unwrap();
+        assert_eq!(c.at, 102.0);
+        assert_eq!(c.ifaces, [("eth0".to_string(), 1_250_000, 2_100_000)]);
+
+        // Conteiner: a placa e um veth (virtual). Contam todas menos a lo.
+        let nic = [link("eth0", "virtual"), link("lo", "virtual")].concat();
+        let out = net_out("10", &[("lo", 0, 0), ("eth0", 0, 0)], "11", &[("lo", 50, 50), ("eth0", 800, 400)], &nic);
+        let s = parse_output(out.as_bytes()).unwrap();
+        assert_eq!(s.net, Some(NetRate { rx: 800.0, tx: 400.0, secs: 1.0 }));
+        // Sem o `ls` (sem /sys): idem.
+        let out = net_out("10", &[("lo", 0, 0), ("eth0", 0, 0)], "11", &[("lo", 50, 50), ("eth0", 800, 400)], "");
+        assert_eq!(parse_output(out.as_bytes()).unwrap().net.unwrap().rx, 800.0);
+
+        // Kernel antigo: numero grudado no nome (`eth0:4294967296`).
+        let lines: Vec<String> = ["Inter-|", "eth0:4294967296 1 0 0 0 0 0 0 7 1 0 0 0 0 0 0"]
+            .map(String::from)
+            .to_vec();
+        let r = net_reading(&lines, Some(1.0), &[]).unwrap();
+        assert_eq!(r.ifaces, [("eth0".to_string(), 4_294_967_296, 7)]);
+        // Sem a hora, sem leitura; sem a 2a leitura, sem trafego.
+        assert_eq!(net_reading(&lines, None, &[]), None);
+        let cut = out.split("SAGUMON.up2").next().unwrap();
+        let s = parse_output(cut.as_bytes()).unwrap();
+        assert_eq!(s.net, None);
+        assert!(s.net_counters.is_some());
+    }
+
+    /// Trafego pela media desde a coleta anterior, como a CPU; contador
+    /// zerado (reboot ou placa recarregada) fica com o do ultimo segundo.
+    #[test]
+    fn network_average_between_collections() {
+        let reading = |at: f64, rx: u64, tx: u64| NetReading {
+            at,
+            ifaces: vec![("eth0".into(), rx, tx)],
+        };
+        let window = NetRate { rx: 1e6, tx: 1e6, secs: 1.0 };
+        let with = |r: NetReading| Sample {
+            net: Some(window.clone()),
+            net_counters: Some(r),
+            ..Default::default()
+        };
+        let mut carry = Carry::default();
+        let mut s1 = with(reading(100.0, 1_000, 2_000));
+        carry.apply(&mut s1);
+        assert_eq!(s1.net, Some(window.clone()));
+        let mut s2 = with(reading(160.0, 61_000, 8_000));
+        carry.apply(&mut s2);
+        assert_eq!(s2.net, Some(NetRate { rx: 1_000.0, tx: 100.0, secs: 60.0 }));
+        // Reboot: o relogio voltou.
+        let mut s3 = with(reading(30.0, 10, 10));
+        carry.apply(&mut s3);
+        assert_eq!(s3.net, Some(window.clone()));
+        // Contador menor que o anterior: tambem nao ha media.
+        let mut s4 = with(reading(90.0, 5, 5));
+        carry.apply(&mut s4);
+        assert_eq!(s4.net, Some(window));
+    }
+
+    #[test]
+    fn kernel_versions_compare_by_flavor() {
+        let v = |r: &str| KernelVer::parse(r).unwrap();
+        assert_eq!(v("4.18.0-553.el8_10.x86_64").nums, [4, 18, 0, 553]);
+        assert_eq!(v("4.18.0-553.el8_10.x86_64").flavor, "elx");
+        assert!(v("4.18.0-553.22.1.el8_10.x86_64").newer_than(&v("4.18.0-553.el8_10.x86_64")));
+        // De uma versao do RHEL para a seguinte (el8_9 -> el8_10).
+        assert!(v("4.18.0-553.el8_10.x86_64").newer_than(&v("4.18.0-513.24.1.el8_9.x86_64")));
+        assert!(!v("4.18.0-553.el8_10.x86_64").newer_than(&v("4.18.0-553.el8_10.x86_64")));
+        assert!(v("5.15.0-92-generic").newer_than(&v("5.15.0-91-generic")));
+        assert!(v("6.5.0-14-generic").newer_than(&v("5.15.0-91-generic")));
+        // Outro sabor: depuracao, lowlatency, cloud, WSL.
+        assert!(!v("4.18.0-553.el8_10.x86_64+debug").newer_than(&v("4.18.0-553.el8_10.x86_64")));
+        assert!(!v("5.15.0-92-lowlatency").newer_than(&v("5.15.0-91-generic")));
+        assert!(!v("6.1.0-15-cloud-amd64").newer_than(&v("6.1.0-13-amd64")));
+        assert!(!v("6.6.87.2-microsoft-standard-WSL2").newer_than(&v("4.18.0-553.el8_10.x86_64")));
+        // Nao e kernel: pasta extra do Arch, lixo, numero enorme.
+        for r in ["extramodules-6.6-arch1", "x", "", "7", "99999999999999999999999.1"] {
+            assert_eq!(KernelVer::parse(r), None, "{r:?}");
+        }
+    }
+
+    fn kernel_out(running: &str, mods: &[&str], boot: &str, pkg: &str) -> String {
+        format!(
+            "SAGUMON.kver\n{running}\nSAGUMON.kmods\n{}\nSAGUMON.kboot\n{boot}SAGUMON.kpkg\n{pkg}\
+SAGUMON.end\n",
+            mods.join("\n")
+        )
+    }
+
+    #[test]
+    fn kernel_installed_waiting_for_reboot() {
+        let run = "4.18.0-553.el8_10.x86_64";
+        let mods = [
+            "4.18.0-513.24.1.el8_9.x86_64",
+            run,
+            "4.18.0-553.22.1.el8_10.x86_64",
+            "4.18.0-553.8.1.el8_10.x86_64",
+            "4.18.0-553.30.1.el8_10.x86_64+debug",
+        ];
+        let c = parse_kernel(kernel_out(run, &mods, "", "").as_bytes()).unwrap();
+        assert_eq!(c.running, run);
+        assert_eq!(c.installed.as_deref(), Some("4.18.0-553.22.1.el8_10.x86_64"));
+        assert_eq!(c.available, None);
+        assert!(c.has_update());
+        // Ja no mais novo: nada a fazer.
+        let c = parse_kernel(kernel_out("4.18.0-553.22.1.el8_10.x86_64", &mods, "", "").as_bytes()).unwrap();
+        assert!(!c.has_update(), "{c:?}");
+        // Conteiner: o kernel em uso (o do hospedeiro) nao esta instalado.
+        let c = parse_kernel(kernel_out("5.14.0-427.el9.x86_64", &mods, "", "").as_bytes()).unwrap();
+        assert!(!c.has_update(), "{c:?}");
+        // WSL: os kernels da distro instalados nao sao do sabor do em uso.
+        let wsl = "6.6.87.2-microsoft-standard-WSL2";
+        let mods = ["4.18.0-553.80.1.el8_10.x86_64", "6.6.87.1-microsoft-standard-WSL2", wsl];
+        let pkg = "kernel-core.x86_64                4.18.0-553.156.1.el8_10                 baseos\n";
+        let c = parse_kernel(kernel_out(wsl, &mods, "", pkg).as_bytes()).unwrap();
+        assert_eq!(c, KernelCheck { running: wsl.into(), ..Default::default() });
+        // Debian: pacote atualizado com o mesmo nome do kernel em uso.
+        let deb = "6.1.0-13-amd64";
+        let boot = "linux-image-6.1.0-13-amd64\nlinux-base\n";
+        let c = parse_kernel(kernel_out(deb, &[deb], boot, "").as_bytes()).unwrap();
+        assert_eq!(c.installed.as_deref(), Some(deb));
+        // ... mas nao um pacote mais velho que o em uso.
+        let boot = "linux-image-6.1.0-12-amd64\n";
+        assert!(!parse_kernel(kernel_out(deb, &[deb], boot, "").as_bytes()).unwrap().has_update());
+    }
+
+    #[test]
+    fn kernel_available_in_repositories() {
+        let run = "4.18.0-553.80.1.el8_10.x86_64";
+        // dnf: o metapacote e o kernel-core; o recuado e o obsoleto.
+        let pkg = "\nkernel.x86_64          4.18.0-553.156.1.el8_10    baseos\n\
+kernel-core.x86_64     4.18.0-553.156.1.el8_10    baseos\n";
+        let c = parse_kernel(kernel_out(run, &[run], "", pkg).as_bytes()).unwrap();
+        assert_eq!(c.available, Some(("kernel".into(), "4.18.0-553.156.1.el8_10".into())));
+        assert_eq!(c.installed, None);
+        // Pacote mais velho que o em uso (ex.: kernel instalado a mao): nao.
+        let old = "kernel-core.x86_64 4.18.0-553.22.1.el8_10 baseos\n    kernel.x86_64 x @anaconda\n";
+        assert_eq!(parse_kernel(kernel_out(run, &[run], "", old).as_bytes()).unwrap().available, None);
+        // Outros pacotes com "kernel" no nome nao contam.
+        let other = "kernel-headers.x86_64 4.18.0-553.156.1.el8_10 baseos\n\
+kernel-tools.x86_64 4.18.0-553.156.1.el8_10 baseos\n";
+        assert_eq!(parse_kernel(kernel_out(run, &[run], "", other).as_bytes()).unwrap().available, None);
+
+        // apt: metapacote do kernel na lista do `apt list --upgradable`.
+        let ub = "5.15.0-91-generic";
+        let pkg = "Listing...\nbash/jammy-updates 5.1-6ubuntu1.1 amd64 [upgradable from: 5.1-6ubuntu1]\n\
+linux-generic/jammy-updates,jammy-security 5.15.0.92.89 amd64 [upgradable from: 5.15.0.91.88]\n\
+linux-image-generic/jammy-updates,jammy-security 5.15.0.92.89 amd64 [upgradable from: 5.15.0.91.88]\n";
+        let c = parse_kernel(kernel_out(ub, &[ub], "", pkg).as_bytes()).unwrap();
+        assert_eq!(c.available, Some(("linux-image-generic".into(), "5.15.0.92.89".into())));
+        // Nada no servidor alem do `uname`: so o kernel em uso.
+        let c = parse_kernel(b"SAGUMON.kver\n5.15.0-91-generic\nSAGUMON.kmods\nSAGUMON.end\n").unwrap();
+        assert_eq!(c, KernelCheck { running: ub.into(), ..Default::default() });
+        assert_eq!(parse_kernel(b"SAGUMON.kver\nSAGUMON.end\n"), None);
+    }
+
+    /// Texto do servidor com controle ou fora do formato de versao some.
+    #[test]
+    fn kernel_hostile_values_are_rejected() {
+        let run = "5.15.0-91-generic";
+        let evil = "5.15.0-99-generic\u{202E}";
+        let c = parse_kernel(kernel_out(run, &[run, evil], "", "").as_bytes()).unwrap();
+        assert_eq!(c.installed, None);
+        let pkg = "linux-image-generic/x 5.15.0.92\u{1b}[31m amd64 [upgradable from: 1]\n";
+        assert_eq!(parse_kernel(kernel_out(run, &[run], "", pkg).as_bytes()).unwrap().available, None);
+        assert_eq!(parse_kernel(b"SAGUMON.kver\nlinux \x1b]0;x\x07\nSAGUMON.end\n"), None);
+        assert_eq!(clean_release(&"9".repeat(MAX_RELEASE + 1)), None);
+    }
+
     #[test]
     fn hostile_values_are_rejected() {
         let out = "SAGUMON.load\nNaN inf -1 x/y\nSAGUMON.stat\ncpu 9 9 9 9\ncpu 1 1 1 1\n\
@@ -1255,20 +1854,29 @@ SAGUMON.mem\nMemTotal: 10 kB\nMemAvailable: 99 kB\nSAGUMON.end\n";
         assert_eq!(level(95.0, 80.0, 90.0), Level::Crit);
     }
 
-    /// A politica de privacidade cita o comando exato (portugues e ingles).
+    /// A politica de privacidade cita os comandos exatos (portugues e ingles).
     #[test]
     fn privacy_policy_quotes_the_command() {
         let policy = include_str!("../PRIVACY.md");
         assert_eq!(policy.matches(COMMAND).count(), 2);
+        assert_eq!(policy.matches(KERNEL_COMMAND).count(), 2);
     }
 
     #[test]
     fn command_is_shell_agnostic() {
-        for c in ['|', '>', '<', '"', '\'', '$', '*', '?', '#', '&', '`', '\n'] {
-            assert!(!COMMAND.contains(c), "{c:?}");
+        for cmd in [COMMAND, KERNEL_COMMAND] {
+            for c in ['|', '>', '<', '"', '\'', '$', '*', '?', '#', '&', '`', '\n'] {
+                assert!(!cmd.contains(c), "{c:?}");
+            }
+            assert!(cmd.ends_with("; echo SAGUMON.end"));
         }
         assert!(COMMAND.contains("env LC_ALL=C timeout -s KILL 5 df -P -k;"));
         assert!(COMMAND.contains("env LC_ALL=C timeout -t 5 -s KILL df -P -k;"));
+        // O `sleep 1` fica entre as duas leituras da CPU e da rede.
+        let (before, after) = COMMAND.split_once("sleep 1;").unwrap();
+        for part in [before, after] {
+            assert!(part.contains("head -n 1 /proc/stat;") && part.contains("cat /proc/net/dev;"));
+        }
     }
 
     #[test]
@@ -1321,8 +1929,14 @@ SAGUMON.mem\nMemTotal: 10 kB\nMemAvailable: 99 kB\nSAGUMON.end\n";
         seen.into_inner().unwrap().unwrap()
     }
 
+    /// Proxima coleta (pula a verificacao do kernel).
     fn next(h: &MonitorHandle) -> MonitorEvent {
-        h.rx.recv_timeout(Duration::from_secs(30)).expect("sem resultado em 30 s")
+        loop {
+            match h.rx.recv_timeout(Duration::from_secs(30)).expect("sem resultado em 30 s") {
+                Event::Sample(ev) => return ev,
+                Event::Kernel(_) => {}
+            }
+        }
     }
 
     #[test]
@@ -1349,7 +1963,11 @@ SAGUMON.mem\nMemTotal: 10 kB\nMemAvailable: 99 kB\nSAGUMON.end\n";
         host.host_key = Some(server_key(&host));
         for seq in 3..5 {
             h.refresh(vec![host.clone()], seq, false);
-            let s = next(&h).result.unwrap();
+            let ev = match h.rx.recv_timeout(Duration::from_secs(30)).expect("sem coleta") {
+                Event::Sample(ev) => ev,
+                Event::Kernel(k) => panic!("kernel antes da coleta: {k:?}"),
+            };
+            let s = ev.result.unwrap();
             assert!(s.load.is_some(), "{s:?}");
             assert!(s.cpus.is_some_and(|c| c > 0), "{s:?}");
             assert!(s.cpu_pct.is_some(), "{s:?}");
@@ -1357,6 +1975,25 @@ SAGUMON.mem\nMemTotal: 10 kB\nMemAvailable: 99 kB\nSAGUMON.end\n";
             assert!(s.mem.is_some_and(|m| m.total_kb > 0), "{s:?}");
             assert!(s.uptime_secs.is_some(), "{s:?}");
             assert!(!s.disks.is_empty(), "{s:?}");
+            let net = s.net.as_ref().expect("sem trafego de rede");
+            assert!(net.rx >= 0.0 && net.tx >= 0.0 && net.secs > 0.5, "{net:?}");
+            assert!(s.net_counters.as_ref().is_some_and(|c| !c.ifaces.is_empty()), "{s:?}");
+            if seq == 3 {
+                // 1a coleta da conexao: a verificacao do kernel vem logo
+                // depois (uma vez so: a 2a coleta nao repete).
+                match h.rx.recv_timeout(Duration::from_secs(60)).expect("sem kernel") {
+                    Event::Kernel(k) => {
+                        assert_eq!(k.host_id, host.id);
+                        let c = k.check.expect("kernel sem resposta");
+                        assert!(KernelVer::parse(&c.running).is_some(), "{c:?}");
+                        eprintln!("SAGU-E2E: kernel {c:?}");
+                    }
+                    Event::Sample(ev) => panic!("coleta no lugar do kernel: {ev:?}"),
+                }
+            } else {
+                // Media desde a coleta anterior (nao a do ultimo segundo).
+                assert!(net.secs > 1.5 && net.secs < 120.0, "{net:?}");
+            }
         }
 
         // Fora da lista: nenhuma coleta.

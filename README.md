@@ -172,8 +172,14 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
 ### Monitoramento
 - O cartão **Monitoramento**, ao lado do Terminal local e do WSL, abre uma tela com um
   cartão por servidor cadastrado: anéis de **CPU** (média desde a coleta anterior),
-  **memória** e do **disco** mais cheio, **load** de 1, 5 e 15 minutos, gráfico de CPU e
+  **memória** e do **disco** mais cheio, **load** de 1, 5 e 15 minutos (o período fica na
+  dica dos números) e, na mesma linha, o **tráfego de rede** enviado e recebido (só as
+  placas físicas, sem contar de novo bridges, contêineres e VPNs), gráfico de CPU e
   memória da última hora, barras dos discos e do swap, tempo ligado e número de processos.
+- Um **Tux laranja** ao lado da situação avisa que há um **kernel mais novo**: já
+  instalado, esperando o servidor reiniciar, ou disponível nos repositórios (pelo cache
+  do `dnf` ou pelas listas do `apt` que o servidor já tem, sem baixar nada). A conferência
+  é feita uma vez por conexão, e a dica mostra as versões.
 - Cada servidor ganha uma situação (**Saudável**, **Atenção** ou **Crítico**) pela pior
   medida, e o topo da tela resume quantos estão em cada uma. A dica do cartão lista o que
   está fora do normal e todos os discos. O load conta pelo menor entre os de 1 e 5
@@ -182,7 +188,8 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
   montado não conta como disco cheio, e um `df` que trava (compartilhamento de rede fora
   do ar) é encerrado em 5 segundos, mantendo os discos da leitura anterior.
 - Atualiza sozinha a cada minuto enquanto estiver aberta (ou na hora, com **Atualizar
-  agora**), usando uma conexão por servidor que fica aberta só enquanto a tela existir.
+  agora**), usando uma conexão por servidor que fica aberta só enquanto a tela existir. Um
+  anel pequeno no topo esvazia até a próxima coleta (o tempo restante fica na dica).
   Trocar o endereço, a porta, o usuário, a senha ou a chave de uma conexão, ou aceitar a
   chave do servidor no terminal, já dispara uma coleta. Se o servidor recusar as
   credenciais, o monitoramento não tenta de novo sozinho (para não acumular tentativas de
@@ -442,15 +449,17 @@ cor de cada marca.
 | Fedora (logotipo) | Red Hat, Inc. (projeto Fedora) | [Diretrizes da marca Fedora](https://docs.fedoraproject.org/en-US/project/brand/) | [docs.fedoraproject.org](https://docs.fedoraproject.org/en-US/project/brand/) |
 
 Os demais ícones (AlmaLinux, Alpine Linux, Apple, Arch Linux, CentOS, elementary, EndeavourOS,
-FreeBSD, Linux Mint, Manjaro, openSUSE, OpenWrt, Pop!_OS, Raspberry Pi, Red Hat, Slackware, SUSE,
-Ubuntu, Void Linux e Zorin) não têm licença específica registrada no Simple Icons.
+FreeBSD, Linux (o Tux, que no monitoramento avisa de kernel novo), Linux Mint, Manjaro, openSUSE,
+OpenWrt, Pop!_OS, Raspberry Pi, Red Hat, Slackware, SUSE, Ubuntu, Void Linux e Zorin) não têm
+licença específica registrada no Simple Icons.
 
 Todos os nomes e logotipos são marcas de seus respectivos donos e aparecem aqui apenas para
 identificar o sistema do servidor. O SaguTerm não tem vínculo com esses projetos e empresas
 nem é endossado por eles. Entre outras: Debian é marca registrada da Software in the Public
 Interest, Inc.; Devuan é marca registrada da Dyne.org Foundation; Gentoo é marca da Gentoo
 Foundation, Inc. e do Förderverein Gentoo e.V.; Rocky Linux é marca da Rocky Enterprise
-Software Foundation; Fedora e o logotipo do infinito são marcas da Red Hat, Inc.
+Software Foundation; Fedora e o logotipo do infinito são marcas da Red Hat, Inc.; Linux é
+marca registrada de Linus Torvalds.
 
 ## 📄 Licença
 

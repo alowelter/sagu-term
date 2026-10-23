@@ -4731,6 +4731,11 @@ const ICON_PLUS: egui::ImageSource = egui::include_image!("../assets/plus.svg");
 const ICON_KEY: egui::ImageSource = egui::include_image!("../assets/key-round.svg");
 const ICON_PASSWORD: egui::ImageSource =
     egui::include_image!("../assets/rectangle-ellipsis.svg");
+const ICON_ARROW_UP: egui::ImageSource = egui::include_image!("../assets/arrow-up.svg");
+const ICON_ARROW_DOWN: egui::ImageSource = egui::include_image!("../assets/arrow-down.svg");
+/// Tux do Simple Icons (como os de `OS_ICONS`, que nao o usam): kernel novo
+/// no cartao do monitoramento.
+const ICON_LINUX: egui::ImageSource = egui::include_image!("../assets/os/linux.svg");
 
 /// Icones dos sistemas operacionais (slug de `osinfo::icon_slug`, imagem e
 /// cor), para o badge do cartao do host. Vem do Simple Icons 16.33.0 (creditos
@@ -10427,11 +10432,20 @@ const GAUGE_TRACK: egui::Color32 = hex("#2f2f36");
 /// Series do grafico de historico.
 const SERIES_CPU: egui::Color32 = hex("#7aa2f7");
 const SERIES_MEM: egui::Color32 = hex("#c099ff");
+/// Tux laranja: kernel mais novo instalado ou disponivel.
+const KERNEL_FG: egui::Color32 = hex("#f5913e");
+/// Lado do Tux no cabecalho do cartao.
+const KERNEL_ICON: f32 = 16.0;
+/// Lado das setas do trafego de rede.
+const MON_ARROW: f32 = 11.0;
+/// Diametro da contagem para a proxima coleta (e do spinner da coleta).
+const COUNTDOWN_SIZE: f32 = 14.0;
 
 fn monitor_hint() -> Vec<String> {
     vec![
         MONITOR_TITLE.to_string(),
-        "CPU, memória, disco e load de cada servidor, atualizados a cada minuto".to_string(),
+        "CPU, memória, disco, rede e load de cada servidor, atualizados a cada minuto"
+            .to_string(),
         LOCAL_HINT_USE.to_string(),
     ]
 }
@@ -10473,6 +10487,9 @@ struct HostWatch {
     /// Hora, CPU e memoria (%) das coletas da ultima hora, da mais antiga a
     /// mais nova.
     history: std::collections::VecDeque<(Instant, [f32; 2])>,
+    /// Verificacao do kernel da conexao atual (`None`: ainda nao veio ou o
+    /// servidor nao respondeu).
+    kernel: Option<monitor::KernelCheck>,
 }
 
 impl MonitorUi {
@@ -10491,7 +10508,10 @@ impl MonitorUi {
     /// com a deteccao do SO ligada). Devolve quanto falta para a proxima.
     fn tick(&mut self, hosts: &[Host]) -> std::time::Duration {
         while let Ok(ev) = self.handle.rx.try_recv() {
-            self.apply(ev);
+            match ev {
+                monitor::Event::Sample(ev) => self.apply(ev),
+                monitor::Event::Kernel(k) => self.apply_kernel(k),
+            }
         }
         let now = Instant::now();
         let on: Vec<&Host> = hosts.iter().filter(|h| h.detect_os).collect();
@@ -10585,6 +10605,18 @@ impl MonitorUi {
                 w.error = None;
             }
             Err(e) => w.error = Some(e),
+        }
+    }
+
+    /// Verificacao do kernel de uma conexao nova (a primeira ou uma que
+    /// reconectou, como depois de um reboot): substitui a anterior.
+    fn apply_kernel(&mut self, ev: monitor::KernelEvent) {
+        if let Some(w) = self
+            .hosts
+            .get_mut(&ev.host_id)
+            .filter(|w| w.target.as_ref() == Some(&ev.target))
+        {
+            w.kernel = ev.check;
         }
     }
 }
@@ -10701,6 +10733,33 @@ fn fmt_load(v: f32) -> String {
     format!("{v:.2}").replace('.', ",")
 }
 
+/// Numero com uma casa abaixo de 10 e sem casas dai em diante, e a unidade
+/// da escala (de 1000 em 1000) em que ele cabe.
+fn fmt_scaled(v: f64, units: [&str; 4]) -> String {
+    let (mut v, mut i) = (v.max(0.0), 0);
+    while v >= 999.5 && i + 1 < units.len() {
+        v /= 1000.0;
+        i += 1;
+    }
+    let n = if i > 0 && v < 9.95 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.0}")
+    };
+    format!("{} {}", n.replace('.', ","), units[i])
+}
+
+/// Velocidade de rede em bits por segundo, como nos testes de velocidade e
+/// no Gerenciador de Tarefas: "0 bps", "350 kbps", "12,3 Mbps", "1,2 Gbps".
+fn fmt_bitrate(bytes_per_sec: f64) -> String {
+    fmt_scaled(bytes_per_sec * 8.0, ["bps", "kbps", "Mbps", "Gbps"])
+}
+
+/// A mesma velocidade em bytes por segundo (para a dica): "1,5 MB/s".
+fn fmt_byterate(bytes_per_sec: f64) -> String {
+    fmt_scaled(bytes_per_sec, ["B/s", "KB/s", "MB/s", "GB/s"])
+}
+
 /// Texto numa linha, cortado com "…" na largura dada.
 fn mon_galley(
     ui: &egui::Ui,
@@ -10718,22 +10777,61 @@ fn mon_galley(
     ui.fonts(|f| f.layout_job(job))
 }
 
+/// Pontos de um arco de circulo entre duas fracoes da volta (0 = topo, no
+/// sentido horario); vazio se `to <= from`.
+fn arc_points(c: egui::Pos2, r: f32, from: f32, to: f32) -> Vec<egui::Pos2> {
+    let (from, to) = (from.clamp(0.0, 1.0), to.clamp(0.0, 1.0));
+    if to <= from {
+        return Vec::new();
+    }
+    let n = (((to - from) * 72.0).ceil() as usize).max(2);
+    (0..=n)
+        .map(|i| {
+            let t = from + (to - from) * i as f32 / n as f32;
+            let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * t;
+            c + r * egui::vec2(a.cos(), a.sin())
+        })
+        .collect()
+}
+
 /// Anel de 0 a 100% comecando no topo, no sentido horario.
 fn mon_ring(painter: &egui::Painter, c: egui::Pos2, r: f32, frac: f32, color: egui::Color32) {
     let stroke = 7.0;
     painter.circle_stroke(c, r, egui::Stroke::new(stroke, GAUGE_TRACK));
-    let frac = frac.clamp(0.0, 1.0);
-    if frac <= 0.0 {
+    let pts = arc_points(c, r, 0.0, frac);
+    if !pts.is_empty() {
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(stroke, color)));
+    }
+}
+
+/// Contagem para a proxima coleta, no lugar de "Proxima atualizacao em N s":
+/// um anel cheio que vai esvaziando no sentido do relogio (a parte que falta
+/// vai do ponteiro ao topo) ate a coleta, quando vira um spinner; com a
+/// coleta pronta, volta cheio. O tempo fica na dica.
+fn monitor_countdown(ui: &mut egui::Ui, collecting: bool, left: std::time::Duration) {
+    if collecting {
+        // Na cor do anel: o mesmo elemento, girando.
+        ui.add(egui::Spinner::new().size(COUNTDOWN_SIZE).color(ACCENT))
+            .on_hover_text("Coletando os dados agora");
         return;
     }
-    let n = ((frac * 72.0).ceil() as usize).max(2);
-    let pts: Vec<egui::Pos2> = (0..=n)
-        .map(|i| {
-            let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * frac * i as f32 / n as f32;
-            c + r * egui::vec2(a.cos(), a.sin())
-        })
-        .collect();
-    painter.add(egui::Shape::line(pts, egui::Stroke::new(stroke, color)));
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::Vec2::splat(COUNTDOWN_SIZE), egui::Sense::hover());
+    let painter = ui.painter();
+    let (c, r) = (rect.center(), COUNTDOWN_SIZE / 2.0 - 1.5);
+    let stroke = 2.5;
+    painter.circle_stroke(c, r, egui::Stroke::new(stroke, GAUGE_TRACK));
+    let pts = arc_points(c, r, 1.0 - countdown_frac(left), 1.0);
+    if !pts.is_empty() {
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(stroke, ACCENT)));
+    }
+    let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    resp.on_hover_text(format!("Próxima atualização em {secs} s"));
+}
+
+/// Fracao do intervalo que ainda falta ate a proxima coleta (1 = cheio).
+fn countdown_frac(left: std::time::Duration) -> f32 {
+    (left.as_secs_f32() / monitor::INTERVAL.as_secs_f32()).clamp(0.0, 1.0)
 }
 
 /// Barra horizontal fina de 0 a 100%.
@@ -10842,6 +10940,9 @@ fn monitor_card_hint(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
         for (a, l) in alerts {
             ui.label(egui::RichText::new(a).color(level_color(l)));
         }
+        if let Some(text) = w.kernel.as_ref().and_then(kernel_summary) {
+            ui.label(egui::RichText::new(text).color(KERNEL_FG));
+        }
         if let Some(m) = s.mem {
             ui.label(
                 egui::RichText::new(format!(
@@ -10947,8 +11048,24 @@ fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
     );
     painter.galley(pill.center() - pill_g.size() / 2.0, pill_g, pill_color);
 
+    // Kernel novo (instalado ou nos repositorios): o Tux laranja antes da
+    // situacao, com o detalhe na dica.
+    let kernel = w.and_then(|w| w.kernel.as_ref()).filter(|k| k.has_update());
+    let kernel_rect = kernel.map(|_| {
+        egui::Rect::from_min_size(
+            egui::pos2(pill.left() - 6.0 - KERNEL_ICON, pill.center().y - KERNEL_ICON / 2.0),
+            egui::Vec2::splat(KERNEL_ICON),
+        )
+    });
+    if let Some(r) = kernel_rect {
+        egui::Image::new(ICON_LINUX).tint(KERNEL_FG).paint_at(ui, r);
+    }
+    // Dica de cada parte do cartao (ver `CardSpot`).
+    let pointer = resp.hover_pos();
+    let over = |r: Option<egui::Rect>| r.zip(pointer).is_some_and(|(r, p)| r.expand(2.0).contains(p));
+
     let name_x = badge.right() + 10.0;
-    let name_w = pill.left() - 8.0 - name_x;
+    let name_w = kernel_rect.map_or(pill.left(), |r| r.left()) - 8.0 - name_x;
     painter.galley(
         egui::pos2(name_x, inner.top()),
         mon_galley(ui, &display_name(host), 14.0, egui::Color32::WHITE, name_w),
@@ -10989,7 +11106,8 @@ fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
                 egui::Spinner::new().size(20.0).paint_at(ui, spin);
             }
         }
-        resp.on_hover_ui_at_pointer(|ui| monitor_card_hint(ui, host, w));
+        let spot = if over(kernel_rect) { CardSpot::Kernel } else { CardSpot::Card };
+        card_tooltip(resp, spot, host, w);
         return;
     };
 
@@ -11039,9 +11157,34 @@ fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
     // cor da mesma regra da situacao do cartao (`Sample::load_level`): pintar
     // cada media pela propria carga deixava o de 5 e o de 15 min vermelhos
     // por varios minutos depois de o problema acabar, com o cartao ja normal.
+    // Quais medias sao (1, 5 e 15 min) fica na dica dos numeros.
     let load_y = top + 106.0;
-    let mut job = egui::text::LayoutJob::default();
     let font = egui::FontId::proportional(12.0);
+    let line_c = load_y + ui.fonts(|f| f.row_height(&font)) / 2.0;
+
+    // --- Na mesma linha, a direita: o trafego de rede, enviado (seta para
+    // cima) e recebido (para baixo), desenhado da direita para a esquerda.
+    let net_rect = s.net.as_ref().map(|n| {
+        let mut x = inner.right();
+        for (icon, bps) in [(ICON_ARROW_DOWN, n.rx), (ICON_ARROW_UP, n.tx)] {
+            let g = mon_galley(ui, &fmt_bitrate(bps), 11.0, CARD_TEXT, 90.0);
+            x -= g.size().x;
+            painter.galley(egui::pos2(x, line_c - g.size().y / 2.0), g, CARD_TEXT);
+            x -= 2.0 + MON_ARROW;
+            let arrow = egui::Rect::from_min_size(
+                egui::pos2(x, line_c - MON_ARROW / 2.0),
+                egui::Vec2::splat(MON_ARROW),
+            );
+            egui::Image::new(icon).tint(TEXT_WEAK).paint_at(ui, arrow);
+            x -= 8.0;
+        }
+        egui::Rect::from_min_max(
+            egui::pos2(x + 8.0, line_c - 8.0),
+            egui::pos2(inner.right(), line_c + 8.0),
+        )
+    });
+
+    let mut job = egui::text::LayoutJob::default();
     let push = |job: &mut egui::text::LayoutJob, t: &str, color: egui::Color32| {
         job.append(t, 0.0, egui::TextFormat::simple(font.clone(), color));
     };
@@ -11054,19 +11197,26 @@ fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
                     push(&mut job, "  ", TEXT_WEAK);
                 }
             }
-            push(&mut job, "   (1, 5 e 15 min)", TEXT_WEAK);
         }
         None => push(&mut job, "\u{2014}", TEXT_WEAK),
     }
     let dot_x = inner.left() + 4.0;
-    job.wrap = egui::text::TextWrapping::truncate_at_width(inner.width() - 14.0);
+    let load_x = inner.left() + 14.0;
+    let load_end = net_rect.map_or(inner.right(), |r| r.left() - 10.0);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(load_end - load_x);
     let g = ui.fonts(|f| f.layout_job(job));
     let dot_color = match (s.load, s.cpus.filter(|&c| c > 0)) {
         (Some(_), Some(_)) => level_color(s.load_level()),
         _ => TEXT_WEAK,
     };
     painter.circle_filled(egui::pos2(dot_x, load_y + g.size().y / 2.0), 3.5, dot_color);
-    painter.galley(egui::pos2(inner.left() + 14.0, load_y), g, CARD_TEXT);
+    let load_rect = s.load.map(|_| {
+        egui::Rect::from_min_size(
+            egui::pos2(inner.left(), load_y),
+            egui::vec2(load_x - inner.left() + g.size().x, g.size().y),
+        )
+    });
+    painter.galley(egui::pos2(load_x, load_y), g, CARD_TEXT);
 
     // --- Historico da ultima hora.
     let legend_y = top + 128.0;
@@ -11146,9 +11296,130 @@ fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
         color,
     );
 
-    // Junto ao ponteiro: ancorada no cartao (quase 350 px de altura), a dica
-    // abriria embaixo dele, longe do nome.
-    resp.on_hover_ui_at_pointer(|ui| monitor_card_hint(ui, host, w));
+    let spot = if over(kernel_rect) {
+        CardSpot::Kernel
+    } else if over(load_rect) {
+        CardSpot::Load
+    } else if over(net_rect) {
+        CardSpot::Net
+    } else {
+        CardSpot::Card
+    };
+    card_tooltip(resp, spot, host, w);
+}
+
+/// Parte do cartao de monitoramento sob o ponteiro: cada uma tem a sua dica.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardSpot {
+    Card,
+    /// O Tux do kernel novo.
+    Kernel,
+    /// Os numeros do load.
+    Load,
+    /// O trafego de rede.
+    Net,
+}
+
+/// Dica do cartao, conforme a parte sob o ponteiro. Uma dica so (a do
+/// cartao inteiro), com o conteudo trocado: passar do cartao para o Tux nao
+/// fecha uma e espera a outra abrir. Junto ao ponteiro: ancorada no cartao
+/// (quase 350 px de altura), a dica abriria embaixo dele, longe do nome.
+fn card_tooltip(resp: egui::Response, spot: CardSpot, host: &Host, w: Option<&HostWatch>) {
+    let sample = w.and_then(|w| w.last.as_ref());
+    resp.on_hover_ui_at_pointer(|ui| match (spot, sample) {
+        (CardSpot::Kernel, _) => {
+            if let Some(k) = w.and_then(|w| w.kernel.as_ref()) {
+                kernel_hint(ui, k);
+            }
+        }
+        (CardSpot::Load, Some(s)) => load_hint(ui, s),
+        (CardSpot::Net, Some(s)) => net_hint(ui, s),
+        _ => monitor_card_hint(ui, host, w),
+    });
+}
+
+/// Resumo do kernel para a dica do cartao.
+fn kernel_summary(k: &monitor::KernelCheck) -> Option<&'static str> {
+    if k.installed.is_some() {
+        Some("Kernel novo instalado: falta reiniciar o servidor")
+    } else if k.available.is_some() {
+        Some("Atualização do kernel disponível")
+    } else {
+        None
+    }
+}
+
+/// Dica do Tux: o kernel novo e o em uso.
+fn kernel_hint(ui: &mut egui::Ui, k: &monitor::KernelCheck) {
+    ui.label(egui::RichText::new("Atualização do kernel").strong().color(KERNEL_FG));
+    if let Some((pkg, ver)) = &k.available {
+        ui.label(
+            egui::RichText::new(format!("Disponível nos repositórios: {pkg} {ver}")).color(CARD_TEXT),
+        );
+    }
+    if let Some(v) = &k.installed {
+        ui.label(
+            egui::RichText::new(format!("Já instalado: {v}. Reinicie o servidor para usá-lo."))
+                .color(CARD_TEXT),
+        );
+    }
+    ui.label(egui::RichText::new(format!("Em uso: {}", k.running)).color(TEXT_WEAK));
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(
+            "Verificado ao conectar, pela lista de pacotes que o servidor já tem (sem baixá-la).",
+        )
+        .small()
+        .color(TEXT_WEAK),
+    );
+}
+
+/// Dica dos numeros do load.
+fn load_hint(ui: &mut egui::Ui, s: &monitor::Sample) {
+    ui.label(egui::RichText::new("Load de 1, 5 e 15 min").color(CARD_TEXT));
+    let cpus = s.cpus.map_or(String::new(), |c| format!(", para {c} CPU(s)"));
+    ui.label(
+        egui::RichText::new(format!(
+            "Média de processos rodando ou esperando CPU ou disco{cpus}"
+        ))
+        .color(TEXT_WEAK),
+    );
+}
+
+/// Dica do trafego de rede: as duas direcoes em bits e bytes por segundo,
+/// as interfaces contadas e o periodo da media.
+fn net_hint(ui: &mut egui::Ui, s: &monitor::Sample) {
+    let Some(n) = &s.net else {
+        return;
+    };
+    ui.label(egui::RichText::new("Tráfego de rede do servidor").color(CARD_TEXT));
+    for (icon, label, bps) in [
+        (ICON_ARROW_UP, "Enviado (upload)", n.tx),
+        (ICON_ARROW_DOWN, "Recebido (download)", n.rx),
+    ] {
+        ui.horizontal(|ui| {
+            ui.add(egui::Image::new(icon).tint(TEXT_WEAK).fit_to_exact_size(egui::Vec2::splat(MON_ARROW)));
+            ui.label(
+                egui::RichText::new(format!("{label}: {} ({})", fmt_bitrate(bps), fmt_byterate(bps)))
+                    .color(CARD_TEXT),
+            );
+        });
+    }
+    if let Some(c) = &s.net_counters {
+        let names: Vec<&str> = c.ifaces.iter().take(6).map(|(n, ..)| n.as_str()).collect();
+        let more = c.ifaces.len().saturating_sub(names.len());
+        let mut text = format!("Interfaces: {}", names.join(", "));
+        if more > 0 {
+            text.push_str(&format!(" e mais {more}"));
+        }
+        ui.label(egui::RichText::new(text).color(TEXT_WEAK));
+    }
+    let period = if n.secs < 2.0 {
+        "Média do último segundo".to_string()
+    } else {
+        format!("Média dos últimos {} s", n.secs.round() as u64)
+    };
+    ui.label(egui::RichText::new(period).small().color(TEXT_WEAK));
 }
 
 /// Contagem de hosts por situacao no topo da tela de monitoramento.
@@ -11204,17 +11475,7 @@ fn monitor_controls(ui: &mut egui::Ui, mon: &mut MonitorUi, left: std::time::Dur
             ui.ctx().request_repaint();
         }
         ui.add_space(8.0);
-        if mon.collecting() {
-            ui.label(egui::RichText::new("Coletando...").small().color(TEXT_WEAK));
-            ui.add(egui::Spinner::new().size(12.0));
-        } else {
-            let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
-            ui.label(
-                egui::RichText::new(format!("Próxima atualização em {secs} s"))
-                    .small()
-                    .color(TEXT_WEAK),
-            );
-        }
+        monitor_countdown(ui, mon.collecting(), left);
     });
 }
 
@@ -11355,8 +11616,8 @@ mod monitor_ui_tests {
         let req = sent.try_recv().unwrap();
         assert_eq!((req.hosts.len(), req.seq, req.force), (2, 1, false));
         assert!(mon.collecting());
-        events.send(ok_event(&a, 99.0, 1)).unwrap();
-        events.send(ok_event(&b, 10.0, 1)).unwrap();
+        events.send(ok_event(&a, 99.0, 1).into()).unwrap();
+        events.send(ok_event(&b, 10.0, 1).into()).unwrap();
         mon.tick(&hosts);
         assert!(!mon.collecting());
         assert!(sent.try_recv().is_err(), "coletou de novo antes do minuto");
@@ -11371,10 +11632,10 @@ mod monitor_ui_tests {
         assert!(st(&mon, &a) == MonState::Waiting);
         assert_eq!(sent.try_recv().unwrap().seq, 2);
         // Resultado atrasado do servidor antigo: descartado.
-        events.send(ok_event(&old, 99.0, 2)).unwrap();
+        events.send(ok_event(&old, 99.0, 2).into()).unwrap();
         mon.tick(&hosts);
         assert!(mon.hosts[&a.id].last.is_none());
-        events.send(ok_event(&a, 5.0, 2)).unwrap();
+        events.send(ok_event(&a, 5.0, 2).into()).unwrap();
         mon.tick(&hosts);
         assert!(st(&mon, &a) == MonState::Level(monitor::Level::Ok));
 
@@ -11413,11 +11674,11 @@ mod monitor_ui_tests {
         mon.tick(&hosts);
         let req = sent.try_recv().unwrap();
         assert_eq!((req.seq, req.force), (seq + 1, true));
-        events.send(ok_event(&hosts[0], 77.0, seq)).unwrap();
+        events.send(ok_event(&hosts[0], 77.0, seq).into()).unwrap();
         mon.tick(&hosts);
         assert!(mon.hosts[&a.id].pending);
         assert!(mon.hosts[&a.id].last.as_ref().unwrap().cpu_pct != Some(77.0));
-        events.send(ok_event(&hosts[0], 12.0, seq + 1)).unwrap();
+        events.send(ok_event(&hosts[0], 12.0, seq + 1).into()).unwrap();
         mon.tick(&hosts);
         assert!(!mon.hosts[&a.id].pending);
         assert_eq!(mon.hosts[&a.id].last.as_ref().unwrap().cpu_pct, Some(12.0));
@@ -11437,14 +11698,14 @@ mod monitor_ui_tests {
             result: Err(fail.clone()),
             replayed,
         };
-        events.send(ev(req.seq, false)).unwrap();
+        events.send(ev(req.seq, false).into()).unwrap();
         mon.tick(&hosts);
         let at = mon.hosts[&a.id].at;
         assert!(st(&mon, &a) == MonState::Failed);
         mon.next_at = Instant::now();
         mon.tick(&hosts);
         let seq = sent.try_recv().unwrap().seq;
-        events.send(ev(seq, true)).unwrap();
+        events.send(ev(seq, true).into()).unwrap();
         mon.tick(&hosts);
         assert!(!mon.hosts[&a.id].pending);
         assert_eq!(mon.hosts[&a.id].at, at);
@@ -11674,6 +11935,242 @@ mod monitor_ui_tests {
             "dica longe do ponteiro {at:?}: {first:?}"
         );
         assert!((first.left() - at.x).abs() < 30.0, "dica longe do ponteiro {at:?}: {first:?}");
+    }
+
+    #[test]
+    fn network_rates_are_short() {
+        assert_eq!(fmt_bitrate(0.0), "0 bps");
+        assert_eq!(fmt_bitrate(60.0), "480 bps");
+        assert_eq!(fmt_bitrate(43_750.0), "350 kbps");
+        assert_eq!(fmt_bitrate(1_537_500.0), "12 Mbps");
+        assert_eq!(fmt_bitrate(1_000_000.0), "8,0 Mbps");
+        // Logo abaixo de 1000 sobe de unidade (sem "1000 kbps").
+        assert_eq!(fmt_bitrate(124_990.0), "1,0 Mbps");
+        assert_eq!(fmt_bitrate(150_000_000.0), "1,2 Gbps");
+        assert_eq!(fmt_byterate(1_537_500.0), "1,5 MB/s");
+        assert_eq!(fmt_byterate(512.0), "512 B/s");
+        assert_eq!(fmt_bitrate(-5.0), "0 bps");
+    }
+
+    /// Anel cheio com o minuto inteiro pela frente, vazio na hora da coleta;
+    /// a parte que falta termina sempre no topo.
+    #[test]
+    fn countdown_ring_empties_toward_the_top() {
+        let secs = std::time::Duration::from_secs;
+        assert_eq!(countdown_frac(monitor::INTERVAL), 1.0);
+        assert_eq!(countdown_frac(monitor::INTERVAL / 2), 0.5);
+        assert_eq!(countdown_frac(secs(0)), 0.0);
+        assert_eq!(countdown_frac(secs(600)), 1.0);
+        let c = egui::pos2(10.0, 10.0);
+        // Metade: do ponteiro embaixo ate o topo, pela esquerda.
+        let pts = arc_points(c, 5.0, 0.5, 1.0);
+        let (first, last) = (pts[0], *pts.last().unwrap());
+        assert!((first - egui::pos2(10.0, 15.0)).length() < 0.01, "{first:?}");
+        assert!((last - egui::pos2(10.0, 5.0)).length() < 0.01, "{last:?}");
+        assert!(pts.iter().all(|p| p.x <= 10.01), "{pts:?}");
+        assert!(arc_points(c, 5.0, 1.0, 1.0).is_empty());
+    }
+
+    /// Ponteiro parado em `at`: os textos pintados com a dica ja aberta.
+    fn hover_card(
+        ctx: &egui::Context,
+        host: &Host,
+        w: &HostWatch,
+        t0: f64,
+        at: egui::Pos2,
+    ) -> Vec<String> {
+        card_frame(ctx, host, w, t0, vec![egui::Event::PointerMoved(at)]);
+        let mut out = None;
+        for i in 0..3 {
+            out = Some(card_frame(ctx, host, w, t0 + 0.5 + i as f64 * 0.5, vec![]));
+        }
+        painted(out.as_ref().unwrap()).into_iter().map(|(t, ..)| t).collect()
+    }
+
+    fn hint_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        ctx.style_mut(|s| s.interaction.tooltip_delay = 0.0);
+        ctx
+    }
+
+    /// O "(1, 5 e 15 min)" saiu da linha e virou a dica dos numeros.
+    #[test]
+    fn load_periods_moved_to_the_hint() {
+        let ctx = hint_ctx();
+        let host = mon_host("Carga", "srv");
+        let w = HostWatch {
+            last: Some(monitor::Sample {
+                cpu_pct: Some(10.0),
+                cpus: Some(4),
+                load: Some([0.52, 0.58, 0.59]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let out = card_frame(&ctx, &host, &w, 0.0, vec![]);
+        let (text, _, rect) = painted(&out)
+            .into_iter()
+            .find(|(t, ..)| t.starts_with("Load"))
+            .expect("linha do load");
+        assert_eq!(text, "Load  0,52  0,58  0,59");
+        let texts = hover_card(&ctx, &host, &w, 10.0, egui::pos2(rect.right() - 4.0, rect.center().y));
+        assert!(texts.iter().any(|t| t == "Load de 1, 5 e 15 min"), "{texts:?}");
+        assert!(texts.iter().any(|t| t.ends_with("para 4 CPU(s)")), "{texts:?}");
+        // So a dica dos numeros, nao a do cartao.
+        assert!(!texts.iter().any(|t| t == "Tudo dentro dos limites"), "{texts:?}");
+    }
+
+    /// Trafego na linha do load, a direita, sem encostar nos numeros mesmo
+    /// com load e velocidades largos; a dica traz as duas direcoes.
+    #[test]
+    fn network_rates_share_the_load_line() {
+        let ctx = hint_ctx();
+        let host = mon_host("Rede", "srv");
+        let w = HostWatch {
+            last: Some(monitor::Sample {
+                cpu_pct: Some(10.0),
+                cpus: Some(64),
+                load: Some([123.45, 110.22, 98.15]),
+                net: Some(monitor::NetRate {
+                    rx: 123_456_789.0,
+                    tx: 999_000_000.0,
+                    secs: 60.2,
+                }),
+                net_counters: Some(monitor::NetReading {
+                    at: 1.0,
+                    ifaces: vec![("eth0".into(), 1, 1), ("eth1".into(), 1, 1)],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let out = card_frame(&ctx, &host, &w, 0.0, vec![]);
+        let texts = painted(&out);
+        let load = texts.iter().find(|(t, ..)| t.starts_with("Load")).expect("load").2;
+        let up = texts.iter().find(|(t, ..)| t == "8,0 Gbps").expect("upload").2;
+        let down = texts.iter().find(|(t, ..)| t == "988 Mbps").expect("download").2;
+        assert!(up.right() < down.left(), "upload antes do download: {up:?} {down:?}");
+        assert!(load.right() + MON_ARROW < up.left(), "load {load:?} encosta em {up:?}");
+        for r in [up, down] {
+            assert!((r.center().y - load.center().y).abs() < 2.0, "{r:?} fora da linha {load:?}");
+        }
+        let texts = hover_card(&ctx, &host, &w, 10.0, down.center());
+        assert!(texts.iter().any(|t| t == "Enviado (upload): 8,0 Gbps (999 MB/s)"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Recebido (download): 988 Mbps (123 MB/s)"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Interfaces: eth0, eth1"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Média dos últimos 60 s"), "{texts:?}");
+    }
+
+    /// Tux laranja antes da situacao so com kernel novo; a dica dele explica
+    /// e a do cartao tambem avisa.
+    #[test]
+    fn kernel_update_shows_the_tux() {
+        let ctx = hint_ctx();
+        let host = mon_host("Kernel", "srv");
+        let mut w = HostWatch {
+            last: Some(monitor::Sample {
+                cpu_pct: Some(12.0),
+                ..Default::default()
+            }),
+            kernel: Some(monitor::KernelCheck {
+                running: "4.18.0-553.el8_10.x86_64".into(),
+                installed: Some("4.18.0-553.22.1.el8_10.x86_64".into()),
+                available: None,
+            }),
+            ..Default::default()
+        };
+        let tux_tints = |out: &egui::FullOutput| -> usize {
+            out.shapes
+                .iter()
+                .filter(|s| match &s.shape {
+                    // Imagem: retangulo com a textura, pintado com o tint.
+                    egui::epaint::Shape::Rect(r) => r.fill == KERNEL_FG && r.brush.is_some(),
+                    _ => false,
+                })
+                .count()
+        };
+        // Primeiro quadro so carrega as imagens.
+        card_frame(&ctx, &host, &w, 0.0, vec![]);
+        let out = card_frame(&ctx, &host, &w, 0.1, vec![]);
+        assert_eq!(tux_tints(&out), 1);
+        let pill = painted(&out).into_iter().find(|(t, ..)| t == "Saudável").expect("situacao").2;
+        let tux = egui::pos2(pill.left() - 8.0 - 6.0 - KERNEL_ICON / 2.0, pill.center().y);
+        let texts = hover_card(&ctx, &host, &w, 10.0, tux);
+        assert!(texts.iter().any(|t| t == "Atualização do kernel"), "{texts:?}");
+        assert!(
+            texts.iter().any(|t| t == "Já instalado: 4.18.0-553.22.1.el8_10.x86_64. Reinicie o servidor para usá-lo."),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "Em uso: 4.18.0-553.el8_10.x86_64"), "{texts:?}");
+        // A dica do cartao (no nome) tambem avisa.
+        let name = painted(&out).into_iter().find(|(t, ..)| t == "Kernel").expect("nome").2;
+        let texts = hover_card(&ctx, &host, &w, 20.0, name.center());
+        assert!(texts.iter().any(|t| t == "Kernel novo instalado: falta reiniciar o servidor"), "{texts:?}");
+
+        // Disponivel nos repositorios.
+        let k = w.kernel.as_mut().unwrap();
+        k.installed = None;
+        k.available = Some(("kernel".into(), "4.18.0-553.30.1.el8_10".into()));
+        let texts = hover_card(&ctx, &host, &w, 30.0, tux);
+        assert!(
+            texts.iter().any(|t| t == "Disponível nos repositórios: kernel 4.18.0-553.30.1.el8_10"),
+            "{texts:?}"
+        );
+        // Sem kernel novo: sem Tux, e ali vale a dica do cartao.
+        w.kernel.as_mut().unwrap().available = None;
+        let out = card_frame(&ctx, &host, &w, 35.0, vec![]);
+        assert_eq!(tux_tints(&out), 0);
+        let texts = hover_card(&ctx, &host, &w, 40.0, tux);
+        assert!(!texts.iter().any(|t| t == "Atualização do kernel"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Tudo dentro dos limites"), "{texts:?}");
+    }
+
+    /// A verificacao do kernel vale para o servidor de agora: a de um
+    /// endereco antigo e descartada, e trocar o endereco apaga a anterior.
+    #[test]
+    fn kernel_event_follows_the_target() {
+        let (handle, _sent, events) = monitor::test_handle();
+        let mut mon = MonitorUi::new(handle);
+        let mut a = mon_host("A", "srv-a");
+        let mut hosts = vec![a.clone()];
+        mon.tick(&hosts);
+        let check = monitor::KernelCheck {
+            running: "5.15.0-91-generic".into(),
+            installed: Some("5.15.0-92-generic".into()),
+            available: None,
+        };
+        let ev = |h: &Host| {
+            monitor::Event::Kernel(monitor::KernelEvent {
+                host_id: h.id,
+                target: monitor::target(h),
+                check: Some(check.clone()),
+            })
+        };
+        events.send(ev(&a)).unwrap();
+        mon.tick(&hosts);
+        assert_eq!(mon.hosts[&a.id].kernel.as_ref(), Some(&check));
+        let old = a.clone();
+        a.host = "srv-novo".into();
+        hosts[0] = a.clone();
+        mon.tick(&hosts);
+        assert_eq!(mon.hosts[&a.id].kernel, None);
+        events.send(ev(&old)).unwrap();
+        mon.tick(&hosts);
+        assert_eq!(mon.hosts[&a.id].kernel, None);
+        // Conexao nova sem resposta: o aviso anterior nao fica.
+        events.send(ev(&a)).unwrap();
+        mon.tick(&hosts);
+        assert!(mon.hosts[&a.id].kernel.is_some());
+        events
+            .send(monitor::Event::Kernel(monitor::KernelEvent {
+                host_id: a.id,
+                target: monitor::target(&a),
+                check: None,
+            }))
+            .unwrap();
+        mon.tick(&hosts);
+        assert_eq!(mon.hosts[&a.id].kernel, None);
     }
 }
 
@@ -15619,6 +16116,9 @@ mod focus_tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         files.sort_unstable();
+        // O Tux (ICON_LINUX) marca o kernel novo, nao um sistema.
+        slugs.push("linux");
+        slugs.sort_unstable();
         let expected: Vec<String> = slugs.iter().map(|s| format!("{s}.svg")).collect();
         assert_eq!(files, expected);
     }
@@ -15627,7 +16127,8 @@ mod focus_tests {
     /// sem script, link externo nem estilo, e pequeno.
     #[test]
     fn os_icon_assets_are_safe_white_svgs() {
-        for (slug, img, _) in OS_ICONS {
+        let tux = ("linux", ICON_LINUX, KERNEL_FG);
+        for (slug, img, _) in OS_ICONS.iter().chain([&tux]) {
             let (uri, bytes) = icon_bytes(img);
             assert_eq!(uri, format!("bytes://../assets/os/{slug}.svg"));
             let text = std::str::from_utf8(bytes).expect("SVG em UTF-8");
@@ -15648,7 +16149,8 @@ mod focus_tests {
     fn os_icons_render_white() {
         let ctx = egui::Context::default();
         egui_extras::install_image_loaders(&ctx);
-        for (slug, img, _) in OS_ICONS {
+        let tux = ("linux", ICON_LINUX, KERNEL_FG);
+        for (slug, img, _) in OS_ICONS.iter().chain([&tux]) {
             let (uri, bytes) = icon_bytes(img);
             assert!(egui_extras::image::load_svg_bytes(bytes).is_ok(), "{slug}");
             ctx.include_bytes(uri.clone(), bytes);
@@ -15695,6 +16197,8 @@ mod focus_tests {
         // CentOS tem traco fino: 7:1.
         let centos = OS_ICONS.iter().find(|(s, ..)| *s == "centos").unwrap().2;
         assert!(wcag_contrast(centos, WIDGET_BG) >= 7.0);
+        // Tux do kernel novo, direto no fundo do cartao.
+        assert!(wcag_contrast(KERNEL_FG, CARD_BG) >= 4.5);
     }
 
     #[test]
