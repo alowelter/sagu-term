@@ -130,7 +130,8 @@ TERMINAL LOCAL
 • Prompt de Comando e WSL (quando instalado) nos mesmos painéis dos servidores remotos.
 
 MONITORAMENTO
-• O cartão Monitoramento abre uma tela com um cartão por servidor: anéis de CPU, memória e do disco mais cheio, load de 1, 5 e 15 minutos, gráfico de CPU e memória da última hora, discos, swap, tempo ligado e processos.
+• O cartão Monitoramento abre uma tela com um cartão por servidor: anéis de CPU, memória e do disco mais cheio, load de 1, 5 e 15 minutos, tráfego de rede enviado e recebido, gráfico de CPU e memória da última hora, discos, swap, tempo ligado e processos.
+• Um ícone do Linux em laranja avisa quando o servidor tem um kernel mais novo, já instalado e esperando reiniciar ou disponível nos repositórios, com as versões na dica.
 • Cada servidor ganha uma situação (Saudável, Atenção ou Crítico) pela pior medida, e o topo da tela resume quantos estão em cada uma. A dica do cartão mostra o que está fora do normal.
 • Atualiza sozinho a cada minuto enquanto está aberto, ou na hora com Atualizar agora, usando uma conexão por servidor que fecha junto com a tela. Funciona em servidores Linux.
 
@@ -149,7 +150,7 @@ COFRE E CONEXÕES
 • O cofre é gravado de forma atômica: uma queda de energia no meio da gravação não corrompe o arquivo.
 
 PRIVACIDADE
-Sem conta, sem anúncios e sem telemetria. O SaguTerm não envia nenhum dado ao desenvolvedor e não acessa a internet por conta própria: ele se conecta apenas aos servidores que você cadastra. Para mostrar o ícone do sistema, ele executa no servidor, com o seu usuário, um comando que só lê a identificação do sistema, e a tela de monitoramento, enquanto aberta, executa a cada minuto um comando que só lê o uso de CPU, memória, swap e disco, a carga, o tempo ligado e o número de processos; isso pode ser desligado em cada conexão, e os detalhes estão na política de privacidade. As atualizações chegam pela Microsoft Store.
+Sem conta, sem anúncios e sem telemetria. O SaguTerm não envia nenhum dado ao desenvolvedor e não acessa a internet por conta própria: ele se conecta apenas aos servidores que você cadastra. Para mostrar o ícone do sistema, ele executa no servidor, com o seu usuário, um comando que só lê a identificação do sistema, e a tela de monitoramento, enquanto aberta, executa a cada minuto um comando que só lê o uso de CPU, memória, swap, disco e rede, a carga, o tempo ligado e o número de processos, e uma vez por conexão outro que só confere se há um kernel mais novo, sem instalar nada; isso pode ser desligado em cada conexão, e os detalhes estão na política de privacidade. As atualizações chegam pela Microsoft Store.
 
 LIMITAÇÕES ATUAIS
 • A interface está em português (Brasil).
@@ -163,8 +164,16 @@ Leve e rápido: escrito em Rust do começo ao fim, incluindo o SSH (sem OpenSSL)
 
 ### What's new in this version (Novidades desta versão)
 
-Limite: 1500 caracteres. Texto da 1.4.0 (764 caracteres), com a cópia entre servidores
-arrastando entre painéis e a correção do download de pastas grandes:
+Limite: 1500 caracteres. Texto da 1.5.0 (664 caracteres), com o aviso de kernel novo, o
+tráfego de rede e o cartão mais enxuto no monitoramento:
+
+```text
+Monitoramento: um ícone do Linux em laranja no cartão avisa quando o servidor tem um kernel mais novo, já instalado e esperando reiniciar ou disponível nos repositórios, com as versões na dica. A conferência é feita uma vez por conexão, com o que o servidor já tem baixado, sem instalar nada.
+Na linha do load, o tráfego de rede do servidor, enviado e recebido, pela média desde a coleta anterior. Só as placas físicas contam, sem somar de novo o tráfego de bridges, contêineres e VPNs.
+Mais espaço no cartão: o período do load (1, 5 e 15 minutos) foi para a dica dos números, e a contagem para a próxima atualização virou um pequeno anel que esvazia até a coleta.
+```
+
+Texto da 1.4.0, só de referência:
 
 ```text
 Copiar entre servidores: com dois painéis SFTP abertos, arraste os arquivos e pastas selecionados de um painel e solte no outro para copiá-los para a pasta aberta ali, no mesmo servidor ou em outro. Antes de soltar, o painel mostra para onde vai a cópia, e o andamento aparece no rodapé, com Cancelar. A cópia passa pelo SaguTerm, sem gravar nada no seu computador, e tem as mesmas garantias do colar: nada é substituído sem perguntar, cada arquivo é gravado num temporário e renomeado no fim, e permissões, datas e links simbólicos são mantidos.
@@ -230,7 +239,7 @@ Baixe arquivos e pastas pelo SFTP com Ctrl+S, com andamento, cancelamento e avis
 Copie e mova arquivos e pastas no servidor com Ctrl+C, Ctrl+X e Ctrl+V, e copie entre servidores arrastando de um painel SFTP para o outro
 Histórico de rolagem: role com a roda do mouse ou Shift+PgUp e copie texto que já saiu da tela
 Ícone do sistema de cada servidor (Ubuntu, Debian, Red Hat, AlmaLinux e outros), identificado em segundo plano ao conectar
-Monitoramento: CPU, memória, disco e load dos seus servidores Linux numa só tela, atualizada a cada minuto, com a situação de cada um
+Monitoramento: CPU, memória, disco, rede e load dos seus servidores Linux numa só tela, atualizada a cada minuto, com a situação de cada um e o aviso de kernel novo
 Feito para o teclado: digite parte do nome e aperte Enter para conectar; Alt+setas troca de painel, Ctrl+N cadastra um host, Ctrl+L bloqueia o cofre e F1 mostra os atalhos
 Cofre gravado de forma atômica: uma queda de energia durante a gravação não corrompe o arquivo
 Escrito em Rust, sem OpenSSL, com interface acelerada pela placa de vídeo
@@ -436,10 +445,11 @@ Abra o **SaguTerm** pelo menu Iniciar e confira:
   e reconectar traz o ícone de volta;
 - o ícone de chave ou senha aparece à esquerda do endereço, no cartão;
 - o cartão **Monitoramento** (duplo clique) abre a tela com um cartão por conexão. O do
-  servidor de teste mostra CPU, memória, disco, load e, depois de alguns minutos, o gráfico
-  da última hora; a contagem no topo chega a zero e a coleta se repete. Uma conexão com
-  **Detectar o sistema do servidor** desmarcado aparece como `Desligado`, e uma com a chave
-  ainda não confirmada, como `Confirmar chave`. No servidor de teste,
+  servidor de teste mostra CPU, memória, disco, load, o tráfego de rede na linha do load e,
+  depois de alguns minutos, o gráfico da última hora; o anel no topo esvazia e a coleta se
+  repete. Uma conexão com **Detectar o sistema do servidor** desmarcado aparece como
+  `Desligado`, e uma com a chave ainda não confirmada, como `Confirmar chave`. No servidor
+  de teste,
   `for i in $(seq $(nproc)); do yes > /dev/null & done` ocupa todas as CPUs (num servidor do
   WSL, ocupa também o PC): em até duas coletas, a CPU passa de 95% e a situação passa a
   `Crítico`. Depois de `kill $(jobs -p)`, a situação volta ao normal em poucos minutos;
