@@ -4745,6 +4745,8 @@ const ICON_PASSWORD: egui::ImageSource =
     egui::include_image!("../assets/rectangle-ellipsis.svg");
 const ICON_ARROW_UP: egui::ImageSource = egui::include_image!("../assets/arrow-up.svg");
 const ICON_ARROW_DOWN: egui::ImageSource = egui::include_image!("../assets/arrow-down.svg");
+/// Servidor sem nenhum problema, no cartao do monitoramento.
+const ICON_OK: egui::ImageSource = egui::include_image!("../assets/circle-check.svg");
 /// Chip: kernel novo no cartao do monitoramento.
 const ICON_KERNEL: egui::ImageSource = egui::include_image!("../assets/cpu.svg");
 
@@ -11131,20 +11133,32 @@ fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) -> bool {
         .tint(icon.tint)
         .paint_at(ui, egui::Rect::from_center_size(badge.center(), egui::Vec2::splat(18.0)));
 
+    // Tudo certo: so um icone verde, do tamanho do chip do kernel; nas
+    // demais situacoes, o texto numa pilula.
     let (pill_text, pill_color) = state_label(state);
-    let pill_g = mon_galley(ui, pill_text, 11.0, pill_color, 120.0);
-    let pill = egui::Rect::from_min_size(
-        egui::pos2(inner.right() - pill_g.size().x - 16.0, inner.top() + 6.0),
-        egui::vec2(pill_g.size().x + 16.0, 20.0),
-    );
-    painter.rect(
-        pill,
-        10.0,
-        pill_color.gamma_multiply(0.15),
-        egui::Stroke::new(1.0, pill_color.gamma_multiply(0.6)),
-        egui::StrokeKind::Inside,
-    );
-    painter.galley(pill.center() - pill_g.size() / 2.0, pill_g, pill_color);
+    let pill = if state == MonState::Level(monitor::Level::Ok) {
+        let r = egui::Rect::from_min_size(
+            egui::pos2(inner.right() - KERNEL_ICON, inner.top() + 16.0 - KERNEL_ICON / 2.0),
+            egui::Vec2::splat(KERNEL_ICON),
+        );
+        egui::Image::new(ICON_OK).tint(pill_color).paint_at(ui, r);
+        r
+    } else {
+        let pill_g = mon_galley(ui, pill_text, 11.0, pill_color, 120.0);
+        let pill = egui::Rect::from_min_size(
+            egui::pos2(inner.right() - pill_g.size().x - 16.0, inner.top() + 6.0),
+            egui::vec2(pill_g.size().x + 16.0, 20.0),
+        );
+        painter.rect(
+            pill,
+            10.0,
+            pill_color.gamma_multiply(0.15),
+            egui::Stroke::new(1.0, pill_color.gamma_multiply(0.6)),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(pill.center() - pill_g.size() / 2.0, pill_g, pill_color);
+        pill
+    };
 
     // Kernel novo (instalado ou nos repositorios): o chip laranja antes da
     // situacao, com o detalhe na dica.
@@ -11969,7 +11983,8 @@ mod monitor_ui_tests {
                 "{t:?} pintado de vermelho/ambar"
             );
         }
-        assert!(texts.iter().any(|(t, ..)| t == "Ok"));
+        // Situacao boa: so o icone verde, sem o texto.
+        assert!(!texts.iter().any(|(t, ..)| t == "Ok"));
         assert_eq!(dots(&out), [AUTH_KEY]);
 
         // Carga alta que continua: o ponto fica vermelho.
@@ -12265,22 +12280,30 @@ mod monitor_ui_tests {
             }),
             ..Default::default()
         };
-        let chip_tints = |out: &egui::FullOutput| -> usize {
+        // Imagens pintadas com o tint: retangulo com a textura.
+        let tinted = |out: &egui::FullOutput, color: egui::Color32| -> Vec<egui::Rect> {
             out.shapes
                 .iter()
-                .filter(|s| match &s.shape {
-                    // Imagem: retangulo com a textura, pintado com o tint.
-                    egui::epaint::Shape::Rect(r) => r.fill == KERNEL_FG && r.brush.is_some(),
-                    _ => false,
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Rect(r) if r.fill == color && r.brush.is_some() => {
+                        Some(r.rect)
+                    }
+                    _ => None,
                 })
-                .count()
+                .collect()
         };
+        let chip_tints = |out: &egui::FullOutput| tinted(out, KERNEL_FG).len();
         // Primeiro quadro so carrega as imagens.
         card_frame(&ctx, &host, &w, 0.0, vec![]);
         let out = card_frame(&ctx, &host, &w, 0.1, vec![]);
         assert_eq!(chip_tints(&out), 1);
-        let pill = painted(&out).into_iter().find(|(t, ..)| t == "Ok").expect("situacao").2;
-        let chip = egui::pos2(pill.left() - 8.0 - 6.0 - KERNEL_ICON / 2.0, pill.center().y);
+        let chip = tinted(&out, KERNEL_FG)[0];
+        // O icone verde da situacao boa, do mesmo tamanho, logo a direita.
+        let ok = tinted(&out, AUTH_KEY);
+        assert_eq!(ok.len(), 1, "{ok:?}");
+        assert_eq!(ok[0].size(), chip.size());
+        assert!(ok[0].left() > chip.right() && (ok[0].center().y - chip.center().y).abs() < 0.5);
+        let chip = chip.center();
         let texts = hover_card(&ctx, &host, &w, 10.0, chip);
         assert!(texts.iter().any(|t| t == "Kernel"), "{texts:?}");
         assert!(texts.iter().any(|t| t == "Atual: 4.18.0-553.el8_10.x86_64"), "{texts:?}");

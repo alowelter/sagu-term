@@ -1230,13 +1230,17 @@ fn parse_df(lines: &[String]) -> Vec<Disk> {
 // ------------------------------------------------------------------ kernel
 
 /// Versao de um kernel (`uname -r`) para comparar: os numeros do comeco
-/// (`4.18.0-553.22.1` em `4.18.0-553.22.1.el8_10.x86_64`) e o "sabor", as
-/// letras do resto (`elx`). So kernels do mesmo sabor se comparam: o de
-/// depuracao (`+debug`), o `-lowlatency` e o do WSL nao sao atualizacao do
-/// kernel em uso, e o numero da versao do RHEL (`el8_9`, `el8_10`) nao conta.
+/// (`4.18.0-553.22.1` em `4.18.0-553.22.1.el8_10.x86_64`), a versao de base,
+/// antes do primeiro `-` (`4.18.0`), e o "sabor", as letras do resto (`elx`).
+/// So kernels do mesmo sabor se comparam: o de depuracao (`+debug`), o
+/// `-lowlatency` e o do WSL nao sao atualizacao do kernel em uso, e o numero
+/// da versao do RHEL (`el8_9`, `el8_10`) nao conta.
 #[derive(Debug, PartialEq, Eq)]
 struct KernelVer {
     nums: Vec<u64>,
+    /// Versao de base (`4.18.0`): o que vem depois do `-` sao as revisoes da
+    /// distribuicao (correcoes pequenas), que nao valem o aviso.
+    base: Vec<u64>,
     flavor: String,
 }
 
@@ -1258,13 +1262,25 @@ impl KernelVer {
             .filter(char::is_ascii_alphabetic)
             .map(|c| c.to_ascii_lowercase())
             .collect();
-        (nums.len() >= 2).then_some(KernelVer { nums, flavor })
+        let base = base_nums(release);
+        (nums.len() >= 2).then_some(KernelVer { nums, base, flavor })
     }
 
-    /// Mesmo sabor e numeros maiores (`4.18.0-553.22.1` > `4.18.0-553`).
+    /// Mesmo sabor e versao de base maior (`4.19.0-1` > `4.18.0-553`); so
+    /// uma revisao nova da mesma base (`4.18.0-553.180.1` sobre
+    /// `4.18.0-553.179.1`) nao conta.
     fn newer_than(&self, other: &KernelVer) -> bool {
-        self.flavor == other.flavor && self.nums > other.nums
+        self.flavor == other.flavor && self.base > other.base
     }
+}
+
+/// Numeros da versao de base: os do comeco separados por ponto, ate o
+/// primeiro `-`, `_`, `+` ou `~` (`4.18.0` em `4.18.0-553.el8_10.x86_64`).
+fn base_nums(release: &str) -> Vec<u64> {
+    let head = release.split(['-', '_', '+', '~']).next().unwrap_or("");
+    head.split('.')
+        .map_while(|t| t.parse::<u64>().ok().filter(|_| t.bytes().all(|b| b.is_ascii_digit())))
+        .collect()
 }
 
 /// Versao ou nome de pacote vindo do servidor: so letras, digitos e
@@ -1302,14 +1318,14 @@ fn parse_kernel(out: &[u8]) -> Option<KernelCheck> {
         .max_by(|a, b| a.0.nums.cmp(&b.0.nums))
         .map(|(_, m)| m);
     if check.installed.is_none() {
-        // Debian/Ubuntu: `linux-image-6.1.0-13-amd64`, ate com a mesma versao
-        // do em uso (pacote atualizado sem mudar o nome).
+        // Debian/Ubuntu: `linux-image-6.1.0-13-amd64` com uma versao de base
+        // mais nova (o pacote do mesmo kernel atualizado nao conta).
         check.installed = s
             .kboot
             .iter()
             .take(MAX_KERNEL_LINES)
             .filter_map(|l| l.trim().strip_prefix("linux-image-"))
-            .filter(|r| KernelVer::parse(r).is_some_and(|v| v.flavor == run.flavor && v.nums >= run.nums))
+            .filter(|r| KernelVer::parse(r).is_some_and(|v| v.newer_than(&run)))
             .find_map(clean_release);
     }
     check.available = parse_pkg_update(&s.kpkg, &run);
@@ -1318,10 +1334,12 @@ fn parse_kernel(out: &[u8]) -> Option<KernelCheck> {
 
 /// Pacote do kernel com versao nova nos repositorios, pela saida do `dnf
 /// check-update` (`kernel-core.x86_64  4.18.0-553.22.1.el8_10  baseos`, so se
-/// for do sabor do kernel em uso e mais novo que ele) ou do `apt list
-/// --upgradable` (`linux-image-generic/jammy-updates 5.15.0.92.89 amd64
-/// [upgradable from: 5.15.0.91.88]`: a versao do metapacote nao e a do
-/// `uname -r`, nao ha o que comparar).
+/// for do sabor do kernel em uso e de versao de base mais nova) ou do `apt
+/// list --upgradable` (`linux-image-generic/jammy-updates 5.15.0.92.89 amd64
+/// [upgradable from: 5.15.0.91.88]`). A versao do metapacote do apt nao e a
+/// do `uname -r` (o Debian mostra `6.1.0` com o pacote `6.1.76`), entao so
+/// conta um kernel de outra serie: maior ou menor diferente (`6.5` sobre
+/// `5.15`).
 fn parse_pkg_update(lines: &[String], run: &KernelVer) -> Option<(String, String)> {
     for l in lines.iter().take(MAX_KERNEL_LINES) {
         // dnf: o pacote instalado que um outro torna obsoleto vem recuado.
@@ -1340,9 +1358,11 @@ fn parse_pkg_update(lines: &[String], run: &KernelVer) -> Option<(String, String
                 .is_some_and(|v| v.newer_than(run))
                 .then_some(name)
         } else {
+            let series = |v: &[u64]| v.iter().take(2).copied().collect::<Vec<_>>();
             pkg.split_once('/')
                 .map(|(name, _)| name)
                 .filter(|name| name.starts_with("linux-image-") && l.contains("[upgradable from"))
+                .filter(|_| run.base.len() >= 2 && series(&base_nums(&ver)) > series(&run.base))
         };
         if let Some(name) = found.and_then(clean_release) {
             return Some((name, ver));
@@ -1684,12 +1704,18 @@ SAGUMON.up2\n{t1} 51.00\nSAGUMON.net2\n{header}{}SAGUMON.nic\ntotal 0\n{nic}SAGU
         let v = |r: &str| KernelVer::parse(r).unwrap();
         assert_eq!(v("4.18.0-553.el8_10.x86_64").nums, [4, 18, 0, 553]);
         assert_eq!(v("4.18.0-553.el8_10.x86_64").flavor, "elx");
-        assert!(v("4.18.0-553.22.1.el8_10.x86_64").newer_than(&v("4.18.0-553.el8_10.x86_64")));
-        // De uma versao do RHEL para a seguinte (el8_9 -> el8_10).
-        assert!(v("4.18.0-553.el8_10.x86_64").newer_than(&v("4.18.0-513.24.1.el8_9.x86_64")));
+        assert_eq!(v("4.18.0-553.el8_10.x86_64").base, [4, 18, 0]);
+        assert_eq!(v("6.6.87.2-microsoft-standard-WSL2").base, [6, 6, 87, 2]);
+        assert_eq!(v("6.6.31+rpt-rpi-v8").base, [6, 6, 31]);
+        // So a revisao da distribuicao (depois do "-") mudou: nao e aviso.
+        assert!(!v("4.18.0-553.180.1.el8_10.x86_64").newer_than(&v("4.18.0-553.179.1.el8_10.x86_64")));
+        assert!(!v("4.18.0-553.el8_10.x86_64").newer_than(&v("4.18.0-513.24.1.el8_9.x86_64")));
+        assert!(!v("5.15.0-92-generic").newer_than(&v("5.15.0-91-generic")));
         assert!(!v("4.18.0-553.el8_10.x86_64").newer_than(&v("4.18.0-553.el8_10.x86_64")));
-        assert!(v("5.15.0-92-generic").newer_than(&v("5.15.0-91-generic")));
+        // Versao de base nova: aviso.
         assert!(v("6.5.0-14-generic").newer_than(&v("5.15.0-91-generic")));
+        assert!(v("6.11.6-200.fc40.x86_64").newer_than(&v("6.11.5-300.fc40.x86_64")));
+        assert!(v("4.19.0-1.el8_10.x86_64").newer_than(&v("4.18.0-553.el8_10.x86_64")));
         // Outro sabor: depuracao, lowlatency, cloud, WSL.
         assert!(!v("4.18.0-553.el8_10.x86_64+debug").newer_than(&v("4.18.0-553.el8_10.x86_64")));
         assert!(!v("5.15.0-92-lowlatency").newer_than(&v("5.15.0-91-generic")));
@@ -1711,21 +1737,26 @@ SAGUMON.end\n",
 
     #[test]
     fn kernel_installed_waiting_for_reboot() {
-        let run = "4.18.0-553.el8_10.x86_64";
+        let run = "6.11.5-300.fc40.x86_64";
         let mods = [
-            "4.18.0-513.24.1.el8_9.x86_64",
+            "6.10.12-200.fc40.x86_64",
             run,
-            "4.18.0-553.22.1.el8_10.x86_64",
-            "4.18.0-553.8.1.el8_10.x86_64",
-            "4.18.0-553.30.1.el8_10.x86_64+debug",
+            "6.11.6-200.fc40.x86_64",
+            "6.11.5-301.fc40.x86_64",
+            "6.12.1-100.fc40.x86_64+debug",
         ];
         let c = parse_kernel(kernel_out(run, &mods, "", "").as_bytes()).unwrap();
         assert_eq!(c.running, run);
-        assert_eq!(c.installed.as_deref(), Some("4.18.0-553.22.1.el8_10.x86_64"));
+        assert_eq!(c.installed.as_deref(), Some("6.11.6-200.fc40.x86_64"));
         assert_eq!(c.available, None);
         assert!(c.has_update());
         // Ja no mais novo: nada a fazer.
-        let c = parse_kernel(kernel_out("4.18.0-553.22.1.el8_10.x86_64", &mods, "", "").as_bytes()).unwrap();
+        let c = parse_kernel(kernel_out("6.11.6-200.fc40.x86_64", &mods, "", "").as_bytes()).unwrap();
+        assert!(!c.has_update(), "{c:?}");
+        // RHEL: so revisoes novas do mesmo 4.18.0 instaladas: sem aviso.
+        let run = "4.18.0-553.179.1.el8_10.x86_64";
+        let mods = [run, "4.18.0-553.180.1.el8_10.x86_64"];
+        let c = parse_kernel(kernel_out(run, &mods, "", "").as_bytes()).unwrap();
         assert!(!c.has_update(), "{c:?}");
         // Conteiner: o kernel em uso (o do hospedeiro) nao esta instalado.
         let c = parse_kernel(kernel_out("5.14.0-427.el9.x86_64", &mods, "", "").as_bytes()).unwrap();
@@ -1736,40 +1767,60 @@ SAGUMON.end\n",
         let pkg = "kernel-core.x86_64                4.18.0-553.156.1.el8_10                 baseos\n";
         let c = parse_kernel(kernel_out(wsl, &mods, "", pkg).as_bytes()).unwrap();
         assert_eq!(c, KernelCheck { running: wsl.into(), ..Default::default() });
-        // Debian: pacote atualizado com o mesmo nome do kernel em uso.
+        // Debian: o pacote do mesmo kernel atualizado (mesmo nome) ou uma
+        // revisao nova da mesma base nao avisam.
         let deb = "6.1.0-13-amd64";
-        let boot = "linux-image-6.1.0-13-amd64\nlinux-base\n";
+        for boot in ["linux-image-6.1.0-13-amd64\nlinux-base\n", "linux-image-6.1.0-17-amd64\n"] {
+            let c = parse_kernel(kernel_out(deb, &[deb], boot, "").as_bytes()).unwrap();
+            assert!(!c.has_update(), "{boot:?}: {c:?}");
+        }
+        // Base nova esperando reiniciar: avisa.
+        let boot = "linux-image-6.12.0-1-amd64\n";
         let c = parse_kernel(kernel_out(deb, &[deb], boot, "").as_bytes()).unwrap();
-        assert_eq!(c.installed.as_deref(), Some(deb));
-        // ... mas nao um pacote mais velho que o em uso.
-        let boot = "linux-image-6.1.0-12-amd64\n";
-        assert!(!parse_kernel(kernel_out(deb, &[deb], boot, "").as_bytes()).unwrap().has_update());
+        assert_eq!(c.installed.as_deref(), Some("6.12.0-1-amd64"));
     }
 
     #[test]
     fn kernel_available_in_repositories() {
         let run = "4.18.0-553.80.1.el8_10.x86_64";
-        // dnf: o metapacote e o kernel-core; o recuado e o obsoleto.
-        let pkg = "\nkernel.x86_64          4.18.0-553.156.1.el8_10    baseos\n\
-kernel-core.x86_64     4.18.0-553.156.1.el8_10    baseos\n";
+        // dnf, so uma revisao nova do mesmo 4.18.0: sem aviso.
+        let rev = "kernel.x86_64          4.18.0-553.156.1.el8_10    baseos\n";
+        assert_eq!(parse_kernel(kernel_out(run, &[run], "", rev).as_bytes()).unwrap().available, None);
+        // dnf, base nova: o metapacote e o kernel-core; o recuado e o obsoleto.
+        let run = "6.11.5-300.fc40.x86_64";
+        let pkg = "\nkernel.x86_64          6.11.6-200.fc40    updates\n\
+kernel-core.x86_64     6.11.6-200.fc40    updates\n";
         let c = parse_kernel(kernel_out(run, &[run], "", pkg).as_bytes()).unwrap();
-        assert_eq!(c.available, Some(("kernel".into(), "4.18.0-553.156.1.el8_10".into())));
+        assert_eq!(c.available, Some(("kernel".into(), "6.11.6-200.fc40".into())));
         assert_eq!(c.installed, None);
         // Pacote mais velho que o em uso (ex.: kernel instalado a mao): nao.
-        let old = "kernel-core.x86_64 4.18.0-553.22.1.el8_10 baseos\n    kernel.x86_64 x @anaconda\n";
+        let old = "kernel-core.x86_64 6.10.12-200.fc40 updates\n    kernel.x86_64 x @anaconda\n";
         assert_eq!(parse_kernel(kernel_out(run, &[run], "", old).as_bytes()).unwrap().available, None);
         // Outros pacotes com "kernel" no nome nao contam.
-        let other = "kernel-headers.x86_64 4.18.0-553.156.1.el8_10 baseos\n\
-kernel-tools.x86_64 4.18.0-553.156.1.el8_10 baseos\n";
+        let other = "kernel-headers.x86_64 6.11.6-200.fc40 updates\n\
+kernel-tools.x86_64 6.11.6-200.fc40 updates\n";
         assert_eq!(parse_kernel(kernel_out(run, &[run], "", other).as_bytes()).unwrap().available, None);
 
-        // apt: metapacote do kernel na lista do `apt list --upgradable`.
+        // apt: metapacote do kernel na lista do `apt list --upgradable`; da
+        // mesma serie (5.15) nao avisa.
         let ub = "5.15.0-91-generic";
         let pkg = "Listing...\nbash/jammy-updates 5.1-6ubuntu1.1 amd64 [upgradable from: 5.1-6ubuntu1]\n\
 linux-generic/jammy-updates,jammy-security 5.15.0.92.89 amd64 [upgradable from: 5.15.0.91.88]\n\
 linux-image-generic/jammy-updates,jammy-security 5.15.0.92.89 amd64 [upgradable from: 5.15.0.91.88]\n";
         let c = parse_kernel(kernel_out(ub, &[ub], "", pkg).as_bytes()).unwrap();
-        assert_eq!(c.available, Some(("linux-image-generic".into(), "5.15.0.92.89".into())));
+        assert_eq!(c.available, None);
+        // Debian: o pacote 6.1.76 do kernel 6.1.0 tambem e da mesma serie.
+        let deb = "6.1.0-13-amd64";
+        let pkg = "linux-image-amd64/stable-security 6.1.76-1 amd64 [upgradable from: 6.1.69-1]\n";
+        assert_eq!(parse_kernel(kernel_out(deb, &[deb], "", pkg).as_bytes()).unwrap().available, None);
+        // Serie nova (HWE 6.5): avisa.
+        let pkg = "linux-image-generic-hwe-22.04/jammy-updates 6.5.0.14.14~22.04.7 amd64 \
+[upgradable from: 5.15.0.91.88]\n";
+        let c = parse_kernel(kernel_out(ub, &[ub], "", pkg).as_bytes()).unwrap();
+        assert_eq!(
+            c.available,
+            Some(("linux-image-generic-hwe-22.04".into(), "6.5.0.14.14~22.04.7".into()))
+        );
         // Nada no servidor alem do `uname`: so o kernel em uso.
         let c = parse_kernel(b"SAGUMON.kver\n5.15.0-91-generic\nSAGUMON.kmods\nSAGUMON.end\n").unwrap();
         assert_eq!(c, KernelCheck { running: ub.into(), ..Default::default() });

@@ -182,10 +182,14 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
   **duplo clique** num cartão divide o painel e abre embaixo um terminal no servidor.
 - Um **chip laranja** ao lado da situação avisa que há um **kernel mais novo**: já
   instalado, esperando o servidor reiniciar, ou disponível nos repositórios (pelo cache
-  do `dnf` ou pelas listas do `apt` que o servidor já tem, sem baixar nada). A conferência
-  é feita uma vez por conexão, e a dica mostra o kernel atual e o novo.
+  do `dnf` ou pelas listas do `apt` que o servidor já tem, sem baixar nada). Só conta uma
+  versão nova do kernel, o número antes do `-` (de `4.18.0` para `4.19.0`); revisões da
+  distribuição sobre a mesma versão (`4.18.0-553.180.1` sobre `4.18.0-553.179.1`) não
+  avisam. A conferência é feita uma vez por conexão, e a dica mostra o kernel atual e o
+  novo.
 - Cada servidor ganha uma situação (**Ok**, **Atenção** ou **Crítico**) pela pior
-  medida, e o topo da tela resume quantos estão em cada uma. A dica do cartão lista o que
+  medida, e o topo da tela resume quantos estão em cada uma. Com tudo certo, o cartão
+  mostra só um ícone verde no lugar do texto. A dica do cartão lista o que
   está fora do normal e todos os discos. O load conta pelo menor entre os de 1 e 5
   minutos, por CPU: um pico curto e moderado não acusa, e a situação volta ao normal poucos
   minutos depois que a carga cai (sem esperar a média de 5 minutos baixar). CD ou ISO
