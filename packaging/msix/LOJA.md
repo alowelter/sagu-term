@@ -166,8 +166,15 @@ Leve e rápido: escrito em Rust do começo ao fim, incluindo o SSH (sem OpenSSL)
 
 ### What's new in this version (Novidades desta versão)
 
-Limite: 1500 caracteres. Texto da 1.5.0 (664 caracteres), com o aviso de kernel novo, o
-tráfego de rede e o cartão mais enxuto no monitoramento:
+Limite: 1500 caracteres. Texto da 1.6.0 (710 caracteres), com o filtro, o duplo clique e o
+cartão mais limpo no monitoramento e o SFTP ao lado pelo terminal:
+
+```text
+Monitoramento: filtre os servidores pelo nome no topo da tela, e um duplo clique num cartão abre um terminal no servidor, no mesmo painel, logo abaixo. O aviso de kernel novo agora é um chip laranja, com o kernel atual e o novo na dica. O cartão ficou mais limpo: só o endereço do servidor abaixo do nome, a situação boa aparece como Ok, o tempo ligado como Ativo (com as horas só no primeiro dia) e a idade da leitura só aparece quando há algum problema. A contagem para a próxima atualização virou um anel de pontos que vão acendendo.
+Terminal: Ctrl+B, E (ou o novo ícone de pasta na barra do painel) abre ao lado um navegador SFTP no mesmo servidor, e Ctrl+B, B envia um Ctrl+B ao terminal, útil com o tmux.
+```
+
+Texto da 1.5.0, só de referência:
 
 ```text
 Monitoramento: um ícone do Linux em laranja no cartão avisa quando o servidor tem um kernel mais novo, já instalado e esperando reiniciar ou disponível nos repositórios, com as versões na dica. A conferência é feita uma vez por conexão, com o que o servidor já tem baixado, sem instalar nada.
@@ -448,8 +455,10 @@ Abra o **SaguTerm** pelo menu Iniciar e confira:
 - o ícone de chave ou senha aparece à esquerda do endereço, no cartão;
 - o cartão **Monitoramento** (duplo clique) abre a tela com um cartão por conexão. O do
   servidor de teste mostra CPU, memória, disco, load, o tráfego de rede na linha do load e,
-  depois de alguns minutos, o gráfico da última hora; o anel no topo esvazia e a coleta se
-  repete. Uma conexão com **Detectar o sistema do servidor** desmarcado aparece como
+  depois de alguns minutos, o gráfico da última hora; os pontos do anel no topo vão
+  acendendo e a coleta se repete. Digitar parte do nome em **Filtrar servidores** deixa só
+  os cartões correspondentes, e o duplo clique no cartão do servidor de teste abre embaixo
+  um terminal nele; ali, `Ctrl+B, E` abre ao lado um SFTP no mesmo servidor. Uma conexão com **Detectar o sistema do servidor** desmarcado aparece como
   `Desligado`, e uma com a chave ainda não confirmada, como `Confirmar chave`. No servidor
   de teste,
   `for i in $(seq $(nproc)); do yes > /dev/null & done` ocupa todas as CPUs (num servidor do
