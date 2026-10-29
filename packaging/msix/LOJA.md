@@ -130,14 +130,16 @@ TERMINAL LOCAL
 • Prompt de Comando e WSL (quando instalado) nos mesmos painéis dos servidores remotos.
 
 MONITORAMENTO
-• O cartão Monitoramento abre uma tela com um cartão por servidor: anéis de CPU, memória e do disco mais cheio, load de 1, 5 e 15 minutos, tráfego de rede enviado e recebido, gráfico de CPU e memória da última hora, discos, swap, tempo ligado e processos.
-• Um ícone do Linux em laranja avisa quando o servidor tem um kernel mais novo, já instalado e esperando reiniciar ou disponível nos repositórios, com as versões na dica.
-• Cada servidor ganha uma situação (Saudável, Atenção ou Crítico) pela pior medida, e o topo da tela resume quantos estão em cada uma. A dica do cartão mostra o que está fora do normal.
+• O cartão Monitoramento abre uma tela com um cartão por servidor: anéis de CPU, memória e do disco mais cheio, load de 1, 5 e 15 minutos, tráfego de rede enviado e recebido, gráfico de CPU e memória da última hora, discos, swap, tempo ativo e processos.
+• Filtre os servidores pelo nome e, com um duplo clique num cartão, abra um terminal no servidor no mesmo painel, logo abaixo.
+• Um chip laranja avisa quando o servidor tem um kernel mais novo, já instalado e esperando reiniciar ou disponível nos repositórios, com o kernel atual e o novo na dica.
+• Cada servidor ganha uma situação (Ok, Atenção ou Crítico) pela pior medida, e o topo da tela resume quantos estão em cada uma. A dica do cartão mostra o que está fora do normal.
 • Atualiza sozinho a cada minuto enquanto está aberto, ou na hora com Atualizar agora, usando uma conexão por servidor que fecha junto com a tela. Funciona em servidores Linux.
 
 PAINÉIS DIVIDIDOS
 • Divida qualquer painel lado a lado ou empilhado, quantas vezes quiser, misturando sessões SSH, SFTP e terminais locais.
 • Cada painel novo já abre o seletor de conexões com a busca pronta para digitar.
+• Num terminal SSH, Ctrl+B, E abre ao lado um navegador SFTP no mesmo servidor.
 
 COFRE E CONEXÕES
 • Busca instantânea pelo nome da conexão.

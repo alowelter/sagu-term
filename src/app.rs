@@ -161,6 +161,9 @@ struct Pane {
     paste: Option<PasteUi>,
     /// Tela de monitoramento dos servidores (quando o painel e de monitoramento).
     monitor: Option<MonitorUi>,
+    /// Host cadastrado do terminal ou do SFTP deste painel (abrir um SFTP
+    /// ao lado, Ctrl+B, E).
+    host_id: Option<uuid::Uuid>,
 }
 
 /// Pergunta de chave cancelada porque o host saiu do cofre.
@@ -666,6 +669,7 @@ impl Pane {
             origin: None,
             paste: None,
             monitor: None,
+            host_id: None,
         }
     }
 }
@@ -4652,6 +4656,14 @@ enum PaneAction {
     Sftp { path: Vec<usize>, host: usize },
     /// Abrir o monitoramento dos servidores no painel indicado.
     Monitor { path: Vec<usize> },
+    /// Dividir o painel e abrir, no painel novo, um terminal (ou um SFTP)
+    /// no host indicado.
+    SplitOpen {
+        path: Vec<usize>,
+        dir: SplitDir,
+        host: usize,
+        sftp: bool,
+    },
     /// Abrir o editor para o host indicado (a partir do seletor de um painel).
     Edit { host: usize },
     /// Abrir o editor para cadastrar um host novo (a partir do seletor).
@@ -4733,9 +4745,8 @@ const ICON_PASSWORD: egui::ImageSource =
     egui::include_image!("../assets/rectangle-ellipsis.svg");
 const ICON_ARROW_UP: egui::ImageSource = egui::include_image!("../assets/arrow-up.svg");
 const ICON_ARROW_DOWN: egui::ImageSource = egui::include_image!("../assets/arrow-down.svg");
-/// Tux do Simple Icons (como os de `OS_ICONS`, que nao o usam): kernel novo
-/// no cartao do monitoramento.
-const ICON_LINUX: egui::ImageSource = egui::include_image!("../assets/os/linux.svg");
+/// Chip: kernel novo no cartao do monitoramento.
+const ICON_KERNEL: egui::ImageSource = egui::include_image!("../assets/cpu.svg");
 
 /// Icones dos sistemas operacionais (slug de `osinfo::icon_slug`, imagem e
 /// cor), para o badge do cartao do host. Vem do Simple Icons 16.33.0 (creditos
@@ -6357,11 +6368,13 @@ impl App {
                 ctx.request_repaint();
             }
         };
+        let id = host.id;
         let handle = ssh::connect(host, INITIAL_COLS, INITIAL_ROWS, detect_os, repaint);
 
         if let Some(root) = &mut self.root {
             if let Some(Node::Leaf(pane)) = node_at_mut(root, path) {
                 pane.host_name = name;
+                pane.host_id = Some(id);
                 pane.terminal = Some(Terminal::new(INITIAL_COLS, INITIAL_ROWS));
                 pane.state = SessionState::Connecting;
                 pane.ssh = Some(handle);
@@ -6391,11 +6404,13 @@ impl App {
                 ctx.request_repaint();
             }
         };
+        let id = host.id;
         let handle = sftp::connect(host, detect_os, repaint);
 
         if let Some(root) = &mut self.root {
             if let Some(Node::Leaf(pane)) = node_at_mut(root, path) {
                 pane.host_name = format!("{name}  (SFTP)");
+                pane.host_id = Some(id);
                 pane.origin = Some(origin);
                 pane.paste = None;
                 pane.explorer = Some(FileExplorer::new());
@@ -6449,6 +6464,32 @@ impl App {
             }
         }
         None
+    }
+
+    /// Divide o painel no caminho e abre no painel novo (que recebe o foco)
+    /// um terminal ou um SFTP no host de indice `host`.
+    fn split_open(&mut self, path: &[usize], dir: SplitDir, host: usize, sftp: bool) {
+        if host >= self.vault.hosts.len() {
+            return;
+        }
+        let Some(new) = self.split_pane(path, dir) else {
+            return;
+        };
+        if sftp {
+            self.connect_sftp_pane(&new, host);
+        } else {
+            self.connect_pane(&new, host);
+        }
+        self.pending_focus = Some(new);
+    }
+
+    /// Indice no cofre do host do painel no caminho (terminal ou SFTP).
+    fn pane_host(&self, path: &[usize]) -> Option<usize> {
+        let Some(Node::Leaf(pane)) = self.root.as_ref().and_then(|r| node_at(r, path)) else {
+            return None;
+        };
+        let id = pane.host_id?;
+        self.vault.hosts.iter().position(|h| h.id == id)
     }
 
     /// Fecha o painel no caminho; colapsa a divisao se sobrar um filho, ou
@@ -6829,9 +6870,10 @@ impl App {
     /// `Alt+setas` troca o painel focado diretamente (atalho principal).
     ///
     /// O restante usa o prefixo `Ctrl+B` em dois tempos (estilo tmux): `H`/`V`
-    /// dividem o painel focado, setas tambem movem o foco (alias do Alt+setas),
-    /// `O` cicla, `X` fecha o painel, `A` abre a ajuda, `Ctrl+B` de novo envia
-    /// um Ctrl+B literal ao terminal (util para tmux remoto) e `F1` envia o F1
+    /// dividem o painel focado, `E` abre ao lado um SFTP no servidor do painel,
+    /// setas tambem movem o foco (alias do Alt+setas), `O` cicla, `X` fecha o
+    /// painel, `A` abre a ajuda, `B` (ou `Ctrl+B`) de novo envia um Ctrl+B
+    /// literal ao terminal (util para tmux remoto) e `F1` envia o F1
     /// que, sem o prefixo, abre a ajuda (ex.: ajuda do htop/mc). Teclas invalidas
     /// apos o prefixo sao engolidas (nao vazam para o shell) e o prefixo expira
     /// sozinho. Todos os eventos usados sao consumidos.
@@ -6870,6 +6912,7 @@ impl App {
 
         let mut armed = self.chord_armed_at.is_some();
         let mut split: Option<SplitDir> = None;
+        let mut sftp_beside = false;
         let mut nav: Option<(i32, i32)> = None;
         let mut cycle = false;
         let mut close = false;
@@ -6916,6 +6959,7 @@ impl App {
                 match key {
                     egui::Key::H => split = Some(SplitDir::SideBySide),
                     egui::Key::V => split = Some(SplitDir::Stacked),
+                    egui::Key::E => sftp_beside = true,
                     egui::Key::ArrowLeft => nav = Some((-1, 0)),
                     egui::Key::ArrowRight => nav = Some((1, 0)),
                     egui::Key::ArrowUp => nav = Some((0, -1)),
@@ -6923,7 +6967,7 @@ impl App {
                     egui::Key::O => cycle = true,
                     egui::Key::X => close = true,
                     egui::Key::A => help = true,
-                    egui::Key::B if modifiers.ctrl => literal = Some(&[0x02]),
+                    egui::Key::B => literal = Some(&[0x02]),
                     egui::Key::F1 => literal = Some(b"\x1bOP"),
                     egui::Key::Escape => {} // apenas cancela o prefixo
                     _ => {} // tecla invalida: engolida, sem acao (estilo tmux)
@@ -6937,6 +6981,13 @@ impl App {
             if let Some(path) = self.focused_path.clone().or_else(|| self.first_pane_path()) {
                 // O novo painel (seletor) ja nasce com o filtro focado.
                 self.pending_focus = self.split_pane(&path, dir);
+            }
+        } else if sftp_beside {
+            // So num painel de host cadastrado (terminal ou SFTP).
+            if let Some(path) = self.focused_path.clone() {
+                if let Some(host) = self.pane_host(&path) {
+                    self.split_open(&path, SplitDir::SideBySide, host, true);
+                }
             }
         } else if let Some((dx, dy)) = nav {
             self.focus_dir(dx, dy);
@@ -7296,10 +7347,11 @@ impl App {
                     secao(ui, "Painéis da sessão (prefixo Ctrl+B)");
                     atalho(ui, "Ctrl+B, H", "dividir lado a lado");
                     atalho(ui, "Ctrl+B, V", "dividir empilhado");
+                    atalho(ui, "Ctrl+B, E", "abrir SFTP ao lado no mesmo servidor");
                     atalho(ui, "Ctrl+B, setas", "trocar de painel (alternativa)");
                     atalho(ui, "Ctrl+B, O", "ciclar o foco");
                     atalho(ui, "Ctrl+B, X", "fechar o painel focado");
-                    atalho(ui, "Ctrl+B, Ctrl+B", "enviar Ctrl+B ao terminal");
+                    atalho(ui, "Ctrl+B, B", "enviar Ctrl+B ao terminal");
                     atalho(ui, "Ctrl+B, F1", "enviar F1 ao terminal");
                     atalho(ui, "Ctrl+B, A", "abrir/fechar esta ajuda");
                     atalho(ui, "Ctrl+B, Esc", "cancelar o prefixo");
@@ -8210,6 +8262,12 @@ impl App {
                 }
                 PaneAction::Sftp { path, host } => self.connect_sftp_pane(&path, host),
                 PaneAction::Monitor { path } => self.open_monitor_pane(&path),
+                PaneAction::SplitOpen {
+                    path,
+                    dir,
+                    host,
+                    sftp,
+                } => self.split_open(&path, dir, host, sftp),
                 PaneAction::Edit { host } => {
                     if host < self.vault.hosts.len() {
                         self.hosts_error = None;
@@ -10418,6 +10476,7 @@ const MONITOR_SUBTITLE: &str = "Saúde dos servidores";
 const MONITOR_OFF: &str = "Monitoramento desligado nesta conexão: \u{201C}Detectar o sistema \
      do servidor\u{201D} está desmarcado (o servidor força um comando próprio).";
 const MONITOR_EMPTY: &str = "Nenhum host cadastrado para monitorar.";
+const MON_CARD_USE: &str = "Duplo clique abre um terminal no servidor";
 /// Janela do grafico de historico (a ultima hora).
 const MON_SPAN: std::time::Duration = std::time::Duration::from_secs(3600);
 /// Intervalo sem coleta acima do qual a linha do grafico se interrompe
@@ -10432,14 +10491,16 @@ const GAUGE_TRACK: egui::Color32 = hex("#2f2f36");
 /// Series do grafico de historico.
 const SERIES_CPU: egui::Color32 = hex("#7aa2f7");
 const SERIES_MEM: egui::Color32 = hex("#c099ff");
-/// Tux laranja: kernel mais novo instalado ou disponivel.
+/// Chip laranja: kernel mais novo instalado ou disponivel.
 const KERNEL_FG: egui::Color32 = hex("#f5913e");
-/// Lado do Tux no cabecalho do cartao.
+/// Lado do chip no cabecalho do cartao.
 const KERNEL_ICON: f32 = 16.0;
 /// Lado das setas do trafego de rede.
 const MON_ARROW: f32 = 11.0;
-/// Diametro da contagem para a proxima coleta (e do spinner da coleta).
-const COUNTDOWN_SIZE: f32 = 14.0;
+/// Diametro da contagem para a proxima coleta.
+const COUNTDOWN_SIZE: f32 = 20.0;
+/// Pontos do anel da contagem.
+const COUNTDOWN_DOTS: usize = 12;
 
 fn monitor_hint() -> Vec<String> {
     vec![
@@ -10464,6 +10525,9 @@ struct MonitorUi {
     /// O proximo pedido e um "Atualizar agora" (tenta de novo tambem quem
     /// teve as credenciais recusadas).
     force_next: bool,
+    /// Texto do filtro: so os cartoes com o nome correspondente aparecem
+    /// (a coleta continua para todos).
+    filter: String,
 }
 
 /// O que se sabe de um host no monitoramento.
@@ -10501,6 +10565,7 @@ impl MonitorUi {
             sent: Vec::new(),
             seq: 0,
             force_next: false,
+            filter: String::new(),
         }
     }
 
@@ -10671,7 +10736,7 @@ fn level_color(l: monitor::Level) -> egui::Color32 {
 
 fn state_label(s: MonState) -> (&'static str, egui::Color32) {
     match s {
-        MonState::Level(monitor::Level::Ok) => ("Saudável", AUTH_KEY),
+        MonState::Level(monitor::Level::Ok) => ("Ok", AUTH_KEY),
         MonState::Level(monitor::Level::Warn) => ("Atenção", AUTH_PASS),
         MonState::Level(monitor::Level::Crit) => ("Crítico", ERROR_FG),
         MonState::Failed => ("Sem resposta", ERROR_FG),
@@ -10704,11 +10769,12 @@ fn fmt_kb(kb: u64) -> String {
     s.replace('.', ",")
 }
 
-/// Tempo ligado, ex. "3 d 4 h", "5 h 12 min", "8 min".
+/// Tempo ligado, ex. "3 d", "5 h 12 min", "8 min": as horas so contam
+/// abaixo de um dia.
 fn fmt_uptime(secs: u64) -> String {
     let (d, h, m) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
     if d > 0 {
-        format!("{d} d {h} h")
+        format!("{d} d")
     } else if h > 0 {
         format!("{h} h {m} min")
     } else {
@@ -10805,28 +10871,58 @@ fn mon_ring(painter: &egui::Painter, c: egui::Pos2, r: f32, frac: f32, color: eg
 }
 
 /// Contagem para a proxima coleta, no lugar de "Proxima atualizacao em N s":
-/// um anel cheio que vai esvaziando no sentido do relogio (a parte que falta
-/// vai do ponteiro ao topo) ate a coleta, quando vira um spinner; com a
-/// coleta pronta, volta cheio. O tempo fica na dica.
+/// um anel de pontos apagados que vao acendendo no sentido do relogio, a
+/// partir do topo, ate a coleta; durante a coleta um ponto aceso gira pelo
+/// anel. O tempo fica na dica.
 fn monitor_countdown(ui: &mut egui::Ui, collecting: bool, left: std::time::Duration) {
-    if collecting {
-        // Na cor do anel: o mesmo elemento, girando.
-        ui.add(egui::Spinner::new().size(COUNTDOWN_SIZE).color(ACCENT))
-            .on_hover_text("Coletando os dados agora");
-        return;
-    }
     let (rect, resp) =
         ui.allocate_exact_size(egui::Vec2::splat(COUNTDOWN_SIZE), egui::Sense::hover());
+    let (c, r) = (rect.center(), COUNTDOWN_SIZE / 2.0 - 2.0);
+    let lit = if collecting {
+        ui.ctx().request_repaint();
+        spin_dots(ui.input(|i| i.time))
+    } else {
+        countdown_dots(left)
+    };
     let painter = ui.painter();
-    let (c, r) = (rect.center(), COUNTDOWN_SIZE / 2.0 - 1.5);
-    let stroke = 2.5;
-    painter.circle_stroke(c, r, egui::Stroke::new(stroke, GAUGE_TRACK));
-    let pts = arc_points(c, r, 1.0 - countdown_frac(left), 1.0);
-    if !pts.is_empty() {
-        painter.add(egui::Shape::line(pts, egui::Stroke::new(stroke, ACCENT)));
+    for (i, a) in lit.iter().enumerate() {
+        let t = std::f32::consts::TAU * i as f32 / COUNTDOWN_DOTS as f32;
+        let p = c + r * egui::vec2(t.sin(), -t.cos());
+        let color = lerp_color(GAUGE_TRACK, ACCENT, *a);
+        painter.circle_filled(p, 1.3 + 0.3 * a, color);
     }
-    let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
-    resp.on_hover_text(format!("Próxima atualização em {secs} s"));
+    if collecting {
+        resp.on_hover_text("Coletando os dados agora");
+    } else {
+        let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+        resp.on_hover_text(format!("Próxima atualização em {secs} s"));
+    }
+}
+
+/// Brilho de cada ponto da contagem (0 apagado, 1 aceso), a partir do topo:
+/// acendem um a um conforme o intervalo passa, e o que esta acendendo fica
+/// a meia luz.
+fn countdown_dots(left: std::time::Duration) -> [f32; COUNTDOWN_DOTS] {
+    let gone = (1.0 - countdown_frac(left)) * COUNTDOWN_DOTS as f32;
+    std::array::from_fn(|i| (gone - i as f32).clamp(0.0, 1.0))
+}
+
+/// Pontos durante a coleta: um aceso girando (uma volta por segundo), com um
+/// rastro que se apaga.
+fn spin_dots(time: f64) -> [f32; COUNTDOWN_DOTS] {
+    let n = COUNTDOWN_DOTS as f64;
+    let head = (time.rem_euclid(1.0) * n).floor() as usize;
+    std::array::from_fn(|i| {
+        let behind = (head + COUNTDOWN_DOTS - i) % COUNTDOWN_DOTS;
+        (1.0 - behind as f32 / 4.0).max(0.0)
+    })
+}
+
+/// Cor entre `a` (t = 0) e `b` (t = 1).
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    egui::Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
 /// Fracao do intervalo que ainda falta ate a proxima coleta (1 = cheio).
@@ -11002,11 +11098,13 @@ fn disks_stale_text(s: &monitor::Sample) -> &'static str {
 }
 
 /// Cartao de um host na tela de monitoramento: aneis de CPU, memoria e do
-/// disco mais cheio, load, historico da ultima hora, discos e swap.
-fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
-    let (rect, resp) = ui.allocate_exact_size(MON_CARD_SIZE, egui::Sense::hover());
+/// disco mais cheio, load, historico da ultima hora, discos e swap. Devolve
+/// se houve duplo clique (abrir um terminal no servidor).
+fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(MON_CARD_SIZE, egui::Sense::click());
+    let open = resp.double_clicked();
     if !ui.is_rect_visible(rect) {
-        return;
+        return open;
     }
     let painter = ui.painter_at(rect);
     painter.rect(
@@ -11048,7 +11146,7 @@ fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
     );
     painter.galley(pill.center() - pill_g.size() / 2.0, pill_g, pill_color);
 
-    // Kernel novo (instalado ou nos repositorios): o Tux laranja antes da
+    // Kernel novo (instalado ou nos repositorios): o chip laranja antes da
     // situacao, com o detalhe na dica.
     let kernel = w.and_then(|w| w.kernel.as_ref()).filter(|k| k.has_update());
     let kernel_rect = kernel.map(|_| {
@@ -11058,7 +11156,7 @@ fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
         )
     });
     if let Some(r) = kernel_rect {
-        egui::Image::new(ICON_LINUX).tint(KERNEL_FG).paint_at(ui, r);
+        egui::Image::new(ICON_KERNEL).tint(KERNEL_FG).paint_at(ui, r);
     }
     // Dica de cada parte do cartao (ver `CardSpot`).
     let pointer = resp.hover_pos();
@@ -11073,7 +11171,8 @@ fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
     );
     painter.galley(
         egui::pos2(name_x, inner.top() + 19.0),
-        mon_galley(ui, &host_address(host), 11.0, TEXT_WEAK, name_w),
+        // So o endereco: usuario e porta ficam na dica.
+        mon_galley(ui, &host.host, 11.0, TEXT_WEAK, name_w),
         TEXT_WEAK,
     );
 
@@ -11108,7 +11207,7 @@ fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
         }
         let spot = if over(kernel_rect) { CardSpot::Kernel } else { CardSpot::Card };
         card_tooltip(resp, spot, host, w);
-        return;
+        return open;
     };
 
     // --- Aneis: CPU, memoria e o disco mais cheio.
@@ -11268,10 +11367,11 @@ fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
         painter.galley(egui::pos2(inner.right() - g.size().x, y), g, CARD_TEXT);
     }
 
-    // --- Rodape: tempo ligado e processos (ou o erro da ultima coleta) e a
-    // idade do dado.
+    // --- Rodape: tempo ligado e processos (ou o erro da ultima coleta) e,
+    // so com problema, a idade do dado.
     let ago = w
         .and_then(|w| w.at)
+        .filter(|_| state != MonState::Level(monitor::Level::Ok))
         .map(|at| fmt_ago(at.elapsed()))
         .unwrap_or_default();
     let ago_g = mon_galley(ui, &ago, 10.0, TEXT_WEAK, 80.0);
@@ -11282,7 +11382,7 @@ fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
         None => {
             let mut parts = Vec::new();
             if let Some(up) = s.uptime_secs {
-                parts.push(format!("Ligado há {}", fmt_uptime(up)));
+                parts.push(format!("Ativo {}", fmt_uptime(up)));
             }
             if let Some(p) = s.procs {
                 parts.push(format!("{p} processos"));
@@ -11306,13 +11406,14 @@ fn monitor_card(ui: &mut egui::Ui, host: &Host, w: Option<&HostWatch>) {
         CardSpot::Card
     };
     card_tooltip(resp, spot, host, w);
+    open
 }
 
 /// Parte do cartao de monitoramento sob o ponteiro: cada uma tem a sua dica.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CardSpot {
     Card,
-    /// O Tux do kernel novo.
+    /// O chip do kernel novo.
     Kernel,
     /// Os numeros do load.
     Load,
@@ -11321,7 +11422,7 @@ enum CardSpot {
 }
 
 /// Dica do cartao, conforme a parte sob o ponteiro. Uma dica so (a do
-/// cartao inteiro), com o conteudo trocado: passar do cartao para o Tux nao
+/// cartao inteiro), com o conteudo trocado: passar do cartao para o chip nao
 /// fecha uma e espera a outra abrir. Junto ao ponteiro: ancorada no cartao
 /// (quase 350 px de altura), a dica abriria embaixo dele, longe do nome.
 fn card_tooltip(resp: egui::Response, spot: CardSpot, host: &Host, w: Option<&HostWatch>) {
@@ -11334,44 +11435,35 @@ fn card_tooltip(resp: egui::Response, spot: CardSpot, host: &Host, w: Option<&Ho
         }
         (CardSpot::Load, Some(s)) => load_hint(ui, s),
         (CardSpot::Net, Some(s)) => net_hint(ui, s),
-        _ => monitor_card_hint(ui, host, w),
+        _ => {
+            monitor_card_hint(ui, host, w);
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(MON_CARD_USE).small().color(TEXT_WEAK));
+        }
     });
 }
 
 /// Resumo do kernel para a dica do cartao.
 fn kernel_summary(k: &monitor::KernelCheck) -> Option<&'static str> {
     if k.installed.is_some() {
-        Some("Kernel novo instalado: falta reiniciar o servidor")
+        Some("Kernel novo instalado: falta reiniciar")
     } else if k.available.is_some() {
-        Some("Atualização do kernel disponível")
+        Some("Kernel novo disponível")
     } else {
         None
     }
 }
 
-/// Dica do Tux: o kernel novo e o em uso.
+/// Dica do chip: o kernel atual e o novo, em poucas palavras.
 fn kernel_hint(ui: &mut egui::Ui, k: &monitor::KernelCheck) {
-    ui.label(egui::RichText::new("Atualização do kernel").strong().color(KERNEL_FG));
-    if let Some((pkg, ver)) = &k.available {
-        ui.label(
-            egui::RichText::new(format!("Disponível nos repositórios: {pkg} {ver}")).color(CARD_TEXT),
-        );
-    }
+    ui.label(egui::RichText::new("Kernel").strong().color(KERNEL_FG));
+    ui.label(egui::RichText::new(format!("Atual: {}", k.running)).color(TEXT_WEAK));
     if let Some(v) = &k.installed {
-        ui.label(
-            egui::RichText::new(format!("Já instalado: {v}. Reinicie o servidor para usá-lo."))
-                .color(CARD_TEXT),
-        );
+        ui.label(egui::RichText::new(format!("Instalado: {v} (reiniciar)")).color(CARD_TEXT));
     }
-    ui.label(egui::RichText::new(format!("Em uso: {}", k.running)).color(TEXT_WEAK));
-    ui.add_space(2.0);
-    ui.label(
-        egui::RichText::new(
-            "Verificado ao conectar, pela lista de pacotes que o servidor já tem (sem baixá-la).",
-        )
-        .small()
-        .color(TEXT_WEAK),
-    );
+    if let Some((_, ver)) = &k.available {
+        ui.label(egui::RichText::new(format!("Disponível: {ver}")).color(CARD_TEXT));
+    }
 }
 
 /// Dica dos numeros do load.
@@ -11447,7 +11539,7 @@ fn monitor_summary(ui: &mut egui::Ui, mon: &MonitorUi, hosts: &[Host]) {
         .color(CARD_TEXT),
     );
     let chips = [
-        (counts[0], "saudável", "saudáveis", AUTH_KEY),
+        (counts[0], "ok", "ok", AUTH_KEY),
         (counts[1], "em atenção", "em atenção", AUTH_PASS),
         (counts[2], "crítico", "críticos", ERROR_FG),
         (counts[3], "sem resposta", "sem resposta", ERROR_FG),
@@ -11479,30 +11571,94 @@ fn monitor_controls(ui: &mut egui::Ui, mon: &mut MonitorUi, left: std::time::Dur
     });
 }
 
-/// Largura minima para o resumo e os controles na mesma linha.
-const MON_TOP_ONE_ROW: f32 = 760.0;
+/// Largura minima para o filtro, o resumo e os controles na mesma linha.
+const MON_TOP_ONE_ROW: f32 = 1000.0;
 
-/// Tela de monitoramento: resumo e "Atualizar agora" no topo e um cartao por
-/// host cadastrado. Coleta ao abrir e a cada `monitor::INTERVAL`. `path` (o
-/// painel) separa os ids de duas telas abertas lado a lado.
-fn monitor_ui(ui: &mut egui::Ui, mon: &mut MonitorUi, hosts: &[Host], path: &[usize]) {
+/// Hosts que passam no filtro do monitoramento (pelo nome exibido, como no
+/// seletor de conexoes), com o indice de cada um na lista.
+fn mon_filtered<'a>(hosts: &'a [Host], filter: &str) -> Vec<(usize, &'a Host)> {
+    let termo = filter.trim().to_lowercase();
+    hosts
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| termo.is_empty() || display_name(h).to_lowercase().contains(&termo))
+        .collect()
+}
+
+/// Campo de filtro do monitoramento (lupa, texto e limpar); Esc limpa.
+fn monitor_filter(ui: &mut egui::Ui, filter: &mut String) {
+    ui.add(
+        egui::Image::new(ICON_SEARCH)
+            .fit_to_exact_size(egui::vec2(16.0, 16.0))
+            .tint(TEXT_WEAK),
+    );
+    let resp = ui.add(
+        egui::TextEdit::singleline(filter)
+            .id_salt("monitor_filter")
+            .desired_width(200.0)
+            .hint_text("Filtrar servidores..."),
+    );
+    // O egui solta o foco no Esc: aqui ele tambem limpa o filtro.
+    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        filter.clear();
+    }
+    if !filter.is_empty()
+        && ui
+            .add(
+                egui::ImageButton::new(
+                    egui::Image::new(ICON_CLOSE)
+                        .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                        .tint(TEXT_WEAK),
+                )
+                .frame(false),
+            )
+            .on_hover_text("Limpar filtro")
+            .clicked()
+    {
+        filter.clear();
+    }
+}
+
+/// Tela de monitoramento: filtro, resumo e "Atualizar agora" no topo e um
+/// cartao por host cadastrado que passa no filtro. Coleta ao abrir e a cada
+/// `monitor::INTERVAL`. `path` (o painel) separa os ids de duas telas abertas
+/// lado a lado. Devolve o indice do host cujo cartao levou duplo clique.
+fn monitor_ui(
+    ui: &mut egui::Ui,
+    mon: &mut MonitorUi,
+    hosts: &[Host],
+    path: &[usize],
+) -> Option<usize> {
     let left = mon.tick(hosts);
     // Contagem regressiva no topo: um quadro por segundo basta.
     ui.ctx()
         .request_repaint_after(left.min(std::time::Duration::from_secs(1)));
+    let mut open = None;
 
     ui.push_id(("monitor", path), |ui| {
         ui.add_space(6.0);
-        // Painel estreito (tela dividida): resumo numa linha, que quebra se
-        // preciso, e os controles na de baixo.
+        let mut filter = std::mem::take(&mut mon.filter);
+        // O resumo conta so os cartoes que aparecem.
+        let shown: Vec<Host> = mon_filtered(hosts, &filter)
+            .into_iter()
+            .map(|(_, h)| h.clone())
+            .collect();
+        // Painel estreito (tela dividida): filtro e controles numa linha e o
+        // resumo, que quebra se preciso, na de baixo.
         if ui.available_width() >= MON_TOP_ONE_ROW {
             ui.horizontal(|ui| {
-                monitor_summary(ui, mon, hosts);
+                monitor_filter(ui, &mut filter);
+                ui.add_space(12.0);
+                monitor_summary(ui, mon, &shown);
                 monitor_controls(ui, mon, left);
             });
         } else {
-            ui.horizontal_wrapped(|ui| monitor_summary(ui, mon, hosts));
-            ui.horizontal(|ui| monitor_controls(ui, mon, left));
+            ui.horizontal(|ui| {
+                monitor_filter(ui, &mut filter);
+                monitor_controls(ui, mon, left);
+            });
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| monitor_summary(ui, mon, &shown));
         }
         ui.add_space(8.0);
 
@@ -11515,15 +11671,31 @@ fn monitor_ui(ui: &mut egui::Ui, mon: &mut MonitorUi, hosts: &[Host], path: &[us
                     ui.label(egui::RichText::new(MONITOR_EMPTY).color(TEXT_WEAK));
                     return;
                 }
+                let list = mon_filtered(hosts, &filter);
+                if list.is_empty() {
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Nenhum servidor corresponde a \"{}\".",
+                            filter.trim()
+                        ))
+                        .color(TEXT_WEAK),
+                    );
+                    return;
+                }
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::Vec2::splat(TILE_SPACING);
-                    for h in hosts {
-                        monitor_card(ui, h, mon.hosts.get(&h.id));
+                    for (i, h) in list {
+                        if monitor_card(ui, h, mon.hosts.get(&h.id)) {
+                            open = Some(i);
+                        }
                     }
                 });
                 ui.add_space(8.0);
             });
+        mon.filter = filter;
     });
+    open
 }
 
 #[cfg(test)]
@@ -11544,7 +11716,8 @@ mod monitor_ui_tests {
     fn uptime_and_age() {
         assert_eq!(fmt_uptime(59), "0 min");
         assert_eq!(fmt_uptime(3 * 3600 + 12 * 60), "3 h 12 min");
-        assert_eq!(fmt_uptime(2 * 86_400 + 5 * 3600 + 59), "2 d 5 h");
+        assert_eq!(fmt_uptime(2 * 86_400 + 5 * 3600 + 59), "2 d");
+        assert_eq!(fmt_uptime(86_399), "23 h 59 min");
         assert_eq!(fmt_ago(std::time::Duration::from_secs(2)), "agora");
         assert_eq!(fmt_ago(std::time::Duration::from_secs(40)), "há 40 s");
         assert_eq!(fmt_ago(std::time::Duration::from_secs(185)), "há 3 min");
@@ -11796,7 +11969,7 @@ mod monitor_ui_tests {
                 "{t:?} pintado de vermelho/ambar"
             );
         }
-        assert!(texts.iter().any(|(t, ..)| t == "Saudável"));
+        assert!(texts.iter().any(|(t, ..)| t == "Ok"));
         assert_eq!(dots(&out), [AUTH_KEY]);
 
         // Carga alta que continua: o ponto fica vermelho.
@@ -11952,15 +12125,27 @@ mod monitor_ui_tests {
         assert_eq!(fmt_bitrate(-5.0), "0 bps");
     }
 
-    /// Anel cheio com o minuto inteiro pela frente, vazio na hora da coleta;
-    /// a parte que falta termina sempre no topo.
+    /// Pontos todos apagados com o minuto inteiro pela frente e todos acesos
+    /// na hora da coleta, acendendo a partir do topo.
     #[test]
-    fn countdown_ring_empties_toward_the_top() {
+    fn countdown_dots_light_up_from_the_top() {
         let secs = std::time::Duration::from_secs;
         assert_eq!(countdown_frac(monitor::INTERVAL), 1.0);
         assert_eq!(countdown_frac(monitor::INTERVAL / 2), 0.5);
         assert_eq!(countdown_frac(secs(0)), 0.0);
         assert_eq!(countdown_frac(secs(600)), 1.0);
+        assert!(countdown_dots(monitor::INTERVAL).iter().all(|&a| a == 0.0));
+        assert!(countdown_dots(secs(0)).iter().all(|&a| a == 1.0));
+        let half = countdown_dots(monitor::INTERVAL / 2);
+        assert!(half[..COUNTDOWN_DOTS / 2].iter().all(|&a| a == 1.0), "{half:?}");
+        assert!(half[COUNTDOWN_DOTS / 2..].iter().all(|&a| a == 0.0), "{half:?}");
+        // 2,5 s de 60 com 12 pontos: o primeiro a meia luz.
+        let start = countdown_dots(monitor::INTERVAL - std::time::Duration::from_millis(2500));
+        assert!((start[0] - 0.5).abs() < 0.01 && start[1] == 0.0, "{start:?}");
+        // Na coleta, um ponto aceso so (o que gira).
+        let spin = spin_dots(0.26);
+        assert_eq!(spin.iter().filter(|&&a| a == 1.0).count(), 1);
+        assert_eq!(spin[3], 1.0);
         let c = egui::pos2(10.0, 10.0);
         // Metade: do ponteiro embaixo ate o topo, pela esquerda.
         let pts = arc_points(c, 5.0, 0.5, 1.0);
@@ -12062,12 +12247,12 @@ mod monitor_ui_tests {
         assert!(texts.iter().any(|t| t == "Média dos últimos 60 s"), "{texts:?}");
     }
 
-    /// Tux laranja antes da situacao so com kernel novo; a dica dele explica
-    /// e a do cartao tambem avisa.
+    /// Chip laranja antes da situacao so com kernel novo; a dica dele mostra
+    /// o kernel atual e o novo, e a do cartao tambem avisa.
     #[test]
-    fn kernel_update_shows_the_tux() {
+    fn kernel_update_shows_the_chip() {
         let ctx = hint_ctx();
-        let host = mon_host("Kernel", "srv");
+        let host = mon_host("Servidor K", "srv");
         let mut w = HostWatch {
             last: Some(monitor::Sample {
                 cpu_pct: Some(12.0),
@@ -12080,7 +12265,7 @@ mod monitor_ui_tests {
             }),
             ..Default::default()
         };
-        let tux_tints = |out: &egui::FullOutput| -> usize {
+        let chip_tints = |out: &egui::FullOutput| -> usize {
             out.shapes
                 .iter()
                 .filter(|s| match &s.shape {
@@ -12093,37 +12278,124 @@ mod monitor_ui_tests {
         // Primeiro quadro so carrega as imagens.
         card_frame(&ctx, &host, &w, 0.0, vec![]);
         let out = card_frame(&ctx, &host, &w, 0.1, vec![]);
-        assert_eq!(tux_tints(&out), 1);
-        let pill = painted(&out).into_iter().find(|(t, ..)| t == "Saudável").expect("situacao").2;
-        let tux = egui::pos2(pill.left() - 8.0 - 6.0 - KERNEL_ICON / 2.0, pill.center().y);
-        let texts = hover_card(&ctx, &host, &w, 10.0, tux);
-        assert!(texts.iter().any(|t| t == "Atualização do kernel"), "{texts:?}");
+        assert_eq!(chip_tints(&out), 1);
+        let pill = painted(&out).into_iter().find(|(t, ..)| t == "Ok").expect("situacao").2;
+        let chip = egui::pos2(pill.left() - 8.0 - 6.0 - KERNEL_ICON / 2.0, pill.center().y);
+        let texts = hover_card(&ctx, &host, &w, 10.0, chip);
+        assert!(texts.iter().any(|t| t == "Kernel"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Atual: 4.18.0-553.el8_10.x86_64"), "{texts:?}");
         assert!(
-            texts.iter().any(|t| t == "Já instalado: 4.18.0-553.22.1.el8_10.x86_64. Reinicie o servidor para usá-lo."),
+            texts.iter().any(|t| t == "Instalado: 4.18.0-553.22.1.el8_10.x86_64 (reiniciar)"),
             "{texts:?}"
         );
-        assert!(texts.iter().any(|t| t == "Em uso: 4.18.0-553.el8_10.x86_64"), "{texts:?}");
         // A dica do cartao (no nome) tambem avisa.
-        let name = painted(&out).into_iter().find(|(t, ..)| t == "Kernel").expect("nome").2;
+        let name = painted(&out).into_iter().find(|(t, ..)| t == "Servidor K").expect("nome").2;
         let texts = hover_card(&ctx, &host, &w, 20.0, name.center());
-        assert!(texts.iter().any(|t| t == "Kernel novo instalado: falta reiniciar o servidor"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Kernel novo instalado: falta reiniciar"), "{texts:?}");
 
-        // Disponivel nos repositorios.
+        // Disponivel nos repositorios: so a versao, sem o nome do pacote.
         let k = w.kernel.as_mut().unwrap();
         k.installed = None;
         k.available = Some(("kernel".into(), "4.18.0-553.30.1.el8_10".into()));
-        let texts = hover_card(&ctx, &host, &w, 30.0, tux);
-        assert!(
-            texts.iter().any(|t| t == "Disponível nos repositórios: kernel 4.18.0-553.30.1.el8_10"),
-            "{texts:?}"
-        );
-        // Sem kernel novo: sem Tux, e ali vale a dica do cartao.
+        let texts = hover_card(&ctx, &host, &w, 30.0, chip);
+        assert!(texts.iter().any(|t| t == "Disponível: 4.18.0-553.30.1.el8_10"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.starts_with("Instalado")), "{texts:?}");
+        // Sem kernel novo: sem chip, e ali vale a dica do cartao.
         w.kernel.as_mut().unwrap().available = None;
         let out = card_frame(&ctx, &host, &w, 35.0, vec![]);
-        assert_eq!(tux_tints(&out), 0);
-        let texts = hover_card(&ctx, &host, &w, 40.0, tux);
-        assert!(!texts.iter().any(|t| t == "Atualização do kernel"), "{texts:?}");
+        assert_eq!(chip_tints(&out), 0);
+        let texts = hover_card(&ctx, &host, &w, 40.0, chip);
+        assert!(!texts.iter().any(|t| t == "Kernel"), "{texts:?}");
         assert!(texts.iter().any(|t| t == "Tudo dentro dos limites"), "{texts:?}");
+    }
+
+    /// Duplo clique no cartao: `monitor_card` avisa (o painel abre um
+    /// terminal no servidor); um clique so, nao.
+    #[test]
+    fn card_double_click_opens() {
+        let ctx = hint_ctx();
+        let host = mon_host("Duplo", "srv");
+        let w = HostWatch::default();
+        let run = |time: f64, events: Vec<egui::Event>| {
+            let mut open = false;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 800.0),
+                )),
+                events,
+                time: Some(time),
+                focused: true,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    open = monitor_card(ui, &host, Some(&w));
+                });
+            });
+            open
+        };
+        let at = egui::pos2(100.0, 150.0);
+        let click = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        run(0.0, vec![egui::Event::PointerMoved(at)]);
+        assert!(!run(0.1, vec![click(true), click(false)]));
+        assert!(run(0.2, vec![click(true), click(false)]));
+    }
+
+    /// Endereco no cartao sem o usuario e sem a porta; o rodape
+    /// diz "Ativo" e so mostra a idade do dado com problema.
+    #[test]
+    fn card_header_and_footer_are_short() {
+        let ctx = hint_ctx();
+        let mut host = mon_host("Web", "123.123.123.123");
+        let mut w = HostWatch {
+            last: Some(monitor::Sample {
+                cpu_pct: Some(12.0),
+                uptime_secs: Some(3 * 86_400 + 5 * 3600),
+                procs: Some(120),
+                ..Default::default()
+            }),
+            at: Some(Instant::now()),
+            ..Default::default()
+        };
+        let texts = |out: &egui::FullOutput| -> Vec<String> {
+            painted(out).into_iter().map(|(t, ..)| t).collect()
+        };
+        let t = texts(&card_frame(&ctx, &host, &w, 0.0, vec![]));
+        assert!(t.iter().any(|t| t == "123.123.123.123"), "{t:?}");
+        assert!(!t.iter().any(|t| t.contains("root@")), "{t:?}");
+        assert!(t.iter().any(|t| t == "Ativo 3 d \u{00b7} 120 processos"), "{t:?}");
+        assert!(!t.iter().any(|t| t == "agora"), "idade com tudo ok: {t:?}");
+        // Com problema, a idade aparece.
+        w.last.as_mut().unwrap().cpu_pct = Some(99.0);
+        let t = texts(&card_frame(&ctx, &host, &w, 0.1, vec![]));
+        assert!(t.iter().any(|t| t == "agora"), "{t:?}");
+        host.port = 2222;
+        let t = texts(&card_frame(&ctx, &host, &w, 0.2, vec![]));
+        assert!(t.iter().any(|t| t == "123.123.123.123"), "{t:?}");
+        assert!(!t.iter().any(|t| t.contains("2222")), "{t:?}");
+    }
+
+    /// O filtro vale pelo nome exibido (sem diferenciar maiusculas) e
+    /// devolve o indice de cada host na lista.
+    #[test]
+    fn monitor_filter_matches_names() {
+        let hosts = vec![
+            mon_host("Web 01", "10.0.0.1"),
+            mon_host("Banco", "10.0.0.2"),
+            mon_host("web 02", "10.0.0.3"),
+        ];
+        let idx = |f: &str| mon_filtered(&hosts, f).into_iter().map(|(i, _)| i).collect::<Vec<_>>();
+        assert_eq!(idx(""), [0, 1, 2]);
+        assert_eq!(idx("  WEB "), [0, 2]);
+        assert_eq!(idx("banco"), [1]);
+        // O endereco nao conta.
+        assert!(idx("10.0").is_empty());
     }
 
     /// A verificacao do kernel vale para o servidor de agora: a de um
@@ -12772,6 +13044,33 @@ fn render_node(
                                         dir: SplitDir::SideBySide,
                                     });
                                 }
+                                // Terminal de um host cadastrado: SFTP no
+                                // mesmo servidor, ao lado (a esquerda dos
+                                // botoes de divisao, um pouco afastado).
+                                let host = pane.host_id.and_then(|id| {
+                                    hosts.iter().position(|h| h.id == id)
+                                });
+                                if let Some(host) = host.filter(|_| pane.terminal.is_some()) {
+                                    ui.add_space(8.0);
+                                    let sftp = egui::ImageButton::new(
+                                        egui::Image::new(ICON_FOLDER_LOCK)
+                                            .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                                            .tint(ICON_TINT),
+                                    )
+                                    .frame(false);
+                                    if ui
+                                        .add(sftp)
+                                        .on_hover_text("Abrir SFTP ao lado (Ctrl+B, E)")
+                                        .clicked()
+                                    {
+                                        actions.push(PaneAction::SplitOpen {
+                                            path: path.clone(),
+                                            dir: SplitDir::SideBySide,
+                                            host,
+                                            sftp: true,
+                                        });
+                                    }
+                                }
                             },
                         );
                     });
@@ -12847,7 +13146,15 @@ fn render_node(
                         None => {}
                     }
                 } else if let Some(mon) = &mut pane.monitor {
-                    monitor_ui(ui, mon, hosts, path);
+                    // Duplo clique num cartao: terminal no servidor, embaixo.
+                    if let Some(host) = monitor_ui(ui, mon, hosts, path) {
+                        actions.push(PaneAction::SplitOpen {
+                            path: path.clone(),
+                            dir: SplitDir::Stacked,
+                            host,
+                            sftp: false,
+                        });
+                    }
                 } else if pane.sftp.is_some() && pane.host_key.is_some() {
                     // SFTP aguardando a confirmacao da chave: sem navegador ainda.
                     pane_spinner(ui, HOST_KEY_WAIT);
@@ -13298,9 +13605,10 @@ impl eframe::App for App {
                                 ui.label(
                                     egui::RichText::new(
                                         "H dividir  \u{00b7}  V empilhar  \u{00b7}  \
+                                         E SFTP ao lado  \u{00b7}  \
                                          setas trocar painel  \u{00b7}  \
                                          O ciclar  \u{00b7}  X fechar  \u{00b7}  \
-                                         Ctrl+B / F1 literal  \u{00b7}  A ajuda  \u{00b7}  \
+                                         B / F1 literal  \u{00b7}  A ajuda  \u{00b7}  \
                                          Esc cancela",
                                     )
                                     .small()
@@ -13971,6 +14279,76 @@ mod focus_tests {
         frame(&ctx, &mut app, vec![key(egui::Key::F1, egui::Modifiers::NONE)]);
         assert!(!app.show_help);
         assert_eq!(sent_bytes(&mut to_rx), b"\x1bOP");
+    }
+
+    /// Ctrl+B, B envia um Ctrl+B ao terminal (como Ctrl+B, Ctrl+B).
+    #[test]
+    fn chord_b_sends_ctrl_b() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let (mut app, mut to_rx, _tx) = ssh_app(false);
+        app.pending_focus = Some(vec![]);
+        for _ in 0..3 {
+            frame(&ctx, &mut app, vec![]);
+        }
+        frame(&ctx, &mut app, vec![key(egui::Key::B, egui::Modifiers::CTRL)]);
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::B, egui::Modifiers::NONE), egui::Event::Text("b".into())],
+        );
+        assert_eq!(sent_bytes(&mut to_rx), [0x02]);
+        assert!(app.chord_armed_at.is_none());
+        frame(&ctx, &mut app, vec![key(egui::Key::B, egui::Modifiers::CTRL)]);
+        frame(&ctx, &mut app, vec![key(egui::Key::B, egui::Modifiers::CTRL)]);
+        assert_eq!(sent_bytes(&mut to_rx), [0x02]);
+    }
+
+    /// Ctrl+B, E abre ao lado um SFTP no servidor do terminal focado (e o
+    /// painel novo recebe o foco); num terminal sem host cadastrado, nada.
+    #[test]
+    fn chord_e_opens_sftp_beside() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let (mut app, _to_rx, _tx) = ssh_app(false);
+        // Porta fechada: a conexao do SFTP falha sozinha, sem rede.
+        let mut host = Host::new();
+        host.name = "Web".into();
+        host.host = "127.0.0.1".into();
+        host.port = 1;
+        host.username = "root".into();
+        let id = host.id;
+        app.vault.hosts.push(host);
+        app.pending_focus = Some(vec![]);
+        for _ in 0..3 {
+            frame(&ctx, &mut app, vec![]);
+        }
+        // Terminal local (sem host): Ctrl+B, E nao divide.
+        frame(&ctx, &mut app, vec![key(egui::Key::B, egui::Modifiers::CTRL)]);
+        frame(&ctx, &mut app, vec![key(egui::Key::E, egui::Modifiers::NONE)]);
+        assert!(matches!(app.root, Some(Node::Leaf(_))));
+
+        if let Some(Node::Leaf(pane)) = &mut app.root {
+            pane.host_id = Some(id);
+        }
+        frame(&ctx, &mut app, vec![key(egui::Key::B, egui::Modifiers::CTRL)]);
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::E, egui::Modifiers::NONE), egui::Event::Text("e".into())],
+        );
+        let Some(Node::Split { dir, children }) = &app.root else {
+            panic!("nao dividiu");
+        };
+        assert!(*dir == SplitDir::SideBySide);
+        let Node::Leaf(new) = &children[1] else {
+            panic!("painel novo nao e folha");
+        };
+        assert!(new.sftp.is_some() && new.explorer.is_some());
+        assert_eq!(new.host_id, Some(id));
+        assert_eq!(new.host_name, "Web  (SFTP)");
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(app.focused_path, Some(vec![1]));
     }
 
     // --- Chave do servidor (TOFU) -----------------------------------------
@@ -16116,9 +16494,6 @@ mod focus_tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         files.sort_unstable();
-        // O Tux (ICON_LINUX) marca o kernel novo, nao um sistema.
-        slugs.push("linux");
-        slugs.sort_unstable();
         let expected: Vec<String> = slugs.iter().map(|s| format!("{s}.svg")).collect();
         assert_eq!(files, expected);
     }
@@ -16127,8 +16502,7 @@ mod focus_tests {
     /// sem script, link externo nem estilo, e pequeno.
     #[test]
     fn os_icon_assets_are_safe_white_svgs() {
-        let tux = ("linux", ICON_LINUX, KERNEL_FG);
-        for (slug, img, _) in OS_ICONS.iter().chain([&tux]) {
+        for (slug, img, _) in OS_ICONS.iter() {
             let (uri, bytes) = icon_bytes(img);
             assert_eq!(uri, format!("bytes://../assets/os/{slug}.svg"));
             let text = std::str::from_utf8(bytes).expect("SVG em UTF-8");
@@ -16149,8 +16523,7 @@ mod focus_tests {
     fn os_icons_render_white() {
         let ctx = egui::Context::default();
         egui_extras::install_image_loaders(&ctx);
-        let tux = ("linux", ICON_LINUX, KERNEL_FG);
-        for (slug, img, _) in OS_ICONS.iter().chain([&tux]) {
+        for (slug, img, _) in OS_ICONS.iter() {
             let (uri, bytes) = icon_bytes(img);
             assert!(egui_extras::image::load_svg_bytes(bytes).is_ok(), "{slug}");
             ctx.include_bytes(uri.clone(), bytes);

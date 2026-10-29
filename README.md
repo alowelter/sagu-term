@@ -103,6 +103,8 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
 ### Painéis divididos
 - Divida qualquer painel quantas vezes quiser: `Ctrl+B, H` (lado a lado) ou
   `Ctrl+B, V` (empilhado).
+- Num terminal de um servidor cadastrado, `Ctrl+B, E` (ou o ícone de pasta na barra do
+  painel) abre ao lado um navegador SFTP no mesmo servidor.
 - Cada painel novo já abre o seletor de conexões com a busca pronta para digitar.
 - Navegue com `Alt+setas`. O painel ativo fica destacado.
 
@@ -175,12 +177,14 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
   **memória** e do **disco** mais cheio, **load** de 1, 5 e 15 minutos (o período fica na
   dica dos números) e, na mesma linha, o **tráfego de rede** enviado e recebido (só as
   placas físicas, sem contar de novo bridges, contêineres e VPNs), gráfico de CPU e
-  memória da última hora, barras dos discos e do swap, tempo ligado e número de processos.
-- Um **Tux laranja** ao lado da situação avisa que há um **kernel mais novo**: já
+  memória da última hora, barras dos discos e do swap, tempo ativo e número de processos.
+- O campo **Filtrar servidores** no topo mostra só os cartões com o nome digitado, e um
+  **duplo clique** num cartão divide o painel e abre embaixo um terminal no servidor.
+- Um **chip laranja** ao lado da situação avisa que há um **kernel mais novo**: já
   instalado, esperando o servidor reiniciar, ou disponível nos repositórios (pelo cache
   do `dnf` ou pelas listas do `apt` que o servidor já tem, sem baixar nada). A conferência
-  é feita uma vez por conexão, e a dica mostra as versões.
-- Cada servidor ganha uma situação (**Saudável**, **Atenção** ou **Crítico**) pela pior
+  é feita uma vez por conexão, e a dica mostra o kernel atual e o novo.
+- Cada servidor ganha uma situação (**Ok**, **Atenção** ou **Crítico**) pela pior
   medida, e o topo da tela resume quantos estão em cada uma. A dica do cartão lista o que
   está fora do normal e todos os discos. O load conta pelo menor entre os de 1 e 5
   minutos, por CPU: um pico curto e moderado não acusa, e a situação volta ao normal poucos
@@ -189,7 +193,8 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
   do ar) é encerrado em 5 segundos, mantendo os discos da leitura anterior.
 - Atualiza sozinha a cada minuto enquanto estiver aberta (ou na hora, com **Atualizar
   agora**), usando uma conexão por servidor que fica aberta só enquanto a tela existir. Um
-  anel pequeno no topo esvazia até a próxima coleta (o tempo restante fica na dica).
+  anel de pontos no topo vai acendendo até a próxima coleta (o tempo restante fica na
+  dica). A idade do dado só aparece no rodapé do cartão quando há algum problema.
   Trocar o endereço, a porta, o usuário, a senha ou a chave de uma conexão, ou aceitar a
   chave do servidor no terminal, já dispara uma coleta. Se o servidor recusar as
   credenciais, o monitoramento não tenta de novo sozinho (para não acumular tentativas de
@@ -259,9 +264,10 @@ No topo da ajuda aparece a versão instalada.
 |---|---|---|
 | Painéis | `Alt+setas` | Trocar de painel na direção da seta |
 | Painéis | `Ctrl+B, H` / `Ctrl+B, V` | Dividir lado a lado / empilhado |
+| Painéis | `Ctrl+B, E` | Abrir ao lado um SFTP no servidor do terminal |
 | Painéis | `Ctrl+B, O` | Ciclar entre os painéis |
 | Painéis | `Ctrl+B, X` | Fechar o painel ativo |
-| Painéis | `Ctrl+B, Ctrl+B` | Enviar `Ctrl+B` ao terminal (útil com tmux remoto) |
+| Painéis | `Ctrl+B, B` (ou `Ctrl+B, Ctrl+B`) | Enviar `Ctrl+B` ao terminal (útil com tmux remoto) |
 | Painéis | `Ctrl+B, F1` | Enviar `F1` ao terminal (ex.: ajuda do htop ou do mc) |
 | Terminal | Roda do mouse / `Shift+PgUp` / `Shift+PgDn` | Rolar o histórico (3 linhas por clique / uma página) |
 | Terminal | `Shift+Home` / `Shift+End` | Início / fim do histórico (digitar também volta ao fim) |
@@ -449,7 +455,7 @@ cor de cada marca.
 | Fedora (logotipo) | Red Hat, Inc. (projeto Fedora) | [Diretrizes da marca Fedora](https://docs.fedoraproject.org/en-US/project/brand/) | [docs.fedoraproject.org](https://docs.fedoraproject.org/en-US/project/brand/) |
 
 Os demais ícones (AlmaLinux, Alpine Linux, Apple, Arch Linux, CentOS, elementary, EndeavourOS,
-FreeBSD, Linux (o Tux, que no monitoramento avisa de kernel novo), Linux Mint, Manjaro, openSUSE,
+FreeBSD, Linux Mint, Manjaro, openSUSE,
 OpenWrt, Pop!_OS, Raspberry Pi, Red Hat, Slackware, SUSE, Ubuntu, Void Linux e Zorin) não têm
 licença específica registrada no Simple Icons.
 
