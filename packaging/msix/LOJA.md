@@ -132,8 +132,8 @@ TERMINAL LOCAL
 MONITORAMENTO
 • O cartão Monitoramento abre uma tela com um cartão por servidor: anéis de CPU, memória e do disco mais cheio, load de 1, 5 e 15 minutos, tráfego de rede enviado e recebido, gráfico de CPU e memória da última hora, discos, swap, tempo ativo e processos.
 • Filtre os servidores pelo nome e, com um duplo clique num cartão, abra um terminal no servidor no mesmo painel, logo abaixo.
-• Um chip laranja avisa quando o servidor tem um kernel mais novo, já instalado e esperando reiniciar ou disponível nos repositórios, com o kernel atual e o novo na dica.
-• Cada servidor ganha uma situação (Ok, Atenção ou Crítico) pela pior medida, e o topo da tela resume quantos estão em cada uma. A dica do cartão mostra o que está fora do normal.
+• Um chip laranja avisa quando o servidor tem uma versão nova do kernel, já instalada e esperando reiniciar ou disponível nos repositórios, com o kernel atual e o novo na dica. Revisões da distribuição sobre a mesma versão não geram aviso.
+• Cada servidor ganha uma situação (Ok, Atenção ou Crítico) pela pior medida, e o topo da tela resume quantos estão em cada uma. Servidor sem problema mostra só um ícone verde. A dica do cartão mostra o que está fora do normal.
 • Atualiza sozinho a cada minuto enquanto está aberto, ou na hora com Atualizar agora, usando uma conexão por servidor que fecha junto com a tela. Funciona em servidores Linux.
 
 PAINÉIS DIVIDIDOS
@@ -166,8 +166,15 @@ Leve e rápido: escrito em Rust do começo ao fim, incluindo o SSH (sem OpenSSL)
 
 ### What's new in this version (Novidades desta versão)
 
-Limite: 1500 caracteres. Texto da 1.6.0 (710 caracteres), com o filtro, o duplo clique e o
-cartão mais limpo no monitoramento e o SFTP ao lado pelo terminal:
+Limite: 1500 caracteres. Texto da 1.7.0 (536 caracteres), com o aviso de kernel só para
+versão nova, o ícone verde do cartão sem problema e as bordas do pm2 monit no terminal:
+
+```text
+Monitoramento: o aviso de kernel novo ficou mais criterioso. Ele só aparece quando sai uma versão nova do kernel (por exemplo, de 4.18.0 para 4.19.0), e não mais a cada revisão da distribuição sobre a mesma versão, que traz só pequenas correções e acabava virando um aviso insistente. Servidores sem nenhum problema mostram só um ícone verde no cartão, no lugar do texto Ok.
+Terminal: programas que desenham bordas com os gráficos de linha do terminal, como o pm2 monit, agora aparecem com as linhas certas, em vez de letras como q e x.
+```
+
+Texto da 1.6.0, só de referência:
 
 ```text
 Monitoramento: filtre os servidores pelo nome no topo da tela, e um duplo clique num cartão abre um terminal no servidor, no mesmo painel, logo abaixo. O aviso de kernel novo agora é um chip laranja, com o kernel atual e o novo na dica. O cartão ficou mais limpo: só o endereço do servidor abaixo do nome, a situação boa aparece como Ok, o tempo ligado como Ativo (com as horas só no primeiro dia) e a idade da leitura só aparece quando há algum problema. A contagem para a próxima atualização virou um anel de pontos que vão acendendo.
