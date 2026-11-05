@@ -37,6 +37,16 @@
 //! duas telas, e um `ESC 7` (ou `CSI s`) na alternativa apagaria as cores que
 //! o `1049 h` salvou da principal. O `Terminal` guarda a copia e a devolve.
 //!
+//! O vt100 tambem ignora a troca de conjunto de caracteres: `ESC ( 0` (G0)
+//! ou `ESC ) 0` (G1) escolhem os graficos de linha do VT100 (DEC Special
+//! Graphics), `ESC ( B`/`ESC ) B` voltam ao ASCII e SO/SI (0x0E/0x0F) passam
+//! a usar o G1/G0. O blessed (`pm2 monit`) e o ncurses sem UTF-8 desenham
+//! as bordas assim: `lqqk`, `x`, `mqqj`; sem a troca, as letras aparecem no
+//! lugar de `┌──┐`, `│`, `└──┘`. Com os graficos em uso, o tradutor troca no
+//! texto cada byte de 0x5F a 0x7E pelo caractere Unicode correspondente
+//! (`dec_graphic`); as sequencias de escape seguem para o vt100 como
+//! vieram (ele as descarta). `ESC c` (RIS) volta tudo ao ASCII.
+//!
 //! O reconhecimento imita a maquina de estados do vte 0.15 (o parser por
 //! baixo do vt100), para traduzir exatamente o que o vt100 despacharia como
 //! CSI:
@@ -64,6 +74,20 @@ const ESC: u8 = 0x1b;
 const CAN: u8 = 0x18;
 const SUB: u8 = 0x1a;
 const BEL: u8 = 0x07;
+/// Shift Out / Shift In: texto pelo G1 / pelo G0.
+const SO: u8 = 0x0e;
+const SI: u8 = 0x0f;
+
+/// Caractere do conjunto de graficos de linha do VT100 (DEC Special
+/// Graphics) para o byte `b`, como no xterm; `None` fora de 0x5F a 0x7E (o
+/// resto do conjunto e o ASCII).
+fn dec_graphic(b: u8) -> Option<&'static str> {
+    const TABLE: [&str; 32] = [
+        "\u{a0}", "◆", "▒", "␉", "␌", "␍", "␊", "°", "±", "␤", "␋", "┘", "┐", "┌", "└", "┼",
+        "⎺", "⎻", "─", "⎼", "⎽", "├", "┤", "┴", "┬", "│", "≤", "≥", "π", "≠", "£", "·",
+    ];
+    TABLE.get(usize::from(b.checked_sub(0x5f)?)).copied()
+}
 
 /// O que o tradutor entrega, em ordem, a quem usa o parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,8 +129,9 @@ enum State {
     /// Logo depois de um ESC.
     Esc,
     /// ESC e intermediario(s) (0x20..=0x2f, ex. o "ESC (" do sgr0): falta o
-    /// byte final, e um '[' aqui e final, nao abre CSI.
-    EscInter,
+    /// byte final, e um '[' aqui e final, nao abre CSI. Com um intermediario
+    /// so, ele (`(` ou `)` escolhem o conjunto do G0 ou do G1).
+    EscInter(Option<u8>),
     /// "ESC [" no fim do pedaco anterior: o '[' ainda nao foi repassado.
     CsiStart,
     /// Dentro de um CSI (o "ESC [" ja foi repassado).
@@ -164,6 +189,11 @@ pub struct VtFix {
     /// Caractere UTF-8 incompleto do fim do ultimo pedaco (so no texto).
     held: [u8; 3],
     held_len: u8,
+    /// G0 e G1 com os graficos de linha (`ESC ( 0`, `ESC ) 0`).
+    g0_lines: bool,
+    g1_lines: bool,
+    /// Texto pelo G1 (depois de um SO, ate o SI).
+    shifted: bool,
 }
 
 impl VtFix {
@@ -173,6 +203,15 @@ impl VtFix {
     /// sequencia do servidor, e o resto dela iria para a tela.
     pub fn idle(&self) -> bool {
         self.state == State::Text && self.held_len == 0
+    }
+
+    /// O texto sai pelos graficos de linha.
+    fn lines(&self) -> bool {
+        if self.shifted {
+            self.g1_lines
+        } else {
+            self.g0_lines
+        }
     }
 
     /// Traduz `input` e entrega o resultado a `out`, em trechos: fatias do
@@ -219,13 +258,29 @@ impl VtFix {
         }
         while i < input.len() {
             let b = input[i];
+            // SO/SI dentro de um escape ou CSI: o vte os executa sem sair dele.
+            if matches!(b, SO | SI) && matches!(self.state, State::Esc | State::EscInter(_) | State::Csi(_)) {
+                self.shifted = b == SO;
+            }
             match self.state {
                 State::Text => {
-                    // Caminho rapido: pula direto ao proximo ESC.
-                    match input[i..].iter().position(|&c| c == ESC) {
+                    // Caminho rapido: pula direto ao proximo ESC, SO ou SI (e,
+                    // com os graficos de linha, ao proximo byte a trocar).
+                    let lines = self.lines();
+                    let stop = |c: u8| matches!(c, ESC | SO | SI) || (lines && dec_graphic(c).is_some());
+                    match input[i..].iter().position(|&c| stop(c)) {
                         Some(n) => {
                             i += n;
-                            self.state = State::Esc;
+                            match input[i] {
+                                ESC => self.state = State::Esc,
+                                SO => self.shifted = true,
+                                SI => self.shifted = false,
+                                c => {
+                                    emit!(&input[start..i]);
+                                    emit!(dec_graphic(c).unwrap_or_default().as_bytes());
+                                    start = i + 1;
+                                }
+                            }
                         }
                         None => break,
                     }
@@ -271,7 +326,14 @@ impl VtFix {
                         // escape continua.
                         _ if is_exec(b) || b == ESC || b >= 0x7f => State::Esc,
                         // Intermediario: falta o byte final.
-                        0x20..=0x2f => State::EscInter,
+                        0x20..=0x2f => State::EscInter(Some(b)),
+                        // RIS: o terminal volta ao estado inicial (ASCII).
+                        b'c' => {
+                            self.g0_lines = false;
+                            self.g1_lines = false;
+                            self.shifted = false;
+                            State::Text
+                        }
                         // Inicio de string: OSC; DCS, SOS, PM e APC.
                         b']' => State::Str { osc: true },
                         b'P' | b'X' | b'^' | b'_' => State::Str { osc: false },
@@ -279,14 +341,26 @@ impl VtFix {
                         _ => State::Text,
                     };
                 }
-                State::EscInter => {
+                State::EscInter(first) => {
                     self.state = match b {
                         ESC => State::Esc,
                         // Byte final (inclusive '['): o vte despacha o escape.
-                        CAN | SUB | 0x30..=0x7e => State::Text,
-                        // Controle executado, mais intermediarios, DEL ou
-                        // >= 0x80: continua esperando o final.
-                        _ => State::EscInter,
+                        // `ESC ( x`/`ESC ) x`: o conjunto do G0/G1, graficos
+                        // de linha so com o '0'.
+                        0x30..=0x7e => {
+                            match first {
+                                Some(b'(') => self.g0_lines = b == b'0',
+                                Some(b')') => self.g1_lines = b == b'0',
+                                _ => {}
+                            }
+                            State::Text
+                        }
+                        CAN | SUB => State::Text,
+                        // Mais intermediarios: nao e troca de conjunto.
+                        0x20..=0x2f => State::EscInter(None),
+                        // Controle executado, DEL ou >= 0x80: continua
+                        // esperando o final.
+                        _ => State::EscInter(first),
                     };
                 }
                 State::CsiStart => {
@@ -819,6 +893,33 @@ pub(crate) mod tests {
         }
     }
 
+    /// Bordas do `pm2 monit` (blessed) e do ncurses sem UTF-8: pelos graficos
+    /// de linha do G0 ou, com SO/SI, do G1; o resto do texto nao muda.
+    #[test]
+    fn dec_line_drawing() {
+        let fixed = |s: &[u8]| {
+            let got = fix(s);
+            String::from_utf8([got.out, got.pending].concat()).unwrap()
+        };
+        assert_eq!(
+            fixed(b"\x1b(0lqqk\x1b(B Process\r\n\x1b(0x\x1b(Bok\x1b(0x\r\nmqqj"),
+            "\x1b(0┌──┐\x1b(B Process\r\n\x1b(0│\x1b(Bok\x1b(0│\r\n└──┘"
+        );
+        // ncurses com o terminfo do linux/screen: G1 designado, SO/SI.
+        assert_eq!(fixed(b"\x1b)0a\x0elqk\x0fq"), "\x1b)0a\x0e┌─┐\x0fq");
+        // Fora de 0x5F..0x7E segue o ASCII; acentos (UTF-8) nao mudam.
+        assert_eq!(fixed("\x1b(0A1 ~_`é".as_bytes()), "\x1b(0A1 ·\u{a0}◆é");
+        // Outro conjunto, intermediarios a mais, RIS: volta ao ASCII.
+        assert_eq!(fixed(b"\x1b(0q\x1b(Aq"), "\x1b(0─\x1b(Aq");
+        assert_eq!(fixed(b"\x1b(0q\x1b((0q"), "\x1b(0─\x1b((0─");
+        assert_eq!(fixed(b"\x1b(0q\x1bcq"), "\x1b(0─\x1bcq");
+        // SO dentro de um CSI tambem vale; strings (titulo) nao sao texto.
+        assert_eq!(fixed(b"\x1b)0\x1b[\x0e1mq"), "\x1b)0\x1b[\x0e1m─");
+        assert_eq!(fixed(b"\x1b(0\x1b]0;lqk\x07q"), "\x1b(0\x1b]0;lqk\x07─");
+        // A sequencia cortada em qualquer ponto da o mesmo resultado.
+        assert_cut_invariant(b"\x1b(0lq\x1b(B\xc3\xa9\x1b)0\x0ex\x0f\x1b[5;1fq", false);
+    }
+
     #[test]
     fn missing_sequence_notices() {
         use Missing::*;
@@ -996,26 +1097,54 @@ pub(crate) mod tests {
         let mut alt = Vec::new();
         let mut missing = Vec::new();
         let mut dcs_c1_end = false; // DCS encerrado pelo 0x9C (ver acima)
+        // Conjuntos de caracteres: G0/G1 com graficos de linha, SO ativo, e
+        // os intermediarios do escape em curso.
+        let (mut g0, mut g1, mut so) = (false, false, false);
+        let mut esc_inter: Vec<u8> = Vec::new();
         for &b in input {
             let mut byte = Some(b);
             let mut notice = None;
             let mut miss = None;
+            // Controles executados (no texto, no escape e no CSI).
+            if matches!(b, 0x0e | 0x0f)
+                && matches!(st, Ground | Esc | EscInt | CsiEntry | CsiParam | CsiInt | CsiIgnore)
+            {
+                so = b == 0x0e;
+            }
             st = match st {
                 Ground => {
                     if matches!(b, 0x18 | 0x1a | 0x1b) {
                         dcs_c1_end = false;
                     }
+                    // print do vte, pelo conjunto em uso.
+                    if (0x20..=0x7e).contains(&b) && (if so { g1 } else { g0 }) {
+                        if let Some(g) = dec_graphic(b) {
+                            byte = None;
+                            out.extend_from_slice(g.as_bytes());
+                        }
+                    }
                     if b == 0x1b {
+                        esc_inter.clear();
                         Esc
                     } else {
                         Ground
                     }
                 }
                 Esc => match b {
-                    0x1b => Esc,
+                    0x1b => {
+                        esc_inter.clear();
+                        Esc
+                    }
                     _ if exec(b) => Esc,
                     0x18 | 0x1a => Ground,
-                    0x20..=0x2f => EscInt,
+                    0x20..=0x2f => {
+                        esc_inter.push(b);
+                        EscInt
+                    }
+                    b'c' => {
+                        (g0, g1, so) = (false, false, false);
+                        Ground
+                    }
                     b'P' => DcsEntry,
                     b'X' | b'^' | b'_' => SosPmApc,
                     b'[' => {
@@ -1033,8 +1162,20 @@ pub(crate) mod tests {
                 },
                 EscInt => match b {
                     _ if exec(b) => EscInt,
-                    0x20..=0x2f | 0x7f => EscInt,
-                    0x30..=0x7e => Ground,
+                    0x20..=0x2f => {
+                        esc_inter.push(b);
+                        EscInt
+                    }
+                    0x7f => EscInt,
+                    0x30..=0x7e => {
+                        // esc_dispatch: designacao do G0/G1.
+                        match esc_inter.as_slice() {
+                            [b'('] => g0 = b == b'0',
+                            [b')'] => g1 = b == b'0',
+                            _ => {}
+                        }
+                        Ground
+                    }
                     _ => anywhere(b, EscInt),
                 },
                 CsiEntry | CsiParam | CsiInt => {
@@ -1241,12 +1382,14 @@ pub(crate) mod tests {
         }
     }
 
+    /// Sem o '(' nao ha `ESC ( 0` (graficos de linha no G0; o G1 nunca e
+    /// designado aqui): so as trocas do f, s e u mudam alguma coisa.
     #[test]
     fn identity_without_f_s_u() {
         let alphabet: Vec<u8> = ALPHABET
             .iter()
             .copied()
-            .filter(|b| !b"fsu".contains(b))
+            .filter(|b| !b"fsu(".contains(b))
             .collect();
         let mut rng = Rng(0xfeed_beef_cafe_f00d);
         for _ in 0..20_000 {
