@@ -530,6 +530,31 @@ fn temp_name(local: &str) -> String {
 
 /// Nomes locais dos itens escolhidos e quais ja existem em `dest`.
 pub fn prepare(dest: &Path, picks: &[Pick]) -> Prepared {
+    let (items, invalid) = local_items(picks);
+    let mut out = Prepared {
+        dest: dest.to_path_buf(),
+        items: Vec::new(),
+        conflicts: Vec::new(),
+        invalid,
+    };
+    for item in items {
+        // Qualquer coisa com esse nome conta, inclusive link quebrado
+        // (e "A.TXT" contra "a.txt": o NTFS nao diferencia).
+        let exists = local_target(dest, std::slice::from_ref(&item.local))
+            .is_some_and(|p| std::fs::symlink_metadata(p).is_ok());
+        if exists {
+            out.conflicts.push(out.items.len());
+        }
+        out.items.push(item);
+    }
+    out
+}
+
+/// Nomes locais dos itens escolhidos (unicos entre eles, na ordem da
+/// listagem), sem olhar destino nenhum: os itens validos (com `replace =
+/// false`) e (nome remoto, motivo) dos que nao tem nome local possivel.
+/// Tambem usada pelo arrastar para o Explorer (ver `dragout`).
+pub(crate) fn local_items(picks: &[Pick]) -> (Vec<DownloadItem>, Vec<(String, String)>) {
     let mut order: Vec<usize> = (0..picks.len()).collect();
     order.sort_by(|&a, &b| picks[a].name.cmp(&picks[b].name));
     let sorted: Vec<String> = order.iter().map(|&i| picks[i].name.clone()).collect();
@@ -537,34 +562,21 @@ pub fn prepare(dest: &Path, picks: &[Pick]) -> Prepared {
     for (res, &i) in unique_local_names(&sorted).into_iter().zip(&order) {
         locals[i] = Some(res);
     }
-    let mut out = Prepared {
-        dest: dest.to_path_buf(),
-        items: Vec::new(),
-        conflicts: Vec::new(),
-        invalid: Vec::new(),
-    };
+    let mut items = Vec::new();
+    let mut invalid = Vec::new();
     for (pick, res) in picks.iter().zip(locals) {
         match res {
-            Some(Ok(local)) => {
-                // Qualquer coisa com esse nome conta, inclusive link quebrado
-                // (e "A.TXT" contra "a.txt": o NTFS nao diferencia).
-                let exists = local_target(dest, std::slice::from_ref(&local))
-                    .is_some_and(|p| std::fs::symlink_metadata(p).is_ok());
-                if exists {
-                    out.conflicts.push(out.items.len());
-                }
-                out.items.push(DownloadItem {
-                    remote: pick.remote.clone(),
-                    name: pick.name.clone(),
-                    local,
-                    replace: false,
-                });
-            }
-            Some(Err(why)) => out.invalid.push((pick.name.clone(), why.to_string())),
+            Some(Ok(local)) => items.push(DownloadItem {
+                remote: pick.remote.clone(),
+                name: pick.name.clone(),
+                local,
+                replace: false,
+            }),
+            Some(Err(why)) => invalid.push((pick.name.clone(), why.to_string())),
             None => {}
         }
     }
-    out
+    (items, invalid)
 }
 
 /// Aplica a escolha: Replace marca os conflitos com `replace`; Skip os tira
@@ -815,6 +827,10 @@ struct Job<'a> {
     last_event: Option<Instant>,
     /// Memoria guardada pela varredura ate agora (ver `MAX_SCAN_BYTES`).
     bytes: usize,
+    /// Entradas vistas antes de desistir, e o motivo dado (`MAX_ENTRIES` no
+    /// download; menos no arrastar para o Explorer, ver `scan_tree`).
+    max_entries: usize,
+    too_many: &'static str,
 }
 
 /// Garante um `Finished` por lote: `send` no fim normal; se a tarefa cair no
@@ -874,12 +890,71 @@ pub async fn run(
         report: &mut finish.report,
         last_event: None,
         bytes: 0,
+        max_entries: MAX_ENTRIES,
+        too_many: F_TOO_MANY,
     };
     if let Some(plan) = job.scan(&items).await {
         job.copy(&plan).await;
     }
     drop(job);
     finish.send();
+}
+
+/// Uma linha da arvore varrida por `scan_tree`: pasta ou arquivo.
+#[derive(Clone, Debug)]
+pub(crate) struct TreeEntry {
+    pub remote: String,
+    /// Componentes locais (ja seguros) a partir da pasta onde soltar; o 1o
+    /// e o item escolhido.
+    pub rel: Vec<String>,
+    /// Caminho remoto relativo (com "/"), para mensagens.
+    pub shown: String,
+    /// Tamanho e data de modificacao; `None` = pasta.
+    pub file: Option<(u64, Option<u32>)>,
+}
+
+/// A varredura do download sem gravar nada (arrastar para o Explorer, ver
+/// `dragout`): mesmas regras de nomes, links e arquivos especiais, com no
+/// maximo `max_entries` entradas (alem disso, `too_many` vira o `fatal`).
+/// Devolve o plano (cada pasta antes do seu conteudo; `None` = parou) e o
+/// relatorio com ignorados, ajustados e falhas da varredura.
+pub(crate) async fn scan_tree(
+    sftp: &SftpSession,
+    items: &[DownloadItem],
+    max_entries: usize,
+    too_many: &'static str,
+    cancel: watch::Receiver<bool>,
+) -> (Option<Vec<TreeEntry>>, DownloadReport) {
+    // Ninguem ouve o andamento da varredura aqui.
+    let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let mut report = DownloadReport::default();
+    let mut job = Job {
+        sftp,
+        id: 0,
+        dest: Path::new(""),
+        cancel,
+        tx: &tx,
+        report: &mut report,
+        last_event: None,
+        bytes: 0,
+        max_entries,
+        too_many,
+    };
+    let plan = job.scan(items).await.map(|plan| {
+        plan.into_iter()
+            .map(|e| TreeEntry {
+                remote: e.remote,
+                rel: e.rel,
+                shown: e.shown,
+                file: match e.kind {
+                    Kind::Dir => None,
+                    Kind::File { size, mtime } => Some((size, mtime)),
+                },
+            })
+            .collect()
+    });
+    drop(job);
+    (plan, report)
 }
 
 impl Job<'_> {
@@ -907,8 +982,8 @@ impl Job<'_> {
             return false;
         }
         *seen += 1;
-        if *seen > MAX_ENTRIES {
-            self.report.fatal = Some(F_TOO_MANY.into());
+        if *seen > self.max_entries {
+            self.report.fatal = Some(self.too_many.into());
             return false;
         }
         if self.bytes > MAX_SCAN_BYTES {

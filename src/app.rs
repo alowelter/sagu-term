@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::download::{self, ConflictChoice, DownloadEvent};
+#[cfg(windows)]
+use crate::dragout;
 use crate::hostkey::{self, HostKeyAnswer, HostKeyPrompt, KeyCheck};
 use crate::monitor;
 use crate::osinfo::{self, OsReport};
@@ -5132,6 +5134,46 @@ pub struct App {
 
     // Proximo id de lote de colar.
     next_paste_id: u64,
+
+    // Arrastar itens de um painel SFTP para fora da janela (Explorer).
+    drag_out: DragOutUi,
+}
+
+/// Arrastar itens de um painel SFTP para fora da janela: quando o cursor sai
+/// com o arrasto do egui em curso, ele vira um arrasto do Windows e quem
+/// recebe (o Explorer) baixa os itens para onde foram soltos (ver `dragout`).
+#[derive(Default)]
+struct DragOutUi {
+    /// Janela do app; 0 (testes) desliga o arrastar para fora.
+    hwnd: isize,
+    /// Arrasto do Windows do arrasto atual do egui: reaproveitado se o
+    /// cursor voltar e sair de novo (a varredura roda uma vez so).
+    #[cfg(windows)]
+    current: Option<dragout::DragOut>,
+    /// Soltura a entregar ao egui no proximo quadro (`raw_input_hook`): o
+    /// arrasto do Windows consome a do sistema. `Some(pos)` = solto de volta
+    /// sobre a janela, em `pos`; `None` = fora dela.
+    release: Option<Option<egui::Pos2>>,
+    /// Avisos dos arrastos (varredura, falhas de leitura) para os paineis.
+    #[cfg(windows)]
+    events: Option<(
+        std::sync::mpsc::Sender<dragout::Event>,
+        std::sync::mpsc::Receiver<dragout::Event>,
+    )>,
+}
+
+impl DragOutUi {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
+            Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+            _ => 0,
+        };
+        DragOutUi {
+            hwnd,
+            ..Default::default()
+        }
+    }
 }
 
 /// `host`:`port` e o mesmo endereco do host do cofre (sem diferenciar
@@ -5299,6 +5341,7 @@ impl App {
             fs_clip: None,
             next_paste_id: 1,
             os_checked: std::collections::HashSet::new(),
+            drag_out: DragOutUi::new(cc),
         }
     }
 
@@ -7393,6 +7436,7 @@ impl App {
                         "arrastar para outro painel",
                         "copiar a seleção para lá (também para outro servidor)",
                     );
+                    atalho(ui, "arrastar para o Explorer", "baixar a seleção na pasta onde soltar");
                     atalho(ui, "Esc", "desistir de copiar/mover");
                     atalho(ui, "Enter, duplo clique", "abrir a pasta ou ver o arquivo (\"..\" sobe)");
                     atalho(ui, "Backspace", "voltar à pasta acima");
@@ -8018,6 +8062,11 @@ impl App {
     /// serem desenhados, como os arquivos soltos do Windows).
     fn handle_fs_drag(&mut self, ctx: &egui::Context) {
         let Some(drag) = egui::DragAndDrop::payload::<FsDrag>(ctx) else {
+            // Fim do arrasto do egui: o do Windows (se houve) acaba junto.
+            #[cfg(windows)]
+            {
+                self.drag_out.current = None;
+            }
             return;
         };
         let (pressed, released, pos) = ctx.input(|i| {
@@ -8034,6 +8083,8 @@ impl App {
             return;
         }
         if !released {
+            #[cfg(windows)]
+            self.drag_out_of_window(ctx, &drag);
             return;
         }
         egui::DragAndDrop::clear_payload(ctx);
@@ -8059,6 +8110,170 @@ impl App {
             return;
         }
         self.begin_drag_copy(&drag, path);
+    }
+
+    /// Itens de um painel SFTP arrastados para fora da janela, com o botao
+    /// ainda apertado: o arrasto vira um do Windows (ver `dragout`) e quem
+    /// receber os itens (o Explorer) baixa para onde foram soltos. Bloqueia a
+    /// UI ate soltar, cancelar ou voltar para a janela; voltando, o arrasto
+    /// do egui continua (e a soltura sobre a janela vale para ele).
+    #[cfg(windows)]
+    fn drag_out_of_window(&mut self, ctx: &egui::Context, drag: &FsDrag) {
+        let hwnd = self.drag_out.hwnd;
+        if hwnd == 0 || !dragout::cursor_outside(hwnd) {
+            return;
+        }
+        if !dragout::button_down() {
+            // Soltou fora da janela sem o egui saber (o Windows so repassa o
+            // mouse fora da janela enquanto ela o captura): acabou ali.
+            egui::DragAndDrop::clear_payload(ctx);
+            self.drag_out.current = None;
+            self.drag_out.release = Some(None);
+            ctx.request_repaint();
+            return;
+        }
+        let modal_open = self.editor.is_some()
+            || self.pending_delete.is_some()
+            || self.show_help
+            || self.host_key_pending();
+        if modal_open {
+            return;
+        }
+        let paths: Vec<&str> = drag.items.iter().map(|i| i.path.as_str()).collect();
+        let same = self
+            .drag_out
+            .current
+            .as_ref()
+            .is_some_and(|d| d.is_for(drag.src_pane, &drag.src_dir, &paths));
+        if !same {
+            // Sessao de origem encerrada: o arrasto fica so dentro da janela.
+            let Some(src) = self.drag_source(drag) else {
+                return;
+            };
+            let items: Vec<(String, String)> = drag
+                .items
+                .iter()
+                .map(|i| (i.path.clone(), i.name.clone()))
+                .collect();
+            let tx = self
+                .drag_out
+                .events
+                .get_or_insert_with(std::sync::mpsc::channel)
+                .0
+                .clone();
+            self.drag_out.current = dragout::DragOut::new(
+                drag.src_pane,
+                src.session(),
+                &drag.src_dir,
+                &items,
+                tx,
+                ctx.clone(),
+            );
+        }
+        let Some(out) = self.drag_out.current.as_ref() else {
+            return;
+        };
+        match out.run(hwnd) {
+            dragout::Outcome::Dropped => {
+                egui::DragAndDrop::clear_payload(ctx);
+                if let Some(d) = self.drag_out.current.take() {
+                    d.dropped();
+                }
+                self.drag_out.release = Some(None);
+            }
+            dragout::Outcome::Cancelled => {
+                egui::DragAndDrop::clear_payload(ctx);
+                self.drag_out.current = None;
+                self.drag_out.release = Some(None);
+            }
+            dragout::Outcome::Back => {
+                // Soltou ao voltar: a soltura (que o Windows consumiu) vai ao
+                // egui onde o cursor esta, e o painel sob ele recebe os itens.
+                if !dragout::button_down() {
+                    let ppp = ctx.pixels_per_point();
+                    let pos = dragout::cursor_client_px(hwnd)
+                        .map(|(x, y)| egui::pos2(x / ppp, y / ppp));
+                    self.drag_out.release = Some(pos);
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// Entrega ao egui a soltura do botao que o arrasto do Windows consumiu
+    /// (sem ela, o egui acharia o botao ainda apertado): sobre a janela, no
+    /// ponto do cursor (vale como soltar o arrasto ali); fora, com o ponteiro
+    /// saindo da janela.
+    fn deliver_drag_release(&mut self, raw: &mut egui::RawInput) {
+        let Some(at) = self.drag_out.release.take() else {
+            return;
+        };
+        let modifiers = raw.modifiers;
+        let release = |pos| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers,
+        };
+        match at {
+            Some(pos) => {
+                raw.events.push(egui::Event::PointerMoved(pos));
+                raw.events.push(release(pos));
+            }
+            None => {
+                raw.events.push(release(egui::pos2(-1.0, -1.0)));
+                raw.events.push(egui::Event::PointerGone);
+            }
+        }
+    }
+
+    /// Avisos dos arrastos para fora (o que nao foi, leitura que falhou) no
+    /// rodape de download do painel de origem, se ele nao estiver ocupado.
+    #[cfg(windows)]
+    fn drain_drag_out_events(&mut self) {
+        let Some((_, rx)) = self.drag_out.events.as_ref() else {
+            return;
+        };
+        let events: Vec<dragout::Event> = rx.try_iter().collect();
+        for ev in events {
+            let (pane_id, (text, detail, tone)) = match &ev {
+                dragout::Event::Scanned { pane, report } => (*pane, drag_out_summary(report)),
+                dragout::Event::ReadFailed { pane, name, msg } => (
+                    *pane,
+                    (
+                        format!(
+                            "Falha ao copiar {} para fora: {}",
+                            show_path(name),
+                            show_path(msg)
+                        ),
+                        String::new(),
+                        Tone::Error,
+                    ),
+                ),
+            };
+            let Some(root) = self.root.as_mut() else {
+                return;
+            };
+            // Sem pasta de destino: o rodape nao oferece "Abrir pasta".
+            let mut notice = Some(DownloadUi {
+                id: 0,
+                dest: PathBuf::new(),
+                pre_skipped: Vec::new(),
+                stage: DownloadStage::Done {
+                    text,
+                    detail,
+                    tone,
+                    at: Instant::now(),
+                },
+            });
+            for_each_pane_mut(root, &mut |p| {
+                if p.id == pane_id && !p.download.as_ref().is_some_and(DownloadUi::busy) {
+                    if let Some(n) = notice.take() {
+                        p.download = Some(n);
+                    }
+                }
+            });
+        }
     }
 
     /// Itens arrastados soltos sobre o painel `dest`: copia-os para a pasta
@@ -9354,6 +9569,53 @@ fn download_summary(
     (text, detail, tone)
 }
 
+/// Aviso depois de arrastar itens para fora da janela (ver `dragout`): o que a
+/// varredura deixou de fora, nao conseguiu ler ou teve o nome ajustado. O
+/// resto (andamento, "ja existe") quem recebeu mostra. Texto do rodape,
+/// detalhe para a dica e tom.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn drag_out_summary(r: &download::DownloadReport) -> (String, String, Tone) {
+    let line = |(p, m): &(String, String)| format!("\u{2022} {}: {}", show_path(p), show_path(m));
+    let (text, tone) = if let Some(motivo) = &r.fatal {
+        (format!("Arrastar para fora: {motivo}; nada foi copiado."), Tone::Error)
+    } else if let Some((nome, erro)) = r.failed.first() {
+        let mut text = format!(
+            "Arrastar para fora: {}: {}",
+            show_path(nome),
+            show_path(erro)
+        );
+        if r.failed.len() > 1 {
+            text.push_str(&format!(" (+{} com erro)", r.failed.len() - 1));
+        }
+        (text, Tone::Error)
+    } else if let Some((nome, motivo)) = r.skipped.first() {
+        let text = match r.skipped.len() {
+            1 => format!("Não foi copiado para fora: {}: {motivo}", show_path(nome)),
+            n => format!("{n} itens não foram copiados para fora: {}: {motivo}", show_path(nome)),
+        };
+        (text, Tone::Neutral)
+    } else {
+        (
+            format!(
+                "Copiado para fora com {} nome(s) ajustado(s) para o Windows",
+                r.renamed.len()
+            ),
+            Tone::Neutral,
+        )
+    };
+    let mut detail = String::new();
+    detail_section(&mut detail, "Com erro:", r.failed.iter().map(line));
+    detail_section(&mut detail, "Ignorados:", r.skipped.iter().map(line));
+    detail_section(
+        &mut detail,
+        "Nomes ajustados para o Windows:",
+        r.renamed
+            .iter()
+            .map(|(a, b)| format!("\u{2022} {} \u{2192} {}", show_path(a), show_path(b))),
+    );
+    (text, detail, tone)
+}
+
 /// Pasta Downloads do usuario (inicio sugerido do dialogo), se existir.
 fn default_download_dir() -> Option<PathBuf> {
     let d = PathBuf::from(std::env::var_os("USERPROFILE")?).join("Downloads");
@@ -9440,7 +9702,10 @@ fn download_footer(ui: &mut egui::Ui, rect: egui::Rect, download: &mut Option<Do
                 if ui.add(x).on_hover_text("Dispensar").clicked() {
                     dismiss = true;
                 }
-                if painted_btn(ui, egui::vec2(96.0, 22.0), "Abrir pasta", 13.0, &BTN_GHOST) {
+                // Aviso de um arrasto para fora: a pasta e de quem recebeu.
+                if !d.dest.as_os_str().is_empty()
+                    && painted_btn(ui, egui::vec2(96.0, 22.0), "Abrir pasta", 13.0, &BTN_GHOST)
+                {
                     open_folder(&d.dest);
                 }
                 let color = match tone {
@@ -13546,6 +13811,7 @@ impl eframe::App for App {
     /// Antes de o egui ver a entrada do quadro: o Tab num navegador SFTP.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.take_sftp_tab(ctx, raw_input);
+        self.deliver_drag_release(raw_input);
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -13572,6 +13838,8 @@ impl eframe::App for App {
                 self.handle_fs_drag(ctx);
                 self.handle_session_keys(ctx);
                 self.drain_ssh_events();
+                #[cfg(windows)]
+                self.drain_drag_out_events();
                 self.guard_host_key_keys(ctx);
             }
             Screen::Gate => {
@@ -13793,6 +14061,7 @@ mod focus_tests {
             fs_clip: None,
             next_paste_id: 1,
             os_checked: std::collections::HashSet::new(),
+            drag_out: DragOutUi::default(),
         }
     }
 
@@ -16019,6 +16288,7 @@ mod focus_tests {
         };
         for k in [
             "arrastar para outro painel",
+            "arrastar para o Explorer",
             "Shift+clique, Shift+setas",
             "Ctrl+L, clique no caminho",
             "Enter, duplo clique",
@@ -16031,6 +16301,7 @@ mod focus_tests {
             "recortar a seleção para mover",
             "colar na pasta atual (copia ou move)",
             "copiar a seleção para lá (também para outro servidor)",
+            "baixar a seleção na pasta onde soltar",
             "desistir de copiar/mover",
             "selecionar um intervalo",
         ]
@@ -20040,5 +20311,169 @@ mod focus_tests {
         assert!(a_rx.try_recv().is_err());
         assert!(b_rx.try_recv().is_err());
         assert!(pane_at(&app, &[1]).paste.is_none());
+    }
+
+    // --- Arrastar para fora da janela (Explorer) ---------------------------
+
+    /// A soltura que o arrasto do Windows consumiu chega ao egui: fora da
+    /// janela com o ponteiro saindo; de volta sobre ela, no ponto do cursor.
+    #[test]
+    fn drag_out_release_is_delivered_once() {
+        let mut app = app();
+        let mut raw = egui::RawInput::default();
+        app.deliver_drag_release(&mut raw);
+        assert!(raw.events.is_empty(), "nada pendente, nada entregue");
+
+        app.drag_out.release = Some(None);
+        app.deliver_drag_release(&mut raw);
+        assert!(matches!(
+            raw.events.as_slice(),
+            [
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    ..
+                },
+                egui::Event::PointerGone
+            ]
+        ));
+        let mut again = egui::RawInput::default();
+        app.deliver_drag_release(&mut again);
+        assert!(again.events.is_empty(), "so uma vez");
+
+        let at = egui::pos2(300.0, 200.0);
+        app.drag_out.release = Some(Some(at));
+        let mut raw = egui::RawInput::default();
+        app.deliver_drag_release(&mut raw);
+        assert!(matches!(
+            raw.events.as_slice(),
+            [
+                egui::Event::PointerMoved(p),
+                egui::Event::PointerButton { pos, pressed: false, .. }
+            ] if *p == at && *pos == at
+        ));
+    }
+
+    /// Voltar com o cursor e soltar sobre outro painel (a soltura vinda do
+    /// arrasto do Windows) copia para ele, como o arrasto entre paineis.
+    #[test]
+    fn drag_back_into_window_drops_on_pane() {
+        let ctx = light_ctx();
+        let (mut app, _a, (mut b_rx, _b_tx)) = drag_app(false, true, &[]);
+        for _ in 0..2 {
+            frame_session(&ctx, &mut app, vec![]);
+        }
+        let from = row_pos(&ctx, &mut app, &[0], "a");
+        frame_session(&ctx, &mut app, vec![egui::Event::PointerMoved(from), click(from, true)]);
+        frame_session(&ctx, &mut app, vec![egui::Event::PointerMoved(from + egui::vec2(24.0, 0.0))]);
+        assert!(egui::DragAndDrop::has_any_payload(&ctx), "o arrasto nao comecou");
+
+        app.drag_out.release = Some(Some(pane_rect(&app, &[1]).center()));
+        let mut raw = egui::RawInput::default();
+        app.deliver_drag_release(&mut raw);
+        frame_session(&ctx, &mut app, raw.events);
+        assert!(!egui::DragAndDrop::has_any_payload(&ctx), "a carga ficou apos soltar");
+        let reqs = copy_from_reqs(&mut b_rx);
+        assert_eq!(reqs.len(), 1, "um CopyFrom em B");
+        assert_eq!(item_names(&reqs[0].1), ["a"]);
+    }
+
+    #[test]
+    fn drag_out_summary_texts() {
+        let fatal = download::DownloadReport {
+            fatal: Some("conexão com o servidor perdida".into()),
+            ..Default::default()
+        };
+        let (text, _, tone) = drag_out_summary(&fatal);
+        assert_eq!(tone, Tone::Error);
+        assert!(text.contains("nada foi copiado"), "{text}");
+
+        let skipped = download::DownloadReport {
+            skipped: vec![
+                ("a/fifo".into(), "arquivo especial".into()),
+                ("a/link".into(), "link quebrado".into()),
+            ],
+            renamed: vec![("a/x:y".into(), "a\\x_y".into())],
+            ..Default::default()
+        };
+        let (text, detail, tone) = drag_out_summary(&skipped);
+        assert_eq!(tone, Tone::Neutral);
+        assert!(text.starts_with("2 itens não foram copiados para fora"), "{text}");
+        assert!(detail.contains("Ignorados:") && detail.contains("a/link"), "{detail}");
+        assert!(detail.contains("Nomes ajustados"), "{detail}");
+
+        let renamed = download::DownloadReport {
+            renamed: vec![("x:y".into(), "x_y".into())],
+            ..Default::default()
+        };
+        let (text, _, tone) = drag_out_summary(&renamed);
+        assert_eq!(tone, Tone::Neutral);
+        assert!(text.contains("1 nome(s) ajustado(s)"), "{text}");
+    }
+
+    /// Avisos de um arrasto para fora vao para o rodape do painel de origem
+    /// (sem "Abrir pasta": a pasta e de quem recebeu), sem atropelar um
+    /// download em andamento.
+    #[cfg(windows)]
+    #[test]
+    fn drag_out_notice_lands_on_source_pane() {
+        let ctx = light_ctx();
+        let (mut app, _a, _b) = drag_app(false, true, &[]);
+        let a_id = pane_at(&app, &[0]).id;
+        let tx = app
+            .drag_out
+            .events
+            .get_or_insert_with(std::sync::mpsc::channel)
+            .0
+            .clone();
+        tx.send(dragout::Event::ReadFailed {
+            pane: a_id,
+            name: "a".into(),
+            msg: "sem permissão para ler no servidor".into(),
+        })
+        .unwrap();
+        app.drain_drag_out_events();
+        match &pane_at(&app, &[0]).download.as_ref().expect("aviso no painel A").stage {
+            DownloadStage::Done { text, tone, .. } => {
+                assert_eq!(*tone, Tone::Error);
+                assert!(text.contains("sem permissão"), "{text}");
+            }
+            _ => panic!("esperava o aviso"),
+        }
+        assert!(pane_at(&app, &[1]).download.is_none(), "so o painel de origem");
+        let out = frame_session(&ctx, &mut app, vec![]);
+        let texts = painted_texts(&out);
+        assert!(texts.iter().any(|(t, _)| t.contains("sem permissão")), "{texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t == "Abrir pasta"), "{texts:?}");
+
+        // Download em andamento no painel: o aviso nao o substitui.
+        if let Some(Node::Leaf(p)) = app.root.as_mut().and_then(|r| node_at_mut(r, &[0])) {
+            p.download = Some(DownloadUi {
+                id: 7,
+                dest: PathBuf::from("C:\\destino"),
+                pre_skipped: Vec::new(),
+                stage: DownloadStage::Running {
+                    cancel: download::cancel_pair().0,
+                    cancelling: false,
+                    scanning: true,
+                    found: 0,
+                    index: 0,
+                    count: 0,
+                    name: String::new(),
+                    done: 0,
+                    total: 0,
+                },
+            });
+        }
+        tx.send(dragout::Event::Scanned {
+            pane: a_id,
+            report: download::DownloadReport {
+                skipped: vec![("a".into(), "arquivo especial".into())],
+                ..Default::default()
+            },
+        })
+        .unwrap();
+        app.drain_drag_out_events();
+        assert!(pane_at(&app, &[0]).download.as_ref().is_some_and(|d| d.id == 7));
     }
 }

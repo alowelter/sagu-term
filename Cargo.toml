@@ -81,4 +81,19 @@ windows = { version = "0.62", features = [
     # DPAPI: chave do "abrir sem senha neste computador" (ver src/remember.rs)
     "Win32_Security_Cryptography",
     "Win32_System_Com",
+    # Arrastar itens do SFTP para o Explorer (ver src/dragout.rs)
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com_Marshal",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+# A macro #[implement] dos objetos COM do arrasto gera caminhos `windows_core::`
+windows-core = "0.62"
+# HWND da janela do eframe (o arrasto para fora compara o cursor com ela)
+raw-window-handle = "0.6"

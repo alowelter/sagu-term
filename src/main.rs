@@ -3,6 +3,8 @@
 
 mod app;
 mod download;
+#[cfg(windows)]
+mod dragout;
 mod emoji;
 mod hostkey;
 mod instance;

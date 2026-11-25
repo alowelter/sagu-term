@@ -4198,6 +4198,7 @@ dependencies = [
  "image",
  "portable-pty",
  "rand 0.8.6",
+ "raw-window-handle",
  "rfd",
  "russh",
  "russh-sftp",
@@ -4207,6 +4208,7 @@ dependencies = [
  "uuid",
  "vt100",
  "windows 0.62.2",
+ "windows-core 0.62.2",
  "winresource",
  "zeroize",
 ]
