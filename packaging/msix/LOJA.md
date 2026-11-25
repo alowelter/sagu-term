@@ -122,6 +122,7 @@ NAVEGADOR SFTP
 • Arraste arquivos do Windows para enviá-los à pasta aberta. Soltos sobre um terminal SSH, eles vão para a pasta atual do shell ou para a pasta que você escolher.
 • Baixe arquivos e pastas para o computador: selecione os itens, aperte Ctrl+S ou use o botão de download e escolha a pasta de destino. Pastas vêm com todo o conteúdo.
 • O andamento aparece no painel, com botão para cancelar. Se algo já existe no destino, você escolhe entre substituir, pular os existentes ou cancelar.
+• Ou arraste a seleção para uma pasta do Explorador de Arquivos ou para a Área de Trabalho: os itens são baixados onde você soltar, pastas com todo o conteúdo, com o andamento e a pergunta antes de substituir do próprio Explorer.
 • Cada arquivo é baixado num temporário e só recebe o nome final quando termina, com a data de modificação do servidor. Nomes que o Windows não aceita são ajustados, e nada é gravado fora da pasta escolhida.
 • Copie e mova arquivos e pastas no servidor com Ctrl+C, Ctrl+X e Ctrl+V. Para copiar entre dois servidores, arraste a seleção de um painel SFTP e solte no painel do outro: os dados passam pelo SaguTerm, sem gravar nada no seu computador.
 • Renomeie, altere permissões e proprietário/grupo e exclua arquivos e pastas.
@@ -166,8 +167,14 @@ Leve e rápido: escrito em Rust do começo ao fim, incluindo o SSH (sem OpenSSL)
 
 ### What's new in this version (Novidades desta versão)
 
-Limite: 1500 caracteres. Texto da 1.7.0 (536 caracteres), com o aviso de kernel só para
-versão nova, o ícone verde do cartão sem problema e as bordas do pm2 monit no terminal:
+Limite: 1500 caracteres. Texto da 1.8.0 (553 caracteres), com o arrastar do SFTP para o
+Explorer:
+
+```text
+Arrastar para o Explorer: arraste arquivos e pastas de um painel SFTP para uma pasta do Explorador de Arquivos ou para a Área de Trabalho e solte para baixá-los ali, o inverso de arrastar arquivos do Windows para o SaguTerm. Pastas vêm com todo o conteúdo, e o próprio Explorer mostra o andamento e pergunta antes de substituir um arquivo que já existe. O que não dá para baixar, como um link para outra pasta, aparece no rodapé do painel. Mudou de ideia antes de soltar? Volte com o cursor para a janela: o arrasto continua e pode ir para outro painel.
+```
+
+Texto da 1.7.0, só de referência:
 
 ```text
 Monitoramento: o aviso de kernel novo ficou mais criterioso. Ele só aparece quando sai uma versão nova do kernel (por exemplo, de 4.18.0 para 4.19.0), e não mais a cada revisão da distribuição sobre a mesma versão, que traz só pequenas correções e acabava virando um aviso insistente. Servidores sem nenhum problema mostram só um ícone verde no cartão, no lugar do texto Ok.
@@ -251,7 +258,7 @@ Navegador SFTP: navegue pelas pastas, renomeie, altere permissões e proprietár
 Visualizador somente leitura no SFTP: Enter num arquivo mostra o conteúdo, com números de linha, busca e cópia; arquivos binários não abrem
 SFTP pelo teclado: PageUp/PageDown, Home/End, busca por letras e caminho digitado, com pastas, arquivos e links simbólicos inconfundíveis
 Arraste arquivos do Windows para um painel SFTP ou um terminal SSH para enviá-los ao servidor
-Baixe arquivos e pastas pelo SFTP com Ctrl+S, com andamento, cancelamento e aviso antes de substituir
+Baixe arquivos e pastas pelo SFTP com Ctrl+S ou arrastando para o Explorer, com andamento, cancelamento e aviso antes de substituir
 Copie e mova arquivos e pastas no servidor com Ctrl+C, Ctrl+X e Ctrl+V, e copie entre servidores arrastando de um painel SFTP para o outro
 Histórico de rolagem: role com a roda do mouse ou Shift+PgUp e copie texto que já saiu da tela
 Ícone do sistema de cada servidor (Ubuntu, Debian, Red Hat, AlmaLinux e outros), identificado em segundo plano ao conectar
@@ -488,6 +495,10 @@ Abra o **SaguTerm** pelo menu Iniciar e confira:
   `rm link-pasta link-quebrado`;
 - um download pelo SFTP (`Ctrl+S`) para a pasta Downloads aparece nessa pasta quando você
   a abre pelo Explorador de Arquivos, fora do SaguTerm;
+- um arquivo e uma pasta arrastados de um painel SFTP para uma pasta aberta no Explorador
+  de Arquivos são baixados ali, com o andamento do próprio Explorer; voltando com o cursor
+  para a janela antes de soltar, o arrasto continua, e soltar noutro painel SFTP copia
+  para ele;
 - no SFTP, `Ctrl+C` num arquivo mostra a faixa `Copiando` no topo do painel; `Ctrl+V` em
   outra pasta cria a cópia, e na mesma pasta cria `nome (cópia)`. `Ctrl+X` e `Ctrl+V` em
   outra pasta movem o arquivo (a faixa some); um nome que já existe abre a janela `Já

@@ -50,7 +50,7 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
   Troque de painel com `Alt+setas`. O mouse é opcional.
 - **📂 SFTP sem outro programa.** Navegue pelas pastas do servidor, leia arquivos de texto
   na hora com `Enter`, arraste arquivos do Windows para enviá-los, baixe arquivos e pastas
-  com `Ctrl+S` e copie ou mova com `Ctrl+C`/`Ctrl+X` e `Ctrl+V`.
+  com `Ctrl+S` ou arrastando para o Explorer e copie ou mova com `Ctrl+C`/`Ctrl+X` e `Ctrl+V`.
 - **🛡️ Sabe com quem está falando.** Na primeira conexão, o SaguTerm mostra a impressão
   digital da chave do servidor e pede a sua confirmação. Se a chave mudar depois, ele avisa
   antes de enviar qualquer senha.
@@ -167,6 +167,12 @@ O **SaguTerm** junta tudo isso numa janela só, rápida e feita para ser usada p
   app for fechado no meio do download, pode sobrar um temporário `.sagu-part` na pasta.
 - Nomes que o Windows não aceita (como `CON`, `a:b` ou terminados em ponto) são ajustados,
   e nada é gravado fora da pasta que você escolheu.
+- **Arraste para o Explorer**: arraste a seleção de um painel SFTP para uma pasta do
+  Explorador de Arquivos ou para a Área de Trabalho e solte; os itens são baixados ali,
+  pastas com todo o conteúdo. O andamento e a pergunta antes de substituir um arquivo que
+  já existe são do próprio Explorer. O que não dá para baixar (um link para outra pasta, um
+  arquivo especial, um caminho com mais de 259 caracteres) aparece no rodapé do painel.
+  Voltar com o cursor para a janela antes de soltar continua o arrasto entre painéis.
 - Renomeie, altere **permissões** (chmod), **proprietário/grupo** (chown) e exclua
   arquivos e pastas. Num link simbólico, permissões e proprietário valem para o destino, e
   excluir remove só o link, nunca o destino.
@@ -288,6 +294,7 @@ No topo da ajuda aparece a versão instalada.
 | SFTP | `Ctrl+L` / clique na barra do caminho | Digitar outro caminho (`~` é a pasta inicial) |
 | SFTP | `Ctrl+clique` / `Shift+clique` / `Ctrl+A` | Marcar itens / selecionar um intervalo / selecionar tudo |
 | SFTP | `Ctrl+S` | Baixar a seleção para o computador |
+| SFTP | arrastar para o Explorer | Baixar a seleção na pasta (ou na Área de Trabalho) onde soltar |
 | SFTP | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copiar / recortar / colar arquivos e pastas (mesma conexão) |
 | SFTP | arrastar para outro painel SFTP | Copiar a seleção para a pasta aberta lá (inclusive outro servidor) |
 | SFTP | `Esc` | Desistir de copiar ou mover |
@@ -362,7 +369,7 @@ No topo da ajuda aparece a versão instalada.
 - [x] Histórico de rolagem no terminal (roda do mouse e Shift+PgUp)
 - [x] Assinatura digital (o pacote é assinado pela Microsoft Store)
 - [ ] Enviar pastas inteiras (hoje o envio por arrastar aceita só arquivos)
-- [ ] Arrastar arquivos do navegador SFTP direto para o Explorador de Arquivos
+- [x] Arrastar arquivos e pastas do navegador SFTP direto para o Explorador de Arquivos
 - [ ] Renomear e excluir vários itens de uma vez no navegador SFTP
 - [x] Copiar entre servidores diferentes (arraste entre dois painéis SFTP)
 - [ ] Mover entre servidores diferentes

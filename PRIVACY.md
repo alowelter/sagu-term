@@ -1,6 +1,6 @@
 # Política de Privacidade do SaguTerm
 
-**Vigência:** 23 de outubro de 2026 · [English version below](#english)
+**Vigência:** 25 de novembro de 2026 · [English version below](#english)
 
 Esta política vale para o SaguTerm distribuído pela **Microsoft Store** e também para um
 executável que você mesmo compile a partir do código-fonte, que é público no GitHub. O
@@ -167,6 +167,11 @@ arquivo, e ele então não é removido na desinstalação.
   fica lembrada só enquanto o app está aberto (o próprio diálogo do Windows também pode
   lembrá-la, conforme as regras do Windows). O botão **Abrir pasta** abre essa pasta no
   Explorador de Arquivos.
+- **Arrastar para o Explorador de Arquivos:** a partir da versão 1.8.0, arrastar itens de um
+  painel SFTP para uma pasta do Explorador de Arquivos (ou para outro programa que aceite
+  arquivos arrastados) também os baixa. Nesse caso, o app só lê os itens do servidor e
+  entrega o conteúdo ao programa onde você soltou; é esse programa que grava os arquivos
+  onde você os soltou, e o app não grava nada no seu computador.
 - Além disso, o app apenas verifica se o WSL está instalado (se o `wsl.exe` do Windows
   existe) e se a sua pasta Downloads existe, para sugeri-la como destino. Ele não varre
   pastas nem lê outros arquivos por conta própria.
@@ -440,7 +445,7 @@ públicas: não inclua senhas, chaves, endereços de servidores nem outros dados
 
 # SaguTerm Privacy Policy
 
-**Effective date:** October 23, 2026
+**Effective date:** November 25, 2026
 
 This policy applies to SaguTerm distributed through the **Microsoft Store** and also to an
 executable you build yourself from the source code, which is public on GitHub. SaguTerm is
@@ -608,6 +613,11 @@ file, which is then not removed on uninstall.
   behind. The last folder you picked is remembered only while the app is open (the Windows
   dialog itself may also remember it, according to the Windows rules). The **Abrir pasta**
   (Open folder) button opens that folder in File Explorer.
+- **Dragging to File Explorer:** starting with version 1.8.0, dragging items from an SFTP
+  pane to a File Explorer folder (or to another program that accepts dragged files) also
+  downloads them. In this case the app only reads the items from the server and hands their
+  content to the program where you dropped them; that program writes the files where you
+  dropped them, and the app writes nothing to your computer.
 - Apart from that, the app only checks whether WSL is installed (whether the Windows
   `wsl.exe` exists) and whether your Downloads folder exists, to suggest it as the
   destination. It does not scan folders or read other files on its own.
